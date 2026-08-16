@@ -80,6 +80,30 @@ class AssembledCliTests(unittest.TestCase):
         self.assertEqual(output_rows(self.path), rows_after_first)
         self.assertIn('"no_op":true', second.stdout)
 
+    def test_default_contract_reconciles_optimizer_and_validator_objectives(self) -> None:
+        scenario = Path(self.temporary_directory.name) / "scenario_objective.sqlite"
+        shutil.copy2(SOURCE, scenario)
+
+        completed = self.command("--scenario", str(scenario), "--llm=off")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("contract=benchmark", completed.stdout)
+        with closing(sqlite3.connect(scenario)) as connection:
+            rows = tuple(
+                connection.execute(
+                    "SELECT component_id, supplier_id, quantity, unit_price, "
+                    "order_date, expected_delivery_date "
+                    "FROM purchase_orders ORDER BY component_id, supplier_id"
+                )
+            )
+        self.assertEqual(
+            rows,
+            (
+                ("CMP-014", "SUP-112", 20.0, 32.0, "2025-09-01", "2025-09-15"),
+                ("CMP-016", "SUP-102", 15.0, 18.0, "2025-09-01", "2025-09-15"),
+            ),
+        )
+
     def test_strict_warning_fails_before_any_write(self) -> None:
         before = output_rows(self.path)
         from apex_procurement.validator import IndependentPlanValidator
