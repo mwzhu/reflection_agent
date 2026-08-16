@@ -15,11 +15,15 @@ from apex_procurement.domain import (
     DeadlineSupplyPosition,
     DemandBucket,
     DemandContribution,
+    EvidenceBasis,
+    EvidenceResult,
+    EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
     InboundSupply,
     PlanDisposition,
     ResolutionStatus,
+    RuleSeverity,
     SolveKind,
     SolverStatus,
     Supplier,
@@ -78,6 +82,7 @@ def _route(
     strategic_penalty: tuple[date, ...] = (),
     eligibility: EvidenceStatus = EvidenceStatus.PASS,
     approvals: tuple[str, ...] = (),
+    evidence: tuple[EvidenceResult, ...] = (),
 ) -> CandidateRoute:
     lead = (available - CURRENT).days
     trace = (
@@ -105,7 +110,7 @@ def _route(
         material_available_date=available,
         eligibility=eligibility,
         feasible_deadlines=feasible,
-        evidence=(),
+        evidence=evidence,
         exception_codes=exceptions,
         approval_requirements=approvals,
         comparator_trace=trace,
@@ -201,6 +206,25 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(selected.minimum_compliant_total, Decimal("5"))
         self.assertEqual(selected.forced_surplus, Decimal("3"))
         self.assertEqual(selected.discretionary_surplus, ZERO)
+        self.assertEqual(
+            selected.objective_vector,
+            (
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("50"),
+                Decimal("3"),
+                Decimal("95"),
+                Decimal("1"),
+            ),
+        )
+        self.assertEqual(outcome.calibration.objective_vector, (ZERO, Decimal("5")))
+        self.assertEqual(outcome.baseline.objective_vector, (ZERO, Decimal("50")))
         self.assertEqual(dict(outcome.derived_upper_bounds)[route.route_id], Decimal("5"))
         self.assertIn(AlertCategory.FORCED_SURPLUS, {item.category for item in outcome.alerts})
         self.assertEqual(outcome.requirement_state.fulfillment, FulfillmentStatus.FULFILLED)
@@ -213,6 +237,149 @@ class OptimizerContractTests(unittest.TestCase):
         )
         self.assertEqual(sub_moq.disposition, PlanDisposition.RECOMMEND_APPROVAL)
         self.assertEqual(sub_moq.lines[0].quantity, Decimal("2"))
+        self.assertEqual(
+            sub_moq.objective_vector,
+            (
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("20"),
+                Decimal("0"),
+                Decimal("38"),
+                Decimal("1"),
+            ),
+        )
+
+    def test_review_exposure_counts_unique_assumption_codes_not_evidence_rows(self) -> None:
+        supplier = _supplier("review")
+        evidence = (
+            EvidenceResult(
+                "rule-review-one",
+                EvidenceStatus.UNKNOWN,
+                EvidenceBasis.ROLLING_WINDOW,
+                EvidenceScope.RULE,
+                RuleSeverity.HARD,
+                "Two policy branches share normalized assumptions.",
+                assumption_codes=("ASSUMPTION_A", "ASSUMPTION_SHARED"),
+                contract_disposition=PlanDisposition.EXECUTE_WITH_ASSUMPTION,
+            ),
+            EvidenceResult(
+                "rule-review-two",
+                EvidenceStatus.UNKNOWN,
+                EvidenceBasis.ROLLING_WINDOW,
+                EvidenceScope.RULE,
+                RuleSeverity.HARD,
+                "The same source gap also carries one distinct assumption.",
+                assumption_codes=("ASSUMPTION_SHARED", "ASSUMPTION_B"),
+                contract_disposition=PlanDisposition.EXECUTE_WITH_ASSUMPTION,
+            ),
+        )
+        outcome = ProcurementOptimizer(_stdlib_solver()).optimize(
+            _problem((_route(supplier, "review", evidence=evidence),), (supplier,))
+        )
+        selected = outcome.selected_plan
+        assert selected is not None
+        self.assertEqual(selected.assumption_codes, ("ASSUMPTION_A", "ASSUMPTION_B", "ASSUMPTION_SHARED"))
+        self.assertEqual(selected.objective_vector[3], Decimal("3"))
+        self.assertEqual(len(selected.objective_vector), 12)
+
+    def test_stage_six_charges_condition_a_but_not_condition_b_volume(self) -> None:
+        supplier = _supplier("international")
+        for condition, expected in (("condition_a", Decimal("2")), ("condition_b", ZERO)):
+            with self.subTest(condition=condition):
+                exception = f"rule-domestic:{condition}"
+                route = _route(
+                    supplier,
+                    condition,
+                    exceptions=(exception,),
+                )
+                outcome = ProcurementOptimizer(_stdlib_solver()).optimize(
+                    _problem(
+                        (route,),
+                        (supplier,),
+                        exception_allowances=(
+                            ExceptionAllowance(exception, (DUE,), Decimal("2")),
+                        ),
+                    )
+                )
+                selected = outcome.selected_plan
+                assert selected is not None
+                self.assertEqual(selected.objective_vector[5], expected)
+
+    def test_stage_ten_uses_sorted_semantic_tuple_quantity_order(self) -> None:
+        first = _supplier("tie-first")
+        second = _supplier("tie-second")
+        routes = (
+            _route(first, "tie-first"),
+            _route(second, "tie-second"),
+        )
+        outcome = ProcurementOptimizer(_stdlib_solver(node_limit=1_000_000)).optimize(
+            _problem(
+                routes,
+                (first, second),
+                quantities=("3",),
+                minimum_secondary_fraction=Decimal("0.33"),
+                minimum_secondary_rule_id="rule-secondary",
+            )
+        )
+        selected = outcome.selected_plan
+        assert selected is not None
+        semantic_first = min(routes, key=lambda item: (item.supplier_fingerprint, item.route_fingerprint))
+        first_quantity = next(
+            line.quantity for line in selected.lines if line.route_id == semantic_first.route_id
+        )
+        self.assertEqual(first_quantity, Decimal("1"))
+        self.assertEqual(len(selected.objective_vector), 12)
+
+        renumbered_suppliers = (
+            replace(first, supplier_id="renumbered-supplier-z"),
+            replace(second, supplier_id="renumbered-supplier-a"),
+        )
+        supplier_ids = {
+            first.supplier_id: renumbered_suppliers[0].supplier_id,
+            second.supplier_id: renumbered_suppliers[1].supplier_id,
+        }
+        renumbered_routes = tuple(
+            replace(
+                route,
+                route_id=f"renumbered-route-{index}",
+                supplier_id=supplier_ids[route.supplier_id],
+            )
+            for index, route in enumerate(reversed(routes))
+        )
+        renumbered = ProcurementOptimizer(_stdlib_solver(node_limit=1_000_000)).optimize(
+            _problem(
+                renumbered_routes,
+                renumbered_suppliers,
+                quantities=("3",),
+                minimum_secondary_fraction=Decimal("0.33"),
+                minimum_secondary_rule_id="rule-secondary",
+            )
+        ).selected_plan
+        assert renumbered is not None
+        fingerprints = {
+            supplier.supplier_id: supplier_fingerprint(supplier)
+            for supplier in (*renumbered_suppliers, first, second)
+        }
+        self.assertEqual(
+            tuple(
+                sorted(
+                    (fingerprints[line.supplier_id], line.quantity)
+                    for line in selected.lines
+                )
+            ),
+            tuple(
+                sorted(
+                    (fingerprints[line.supplier_id], line.quantity)
+                    for line in renumbered.lines
+                )
+            ),
+        )
 
     def test_secondary_rule_is_not_silently_dropped_with_one_supplier(self) -> None:
         supplier = _supplier("only")
@@ -429,13 +596,6 @@ class HighsDifferentialTests(unittest.TestCase):
         self.assertEqual(len(outcome.executable.stage_results), 10)
 
         ranked = []
-        fingerprint_rank = {
-            route.route_id: rank
-            for rank, route in enumerate(
-                sorted(routes, key=lambda item: (item.supplier_fingerprint, item.route_fingerprint)),
-                start=1,
-            )
-        }
         for strategic_quantity in range(3):
             ordinary_quantity = 2 - strategic_quantity
             quantities = (strategic_quantity, ordinary_quantity)
@@ -449,10 +609,9 @@ class HighsDifferentialTests(unittest.TestCase):
                 ordinary_quantity,  # strategic-window penalty
                 ordinary_quantity,  # one sustainability band below A
                 10 * strategic_quantity + 9 * ordinary_quantity,
-                2,
+                0,  # MOQ-driven excess above net requirement
                 sum(routes[index].lead_time_days * quantity for index, quantity in enumerate(quantities)),
                 sum(quantity > 0 for quantity in quantities),
-                sum(fingerprint_rank[routes[index].route_id] * quantity for index, quantity in enumerate(quantities)),
             )
             ranked.append((vector, quantities))
         _, expected = min(ranked)
@@ -462,6 +621,7 @@ class HighsDifferentialTests(unittest.TestCase):
         )
         self.assertEqual(actual, expected)
         self.assertEqual(actual, (2, 0))
+        self.assertEqual(outcome.executable.objective_vector, tuple(Decimal(item) for item in min(ranked)[0]))
 
     def test_concentration_includes_existing_supplier_history(self) -> None:
         first = _supplier("history-heavy")
@@ -717,8 +877,9 @@ class HighsDifferentialTests(unittest.TestCase):
                 return super().optimize(model, objective, limits)
 
         # One bucket gives calls 1..8 for stages 1..8, calls 9..10 for
-        # stage 9, and calls 11..13 for stage 10.
-        for call in (*range(1, 9), 9, 11):
+        # stage 9, calls 11..12 for stage-10 metrics, then calls 13..14
+        # to certify semantic-route membership and its scaled quantity.
+        for call in (*range(1, 9), 9, 11, 13, 14):
             with self.subTest(stage_call=call):
                 result = IntegerScaledSolver(backend=TimeoutBackend(call)).solve(executable)
                 self.assertEqual(result.status, SolverStatus.UNRESOLVED)
