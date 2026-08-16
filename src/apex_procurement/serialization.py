@@ -16,9 +16,41 @@ import json
 from pathlib import Path
 import types
 from typing import Any, TypeVar, Union, get_args, get_origin, get_type_hints
+import unicodedata
 
 
 SerializableT = TypeVar("SerializableT")
+MAX_CANONICAL_JSON_BYTES = 4 * 1024 * 1024
+_DANGEROUS_FORMAT_CONTROLS = frozenset(
+    {
+        0x061C,
+        0x200E,
+        0x200F,
+        0xFEFF,
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+    }
+)
+
+
+def _is_unsafe_character(character: str) -> bool:
+    return (
+        unicodedata.category(character) in {"Cc", "Cs"}
+        or ord(character) in _DANGEROUS_FORMAT_CONTROLS
+    )
+
+
+def sanitize_control_characters(value: str, /) -> str:
+    """Replace terminal/bidi controls and malformed surrogates, preserving Unicode text."""
+
+    if not isinstance(value, str):
+        raise TypeError("value must be str")
+    return "".join(
+        "\N{REPLACEMENT CHARACTER}"
+        if _is_unsafe_character(character)
+        else character
+        for character in value
+    )
 
 
 def _to_primitive(value: object) -> object:
@@ -151,10 +183,40 @@ def canonical_loads(payload: str, expected_type: type[SerializableT]) -> Seriali
 
     if not isinstance(payload, str):
         raise TypeError("payload must be str")
-    primitive = json.loads(payload, parse_float=lambda _: (_ for _ in ()).throw(
-        ValueError("JSON floating-point tokens are forbidden")
-    ))
+    try:
+        encoded = payload.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise ValueError("payload contains malformed Unicode") from error
+    if len(encoded) > MAX_CANONICAL_JSON_BYTES:
+        raise ValueError(
+            "serialized payload exceeds the maximum supported size of "
+            f"{MAX_CANONICAL_JSON_BYTES} bytes"
+        )
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON property {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        primitive = json.loads(
+            payload,
+            parse_float=lambda _: (_ for _ in ()).throw(
+                ValueError("JSON floating-point tokens are forbidden")
+            ),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except RecursionError as error:
+        raise ValueError("serialized payload is nested too deeply") from error
     return _from_primitive(primitive, expected_type)  # type: ignore[return-value]
 
 
-__all__ = ["canonical_dumps", "canonical_loads"]
+__all__ = [
+    "MAX_CANONICAL_JSON_BYTES",
+    "canonical_dumps",
+    "canonical_loads",
+    "sanitize_control_characters",
+]
