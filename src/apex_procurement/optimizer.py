@@ -569,7 +569,10 @@ def _candidate_routes(problem: OptimizerProblem) -> tuple[CandidateRoute, ...]:
     return tuple(result)
 
 
-def _supplier_moq_surplus(problem: OptimizerProblem, routes: Sequence[CandidateRoute]) -> Decimal:
+def _allocation_floor(
+    problem: OptimizerProblem,
+    routes: Sequence[CandidateRoute],
+) -> Decimal:
     by_supplier: dict[str, Decimal] = {}
     for route in routes:
         by_supplier[route.supplier_id] = max(
@@ -601,8 +604,34 @@ def _supplier_moq_surplus(problem: OptimizerProblem, routes: Sequence[CandidateR
                     history_dilution,
                     excess / constraint.maximum_fraction,
                 )
-    allocation_floor += history_dilution
-    return max(ZERO, allocation_floor - problem.supply_ledger.total_demand)
+    return allocation_floor + history_dilution
+
+
+def _supplier_moq_surplus(
+    problem: OptimizerProblem,
+    routes: Sequence[CandidateRoute],
+) -> Decimal:
+    return max(
+        ZERO,
+        _allocation_floor(problem, routes) - problem.supply_ledger.total_demand,
+    )
+
+
+def _forced_allocation_surplus(
+    problem: OptimizerProblem,
+    routes: Sequence[CandidateRoute],
+) -> Decimal:
+    """Return surplus forced above the currently uncovered requirement."""
+
+    if (
+        problem.minimum_secondary_fraction is None
+        and not problem.concentration_constraints
+    ):
+        return ZERO
+    return max(
+        ZERO,
+        _allocation_floor(problem, routes) - problem.net_requirement,
+    )
 
 
 def derive_upper_bounds(problem: OptimizerProblem) -> tuple[tuple[str, Decimal], ...]:
@@ -932,11 +961,22 @@ def _build_model(
             raise ValueError(
                 f"exception allowance {exception!r} contains a deadline not opened by a route predicate"
             )
-        derived_maximum = _existing_exception_shortage(problem, qualifying)
+        net_shortage = _existing_exception_shortage(problem, qualifying)
+        # A price-premium gate is a commercial source permission, while its
+        # bucket scope still prevents allocation to an unqualified deadline.
+        # Permit only the extra quantity forced by active allocation rules;
+        # otherwise an MOQ/secondary floor can make a compliant plan
+        # unreachable before solve Q has a chance to calibrate it.
+        forced_surplus = (
+            _forced_allocation_surplus(problem, routes)
+            if exception.endswith("condition_b")
+            else ZERO
+        )
+        derived_maximum = net_shortage + forced_surplus
         if (
             override is not None
             and override.maximum_quantity is not None
-            and override.maximum_quantity > derived_maximum
+            and override.maximum_quantity > net_shortage
         ):
             raise ValueError(
                 f"exception allowance {exception!r} exceeds the net unresolved shortage"
