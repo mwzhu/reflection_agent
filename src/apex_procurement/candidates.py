@@ -166,14 +166,20 @@ def _route_id(
     supplier_hash: str,
     route_hash: str,
     exception_codes: Iterable[str],
-    deadlines: Iterable[date],
+    feasible_deadlines: Iterable[date],
+    exception_scope_deadlines: Iterable[date],
 ) -> str:
     digest = _canonical_hash(
         {
             "supplier_fingerprint": supplier_hash,
             "route_fingerprint": route_hash,
             "exceptions": sorted(exception_codes),
-            "deadlines": sorted(item.isoformat() for item in deadlines),
+            "feasible_deadlines": sorted(
+                item.isoformat() for item in feasible_deadlines
+            ),
+            "exception_scope_deadlines": sorted(
+                item.isoformat() for item in exception_scope_deadlines
+            ),
         }
     )
     return f"route-{digest}"
@@ -1158,10 +1164,14 @@ class CandidateBuilder:
         deadlines: Iterable[date],
         evidence: Iterable[EvidenceResult],
         exception_codes: Iterable[str] = (),
+        exception_scope_deadlines: Iterable[date] = (),
         approval_requirements: Iterable[str] = (),
     ) -> CandidateRoute:
         deadline_tuple = tuple(sorted(set(deadlines)))
         exception_tuple = tuple(sorted(set(exception_codes)))
+        exception_deadline_tuple = tuple(
+            sorted(set(exception_scope_deadlines))
+        )
         route_hash = route_fingerprint(
             facts.component, facts.catalog, shipping_method, lead_time_days
         )
@@ -1192,6 +1202,7 @@ class CandidateBuilder:
                 route_hash,
                 exception_tuple,
                 deadline_tuple,
+                exception_deadline_tuple,
             ),
             component_id=facts.component.component_id,
             supplier_id=facts.supplier.supplier_id,
@@ -1206,6 +1217,7 @@ class CandidateBuilder:
             material_available_date=material,
             eligibility=_eligibility(all_evidence),
             feasible_deadlines=deadline_tuple,
+            exception_scope_deadlines=exception_deadline_tuple,
             evidence=tuple(all_evidence),
             exception_codes=exception_tuple,
             approval_requirements=approvals,
@@ -1290,6 +1302,7 @@ class CandidateBuilder:
                     evidence=facts.base_evidence
                     + self._international_evidence(representative, order_date),
                     exception_codes=(exception,),
+                    exception_scope_deadlines=scoped_deadlines,
                 )
             )
         return tuple(routes)
@@ -1350,6 +1363,7 @@ class CandidateBuilder:
                     + self._international_evidence(representative, scenario_date)
                     + air_evidence,
                     exception_codes=exceptions,
+                    exception_scope_deadlines=deadlines,
                     approval_requirements=approvals,
                 )
             )

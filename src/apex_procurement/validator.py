@@ -16,7 +16,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
+from fractions import Fraction
+import hashlib
 from itertools import combinations
+import json
+from math import gcd
 import re
 import unicodedata
 
@@ -66,6 +70,20 @@ _SYNTHETIC_RULE_PREFIXES = (
     "DATA-QUALITY.",
     "VALIDATOR.",
 )
+_EXECUTABLE_OBJECTIVE_SUFFIX = (
+    "stage_02_unit_late_days",
+    "stage_03_discretionary_surplus",
+    "stage_04_policy_review_exposure",
+    "stage_05_named_primary_deviation",
+    "stage_06_international_volume",
+    "stage_07_strategic_shift",
+    "stage_08_sustainability_band",
+    "stage_09_known_landed_cost",
+    "stage_09_moq_excess",
+    "stage_10_total_lead_time",
+    "stage_10_line_count",
+)
+_COMPLIANCE_DIAGNOSTIC_PREFIX = "Non-executable compliance-cost diagnostic;"
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,10 +173,12 @@ class _Offer:
     lead_days: int
     shipping_method: str
     international: bool
-    assumption: bool
+    review_keys: frozenset[str]
     allowed_buckets: tuple[date, ...]
     gate_conditions: tuple[tuple[date, str], ...]
     upper_bound: Decimal
+    supplier_fingerprint: str
+    route_fingerprint: str
 
     def condition_for(self, due: date) -> str | None:
         return dict(self.gate_conditions).get(due)
@@ -217,12 +237,32 @@ def _normal_name(value: str) -> str:
     return " ".join(_tokens(value))
 
 
+def _normal_text(value: str | None) -> str | None:
+    return None if value is None else " ".join(_tokens(value))
+
+
 def _phrase(haystack: tuple[str, ...], phrase: str) -> bool:
     needle = _tokens(phrase)
     return bool(needle) and any(
         haystack[index : index + len(needle)] == needle
         for index in range(len(haystack) - len(needle) + 1)
     )
+
+
+def _source_term_overlap(tokens: tuple[str, ...], terms: Iterable[object]) -> bool:
+    target = frozenset(tokens)
+    for raw_term in terms:
+        text_value = str(raw_term)
+        significant = tuple(token for token in _tokens(text_value) if len(token) > 2)
+        if significant and set(significant).issubset(target):
+            return True
+        acronyms = {
+            token.casefold()
+            for token in re.findall(r"\b[A-Z][A-Z0-9]{1,}\b", text_value)
+        }
+        if acronyms.intersection(target):
+            return True
+    return False
 
 
 def _certification(value: str) -> str:
@@ -235,6 +275,64 @@ def _certifications(values: Iterable[str]) -> frozenset[str]:
         for value in values
         for part in _CERT_SPLIT_RE.split(value)
         if part.strip()
+    )
+
+
+def _canonical_hash(payload: Mapping[str, object]) -> str:
+    """Hash semantic facts without importing candidate construction code."""
+
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _supplier_fingerprint(supplier: Supplier) -> str:
+    return _canonical_hash(
+        {
+            "legal_name": _normal_name(supplier.name),
+            "country": _normal_text(supplier.country),
+            "certifications": tuple(sorted(_certifications(supplier.certifications))),
+            "relationship_tier": _normal_text(supplier.relationship_tier),
+            "sustainability_rating": _normal_text(supplier.sustainability_rating),
+        }
+    )
+
+
+def _component_fingerprint(component: Component) -> str:
+    return _canonical_hash(
+        {
+            "name": _normal_text(component.name),
+            "description": _normal_text(component.description),
+            "category": _normal_text(component.category),
+            "unit_of_measure": _normal_text(component.unit_of_measure),
+            "is_hazardous": component.is_hazardous,
+            "required_certifications": tuple(
+                sorted(_certifications(component.required_certifications))
+            ),
+        }
+    )
+
+
+def _route_fingerprint(
+    component: Component,
+    catalog: SupplierCatalogLine,
+    shipping_method: str,
+    lead_days: int,
+) -> str:
+    return _canonical_hash(
+        {
+            "component": _component_fingerprint(component),
+            "unit_price": str(catalog.unit_price),
+            "minimum_order_quantity": str(catalog.minimum_order_quantity),
+            "catalog_lead_time_days": catalog.lead_time_days,
+            "effective_lead_time_days": lead_days,
+            "shipping_method": _normal_text(shipping_method),
+            "catalog_notes": _normal_text(catalog.notes),
+        }
     )
 
 
@@ -377,7 +475,22 @@ class IndependentPlanValidator:
             statuses = tuple(self._concept(item, entity) for item in children)
             if EvidenceStatus.PASS in statuses:
                 return EvidenceStatus.PASS
-            return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.FAIL
+            identity = _tokens(" ".join(filter(None, (entity.name, entity.category))))
+            inferred_source_overlap = any(
+                _source_term_overlap(
+                    identity,
+                    self._concepts[child].get("source_terms", ()),
+                )
+                for child in children
+            ) or _source_term_overlap(
+                identity,
+                self._concepts[concept_id].get("source_terms", ()),
+            )
+            return (
+                EvidenceStatus.UNKNOWN
+                if EvidenceStatus.UNKNOWN in statuses or inferred_source_overlap
+                else EvidenceStatus.FAIL
+            )
         identity = _tokens(" ".join(filter(None, (entity.name, entity.category))))
         if any(_phrase(identity, str(item)) for item in concept.get("negative_fixtures", ())):
             return EvidenceStatus.FAIL
@@ -385,8 +498,14 @@ class IndependentPlanValidator:
             return EvidenceStatus.PASS
         if concept_id == "electronic_component" and _tokens(entity.category or "") == ("electronic", "component"):
             return EvidenceStatus.PASS
-        terms = tuple(concept.get("synonyms", ())) + tuple(concept.get("source_terms", ()))
-        return EvidenceStatus.PASS if any(_phrase(identity, str(item)) for item in terms) else EvidenceStatus.FAIL
+        if any(_phrase(identity, str(item)) for item in concept.get("synonyms", ())):
+            return EvidenceStatus.PASS
+        if (
+            str(concept.get("resolution")) == "enumerated_both_ways"
+            and _source_term_overlap(identity, concept.get("source_terms", ()))
+        ):
+            return EvidenceStatus.UNKNOWN
+        return EvidenceStatus.FAIL
 
     def resolve_source_named_entity(
         self, reference: Mapping[str, object], suppliers: Sequence[Supplier]
@@ -463,6 +582,95 @@ class IndependentPlanValidator:
         years = tuple(int(item) for item in _YEAR_RE.findall(supplier.notes or ""))
         return bool(years) and min(years) < effective.year
 
+    def _selector_status(self, rule: PolicyRule, component: Component) -> EvidenceStatus:
+        selector = rule.data.get("selector")
+        if not isinstance(selector, Mapping) or selector.get("entity") != "component":
+            return EvidenceStatus.PASS
+        tags = tuple(str(item) for item in selector.get("semantic_tags", ()))
+        if not tags:
+            return EvidenceStatus.PASS
+        statuses = tuple(self._concept(tag, component) for tag in tags)
+        operator = str(selector.get("operator", "all"))
+        if operator == "any":
+            if EvidenceStatus.PASS in statuses:
+                return EvidenceStatus.PASS
+            return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.FAIL
+        if operator == "none":
+            if EvidenceStatus.PASS in statuses:
+                return EvidenceStatus.FAIL
+            return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.PASS
+        if EvidenceStatus.FAIL in statuses:
+            return EvidenceStatus.FAIL
+        return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.PASS
+
+    def _rolling_review_keys(
+        self,
+        snapshot: ScenarioSnapshot,
+        component: Component,
+        contract: EvidenceContract,
+    ) -> frozenset[str]:
+        if contract is not EvidenceContract.BENCHMARK:
+            return frozenset()
+        applicable = {
+            rule.rule_id: rule
+            for rule in self.registry.active_rules(snapshot.configuration.current_date)
+            if rule.evidence_basis == EvidenceBasis.ROLLING_WINDOW.value
+            and self._selector_status(rule, component) is not EvidenceStatus.FAIL
+        }
+        # A narrower rule erases its broader predecessor only when membership
+        # is proven.  UNKNOWN membership retains both robust branches.
+        for rule in tuple(applicable.values()):
+            if self._selector_status(rule, component) is not EvidenceStatus.PASS:
+                continue
+            precedence = rule.data.get("precedence")
+            if not isinstance(precedence, Mapping):
+                continue
+            for relation in ("supersedes", "outranks"):
+                for target in precedence.get(relation, ()):
+                    applicable.pop(str(target), None)
+        keys = {"ROLLING_HISTORY_UNKNOWN"} if applicable else set()
+        if any(
+            self._selector_status(rule, component) is EvidenceStatus.UNKNOWN
+            for rule in applicable.values()
+        ):
+            keys.update(("INFERRED_CONCEPT_MEMBERSHIP", "ROBUST_BOTH_WAYS"))
+        return frozenset(keys)
+
+    def _review_keys(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        supplier: Supplier,
+        contract: EvidenceContract,
+    ) -> frozenset[str]:
+        """Reconstruct normalized stage-4 assumption keys from source facts."""
+
+        keys = set(
+            self._rolling_review_keys(snapshot, requirement.component, contract)
+        )
+        pcb_rules = self._rules(snapshot.configuration.current_date, "incumbent_supplier_only")
+        if (
+            contract is EvidenceContract.BENCHMARK
+            and pcb_rules
+            and self._concept("printed_circuit_board_component", requirement.component)
+            is EvidenceStatus.PASS
+            and (requirement.component.component_id, supplier.supplier_id)
+            not in self.accepted_shipment_pairs
+        ):
+            prior = any(
+                item.component_id == requirement.component.component_id
+                and item.supplier_id == supplier.supplier_id
+                for item in snapshot.purchase_orders
+            )
+            if prior or self._relationship_predates(supplier, pcb_rules[0].effective_from):
+                keys.add("PCB_INCUMBENCY_INFERRED")
+        rating = _rating(supplier.sustainability_rating)
+        if rating is not None and rating < _rating("B"):
+            named = self._named_primary(snapshot, requirement.component)
+            if named is not None and named.resolved and named.supplier_id == supplier.supplier_id:
+                keys.add("BELOW_B_REVIEW_DISCHARGED_BY_MEMO")
+        return frozenset(keys)
+
     def _hard_eligible(
         self,
         snapshot: ScenarioSnapshot,
@@ -535,19 +743,112 @@ class IndependentPlanValidator:
                 return Decimal(str(rule.data["constraint"]["value"]))
         return None
 
+    def _minimum_secondary_rule_id(
+        self, snapshot: ScenarioSnapshot, component: Component
+    ) -> str | None:
+        for rule in self._rules(
+            snapshot.configuration.current_date,
+            "minimum_secondary_fraction",
+        ):
+            if self._concept("neodymium_magnet", component) is EvidenceStatus.PASS:
+                return rule.rule_id
+        return None
+
     def _increment(self, component: Component) -> Decimal:
         unit = " ".join(_tokens(component.unit_of_measure))
         return Decimal("0.01") if unit in {"kg", "meter"} else Decimal("1")
 
-    def _allocation_surplus_bound(
-        self, requirement: _SourceRequirement, catalogs: Sequence[SupplierCatalogLine], secondary: Decimal | None
+    def _enumeration_increment(
+        self,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+        secondary: Decimal | None,
+    ) -> Decimal:
+        """Return an exact source-derived lattice for independent line search.
+
+        Catalog quantities remain constrained by the unit-of-measure increment,
+        but iterating every hundredth of a kilogram when every source boundary
+        is a multiple of five kilograms is needless and can exhaust the
+        validator before it proves anything.  Linear objectives attain their
+        optima at source or rational-policy boundaries, so the search lattice
+        is the GCD of those boundaries divided by every active ratio
+        denominator.  If that division is not integral we conservatively fall
+        back to the catalog increment.
+        """
+
+        base = self._increment(requirement.component)
+        quantities = [
+            requirement.total_demand,
+            requirement.on_hand,
+            requirement.eventual_gap,
+            *(quantity for _due, quantity in requirement.bucket_quantities),
+            *(item.catalog.minimum_order_quantity for item in offers),
+            *(item.upper_bound for item in offers),
+        ]
+        units: list[int] = []
+        for quantity in quantities:
+            scaled = quantity / base
+            if scaled == scaled.to_integral_value() and scaled > ZERO:
+                units.append(int(scaled))
+        boundary_gcd = 0
+        for value in units:
+            boundary_gcd = gcd(boundary_gcd, value)
+        if boundary_gcd <= 1:
+            return base
+        denominator = Fraction(self.autonomy.max_surplus_fraction).denominator
+        if secondary is not None:
+            secondary_denominator = Fraction(secondary).denominator
+            denominator = (
+                denominator
+                * secondary_denominator
+                // gcd(denominator, secondary_denominator)
+            )
+        if boundary_gcd % denominator:
+            return base
+        return base * Decimal(boundary_gcd // denominator)
+
+    def _allocation_floor(
+        self,
+        catalogs: Sequence[SupplierCatalogLine],
+        secondary: Decimal | None,
     ) -> Decimal:
         if secondary is None or not catalogs:
             return ZERO
-        largest = max(item.minimum_order_quantity for item in catalogs)
-        fraction_bound = largest / secondary if secondary > ZERO else largest
-        all_moq = sum((item.minimum_order_quantity for item in catalogs), ZERO)
-        return max(ZERO, fraction_bound - requirement.eventual_gap, all_moq - requirement.eventual_gap)
+        by_supplier: dict[str, Decimal] = {}
+        for item in catalogs:
+            by_supplier[item.supplier_id] = max(
+                by_supplier.get(item.supplier_id, ZERO),
+                item.minimum_order_quantity,
+            )
+        allocation_floor = sum(by_supplier.values(), ZERO)
+        if by_supplier:
+            primary_share = Decimal("1") - secondary
+            allocation_floor = max(
+                allocation_floor,
+                (max(by_supplier.values()) / primary_share).to_integral_value(
+                    rounding=ROUND_CEILING
+                ),
+            )
+        return allocation_floor
+
+    def _allocation_surplus_bound(
+        self, requirement: _SourceRequirement, catalogs: Sequence[SupplierCatalogLine], secondary: Decimal | None
+    ) -> Decimal:
+        return max(
+            ZERO,
+            self._allocation_floor(catalogs, secondary) - requirement.total_demand,
+        )
+
+    def _forced_allocation_surplus(
+        self,
+        requirement: _SourceRequirement,
+        catalogs: Sequence[SupplierCatalogLine],
+        secondary: Decimal | None,
+    ) -> Decimal:
+        return max(
+            ZERO,
+            self._allocation_floor(catalogs, secondary) - requirement.eventual_gap,
+        )
 
     def derive_upper_bounds(
         self,
@@ -557,16 +858,13 @@ class IndependentPlanValidator:
     ) -> dict[str, Decimal]:
         """Independently derive the §8.2 Big-M values (equality is legal)."""
 
-        recovery = max(
-            (
-                max(ZERO, requirement.cumulative_demand(due) - requirement.on_time_supply(due))
-                for due, _quantity in requirement.bucket_quantities
-            ),
-            default=ZERO,
-        )
         secondary = self._minimum_secondary(snapshot, requirement.component)
         allocation = self._allocation_surplus_bound(requirement, catalogs, secondary)
-        base = requirement.total_demand + recovery + allocation
+        # The assembled default problem authorizes no discretionary recovery
+        # quantity.  Deadline shortfall is an objective, not an implicit
+        # enlargement of U; adding it here would reconstruct a different
+        # model and can make bounded exact enumeration needlessly explode.
+        base = requirement.total_demand + allocation
         return {
             item.supplier_id: max(base, item.minimum_order_quantity)
             for item in catalogs
@@ -623,40 +921,83 @@ class IndependentPlanValidator:
             due: self._domestic_gate(snapshot, requirement, due, tuple((supplier, catalog) for supplier, catalog, _assumption in eligible))
             for due, _quantity in requirement.bucket_quantities
         }
-        upper = self.derive_upper_bounds(snapshot, requirement, catalogs)
+        upper = self.derive_upper_bounds(
+            snapshot,
+            requirement,
+            tuple(catalog for _supplier, catalog, _assumption in eligible),
+        )
+        forced_allocation_surplus = self._forced_allocation_surplus(
+            requirement,
+            tuple(catalog for _supplier, catalog, _assumption in eligible),
+            self._minimum_secondary(snapshot, requirement.component),
+        )
         result: list[_Offer] = []
-        for supplier, catalog, assumption in eligible:
+        for supplier, catalog, _assumption in eligible:
             international = self._concept("international_supplier", supplier) is EvidenceStatus.PASS
-            allowed_buckets = tuple(
-                due for due, _quantity in requirement.bucket_quantities if not international or gate[due] is not None
-            )
-            if not allowed_buckets:
-                continue
             expected = snapshot.configuration.current_date + timedelta(days=catalog.lead_time_days)
             pcb = self._concept("printed_circuit_board_component", requirement.component) is EvidenceStatus.PASS
             buffer = self.receiving_buffer_days if requirement.component.is_hazardous or pcb else 0
-            bound = upper[catalog.supplier_id]
-            if international:
-                allowance = sum((requirement.bucket_shortage(due) for due in allowed_buckets), ZERO)
-                bound = min(bound, allowance)
-            if bound < catalog.minimum_order_quantity:
-                continue
-            result.append(
-                _Offer(
-                    requirement.component,
-                    supplier,
-                    catalog,
-                    expected,
-                    expected + timedelta(days=buffer),
-                    catalog.lead_time_days,
-                    "standard",
-                    international,
-                    assumption,
-                    allowed_buckets,
-                    tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
-                    bound,
-                )
+            material = expected + timedelta(days=buffer)
+            review_keys = self._review_keys(
+                snapshot, requirement, supplier, contract
             )
+            supplier_hash = _supplier_fingerprint(supplier)
+            route_hash = _route_fingerprint(
+                requirement.component, catalog, "standard", catalog.lead_time_days
+            )
+            gate_conditions = tuple(
+                (due, gate[due] or "shut")
+                for due, _quantity in requirement.bucket_quantities
+            )
+            if international:
+                standard_groups: dict[str, list[date]] = defaultdict(list)
+                for due, _quantity in requirement.bucket_quantities:
+                    condition = gate[due]
+                    if condition is not None:
+                        standard_groups[condition].append(due)
+            else:
+                # Ordinary domestic routes may be allocated late and priced
+                # by unit-late-days, so their bucket scope is not restricted
+                # to physically on-time dates.
+                standard_groups = {
+                    "domestic": [
+                        due for due, _quantity in requirement.bucket_quantities
+                    ]
+                }
+            for _condition, scoped_buckets in sorted(standard_groups.items()):
+                allowed_buckets = tuple(scoped_buckets)
+                bound = upper[catalog.supplier_id]
+                if international:
+                    allowance = sum(
+                        (
+                            requirement.bucket_shortage(due)
+                            for due in allowed_buckets
+                        ),
+                        ZERO,
+                    )
+                    if _condition == "b":
+                        allowance += forced_allocation_surplus
+                    bound = min(bound, allowance)
+                if bound < catalog.minimum_order_quantity:
+                    continue
+                result.append(
+                    _Offer(
+                        requirement.component,
+                        supplier,
+                        catalog,
+                        expected,
+                        material,
+                        catalog.lead_time_days,
+                        "standard",
+                        international,
+                        review_keys,
+                        allowed_buckets,
+                        gate_conditions,
+                        bound,
+                        supplier_hash,
+                        route_hash,
+                    )
+                )
             air_rules = self._rules(snapshot.configuration.current_date, "air_freight_authorization")
             if not international or not air_rules:
                 continue
@@ -666,14 +1007,6 @@ class IndependentPlanValidator:
             air_lead = max(minimum_lead, catalog.lead_time_days - reduction)
             if air_lead >= catalog.lead_time_days:
                 continue
-            air_allowed = tuple(
-                due
-                for due in allowed_buckets
-                if expected + timedelta(days=buffer) > due
-                and snapshot.configuration.current_date + timedelta(days=air_lead + buffer) <= due
-            )
-            if not air_allowed:
-                continue
             approval_rules = (
                 *self._rules(snapshot.configuration.current_date, "air_freight_individual_approval"),
                 *self._rules(snapshot.configuration.current_date, "air_freight_period_spend_cap"),
@@ -682,29 +1015,60 @@ class IndependentPlanValidator:
             if not include_unapproved and not approvals_satisfied:
                 continue
             air_expected = snapshot.configuration.current_date + timedelta(days=air_lead)
-            air_bound = min(
-                upper[catalog.supplier_id],
-                sum((requirement.bucket_shortage(due) for due in air_allowed), ZERO),
+            air_material = air_expected + timedelta(days=buffer)
+            air_route_hash = _route_fingerprint(
+                requirement.component, catalog, "air freight", air_lead
             )
-            if air_bound < catalog.minimum_order_quantity:
-                continue
-            result.append(
-                _Offer(
-                    requirement.component,
-                    supplier,
-                    catalog,
-                    air_expected,
-                    air_expected + timedelta(days=buffer),
-                    air_lead,
-                    "air freight",
-                    international,
-                    assumption,
-                    air_allowed,
-                    tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
-                    air_bound,
+            air_groups: dict[str, list[date]] = defaultdict(list)
+            for due, _quantity in requirement.bucket_quantities:
+                condition = gate[due]
+                if (
+                    condition is not None
+                    and material > due
+                    and air_material <= due
+                ):
+                    air_groups[condition].append(due)
+            for _condition, scoped_buckets in sorted(air_groups.items()):
+                air_allowed = tuple(scoped_buckets)
+                air_bound = min(
+                    upper[catalog.supplier_id],
+                    sum(
+                        (
+                            requirement.bucket_shortage(due)
+                            for due in air_allowed
+                        ),
+                        ZERO,
+                    ),
                 )
+                if air_bound < catalog.minimum_order_quantity:
+                    continue
+                result.append(
+                    _Offer(
+                        requirement.component,
+                        supplier,
+                        catalog,
+                        air_expected,
+                        air_material,
+                        air_lead,
+                        "air freight",
+                        international,
+                        review_keys,
+                        air_allowed,
+                        gate_conditions,
+                        air_bound,
+                        supplier_hash,
+                        air_route_hash,
+                    )
+                )
+        return tuple(
+            sorted(
+                result,
+                key=lambda item: (
+                    item.supplier_fingerprint,
+                    item.route_fingerprint,
+                ),
             )
-        return tuple(sorted(result, key=lambda item: (_normal_name(item.supplier.name), item.catalog.unit_price)))
+        )
 
     # ---- exact plan arithmetic and objective reconstruction ------------
 
@@ -716,8 +1080,28 @@ class IndependentPlanValidator:
             and item.catalog.component_id == line.component_id
             and item.expected_delivery == line.expected_delivery_date
             and item.material_available == line.material_available_date
+            and all(
+                allocation.due_date in item.allowed_buckets
+                for allocation in line.bucket_allocations
+            )
         )
         return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _semantic_tie_key(
+        offers: Sequence[_Offer], allocation: Mapping[int, Decimal]
+    ) -> tuple[tuple[str, str, Decimal], ...]:
+        return tuple(
+            sorted(
+                (
+                    offers[index].supplier_fingerprint,
+                    offers[index].route_fingerprint,
+                    quantity,
+                )
+                for index, quantity in allocation.items()
+                if quantity > ZERO
+            )
+        )
 
     def _named_deviation(
         self, snapshot: ScenarioSnapshot, component: Component, quantities: Mapping[str, Decimal]
@@ -736,10 +1120,18 @@ class IndependentPlanValidator:
         offers: Sequence[_Offer],
     ) -> tuple[Decimal, ...]:
         matched = {line.route_id: self._match_offer(offers, line) for line in plan.lines}
+        total_quantity = sum((line.quantity for line in plan.lines), ZERO)
         physical_gaps: list[Decimal] = []
         for due, _quantity in requirement.bucket_quantities:
             planned = sum(
-                (line.quantity for line in plan.lines if line.material_available_date <= due), ZERO
+                (
+                    allocation.quantity
+                    for line in plan.lines
+                    if line.material_available_date <= due
+                    for allocation in line.bucket_allocations
+                    if allocation.due_date <= due
+                ),
+                ZERO,
             )
             physical_gaps.append(max(ZERO, requirement.cumulative_demand(due) - requirement.on_time_supply(due) - planned))
         unit_late = sum(
@@ -750,10 +1142,19 @@ class IndependentPlanValidator:
             ),
             ZERO,
         )
-        # Assumption codes are the normalized, de-duplicated representation of
-        # policy-review exposure.  Counting the backing UNKNOWN evidence again
-        # would double-charge one disclosed assumption.
-        review = Decimal(len(plan.assumption_codes))
+        # Stage 4 counts the normalized union of assumption codes.  Multiple
+        # policy branches can depend on the same unknown fact, so counting
+        # evidence rows or per-route totals would double-charge it.
+        review = Decimal(
+            len(
+                {
+                    key
+                    for offer in matched.values()
+                    if offer is not None
+                    for key in offer.review_keys
+                }
+            )
+        )
         quantities: dict[str, Decimal] = defaultdict(Decimal)
         for line in plan.lines:
             quantities[line.supplier_id] += line.quantity
@@ -804,8 +1205,6 @@ class IndependentPlanValidator:
                         best_rating = max(_rating(item.supplier.sustainability_rating) for item in comparable)
                         assert best_rating is not None
                         sustainability_penalty += (best_rating - current_rating) * allocation.quantity
-        total_quantity = sum((line.quantity for line in plan.lines), ZERO)
-        moq_excess = max(ZERO, total_quantity - plan.net_requirement)
         weighted_lead = sum(
             (line.quantity * Decimal((line.expected_delivery_date - line.order_date).days) for line in plan.lines), ZERO
         )
@@ -818,7 +1217,7 @@ class IndependentPlanValidator:
             strategic_penalty,
             sustainability_penalty,
             plan.total_cost,
-            moq_excess,
+            max(ZERO, total_quantity - requirement.eventual_gap),
             weighted_lead,
             Decimal(len(plan.lines)),
         )
@@ -829,6 +1228,7 @@ class IndependentPlanValidator:
         requirement: _SourceRequirement,
         offers: Sequence[_Offer],
         allocation: Mapping[int, Decimal],
+        phased_allocation: Mapping[tuple[int, int], Decimal],
         q_min: Decimal,
     ) -> tuple[Decimal, ...]:
         physical_gaps = tuple(
@@ -836,7 +1236,16 @@ class IndependentPlanValidator:
                 ZERO,
                 requirement.cumulative_demand(due)
                 - requirement.on_time_supply(due)
-                - sum((quantity for index, quantity in allocation.items() if offers[index].material_available <= due), ZERO),
+                - sum(
+                    (
+                        quantity
+                        for (offer_index, bucket_index), quantity
+                        in phased_allocation.items()
+                        if offers[offer_index].material_available <= due
+                        and requirement.bucket_quantities[bucket_index][0] <= due
+                    ),
+                    ZERO,
+                ),
             )
             for due, _bucket in requirement.bucket_quantities
         )
@@ -846,7 +1255,7 @@ class IndependentPlanValidator:
         sustainable = ZERO
         cost = ZERO
         lead = ZERO
-        used_assumption = False
+        review_keys: set[str] = set()
         quantities: dict[str, Decimal] = defaultdict(Decimal)
         for index, quantity in allocation.items():
             if quantity == ZERO:
@@ -855,40 +1264,74 @@ class IndependentPlanValidator:
             quantities[offer.supplier.supplier_id] += quantity
             cost += quantity * offer.catalog.unit_price
             lead += quantity * Decimal(offer.lead_days)
-            used_assumption = used_assumption or offer.assumption
-            due = min(
-                offer.allowed_buckets,
-                key=lambda item: (
-                    max(0, (offer.material_available - item).days),
-                    0 if offer.condition_for(item) == "b" else 1,
-                    item,
-                ),
+            review_keys.update(offer.review_keys)
+        for (index, bucket_index), quantity in phased_allocation.items():
+            if quantity == ZERO:
+                continue
+            offer = offers[index]
+            due = requirement.bucket_quantities[bucket_index][0]
+            unit_late += quantity * Decimal(
+                max(0, (offer.material_available - due).days)
             )
-            unit_late += quantity * Decimal(max(0, (offer.material_available - due).days))
             if offer.international and offer.condition_for(due) != "b":
                 international += quantity
             if self._concept("strategic_supplier", offer.supplier) is EvidenceStatus.FAIL:
                 strategic_options = tuple(
-                    item for item in offers
-                    if due in item.allowed_buckets and self._concept("strategic_supplier", item.supplier) is EvidenceStatus.PASS
+                    item
+                    for item in offers
+                    if due in item.allowed_buckets
+                    and self._concept("strategic_supplier", item.supplier)
+                    is EvidenceStatus.PASS
                 )
                 if strategic_options:
-                    best = min(strategic_options, key=lambda item: item.catalog.unit_price)
-                    savings = ZERO if best.catalog.unit_price == ZERO else (best.catalog.unit_price - offer.catalog.unit_price) / best.catalog.unit_price
+                    best = min(
+                        strategic_options,
+                        key=lambda item: item.catalog.unit_price,
+                    )
+                    savings = (
+                        ZERO
+                        if best.catalog.unit_price == ZERO
+                        else (
+                            best.catalog.unit_price - offer.catalog.unit_price
+                        )
+                        / best.catalog.unit_price
+                    )
                     if savings <= Decimal("0.15"):
                         strategic += quantity
             current_rating = _rating(offer.supplier.sustainability_rating)
             if current_rating is not None:
                 better = tuple(
-                    item for item in offers
+                    item
+                    for item in offers
                     if due in item.allowed_buckets
                     and _rating(item.supplier.sustainability_rating) is not None
-                    and _rating(item.supplier.sustainability_rating) > current_rating
-                    and (item.catalog.unit_price == offer.catalog.unit_price if min(item.catalog.unit_price, offer.catalog.unit_price) == ZERO else abs(item.catalog.unit_price - offer.catalog.unit_price) / min(item.catalog.unit_price, offer.catalog.unit_price) <= Decimal("0.10"))
-                    and _business_days(item.material_available, offer.material_available) <= 5
+                    and _rating(item.supplier.sustainability_rating)
+                    > current_rating
+                    and (
+                        item.catalog.unit_price == offer.catalog.unit_price
+                        if min(
+                            item.catalog.unit_price, offer.catalog.unit_price
+                        )
+                        == ZERO
+                        else abs(
+                            item.catalog.unit_price
+                            - offer.catalog.unit_price
+                        )
+                        / min(
+                            item.catalog.unit_price, offer.catalog.unit_price
+                        )
+                        <= Decimal("0.10")
+                    )
+                    and _business_days(
+                        item.material_available, offer.material_available
+                    )
+                    <= 5
                 )
                 if better:
-                    best_rating = max(_rating(item.supplier.sustainability_rating) for item in better)
+                    best_rating = max(
+                        _rating(item.supplier.sustainability_rating)
+                        for item in better
+                    )
                     assert best_rating is not None
                     sustainable += (best_rating - current_rating) * quantity
         total = sum(allocation.values(), ZERO)
@@ -896,7 +1339,7 @@ class IndependentPlanValidator:
         return physical_gaps + (
             unit_late,
             max(ZERO, total - q_min),
-            Decimal(1 if used_assumption else 0),
+            Decimal(len(review_keys)),
             named,
             international,
             strategic,
@@ -906,6 +1349,286 @@ class IndependentPlanValidator:
             lead,
             Decimal(sum(1 for value in allocation.values() if value > ZERO)),
         )
+
+    def _best_phased_objective(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+        allocation: Mapping[int, Decimal],
+        q_min: Decimal,
+        nodes: list[int],
+    ) -> tuple[Decimal, ...] | None:
+        """Enumerate route-to-deadline allocation independently of line totals.
+
+        The planner's ``x`` line quantities do not prove its ``z`` bucket
+        assignment.  This pass distributes every selected route quantity over
+        only its policy-allowed deadlines and compares the complete staged
+        vector.  A constant-coefficient fast path closes the common all-on-time
+        case without walking equivalent compositions.
+        """
+
+        selected = tuple(
+            index for index, quantity in allocation.items() if quantity > ZERO
+        )
+        due_to_index = {
+            due: index
+            for index, (due, _quantity) in enumerate(
+                requirement.bucket_quantities
+            )
+        }
+        allowed: dict[int, tuple[int, ...]] = {
+            index: tuple(
+                due_to_index[due]
+                for due in offers[index].allowed_buckets
+                if due in due_to_index
+            )
+            for index in selected
+        }
+        if any(not indexes for indexes in allowed.values()):
+            return None
+
+        values = [
+            *allocation.values(),
+            requirement.on_hand,
+            *(quantity for _due, quantity in requirement.bucket_quantities),
+            *(quantity for _number, quantity, _due in requirement.inbound),
+        ]
+        places = max(
+            0,
+            max(
+                (-value.normalize().as_tuple().exponent for value in values),
+                default=0,
+            ),
+        )
+        atom = Decimal(1).scaleb(-places)
+
+        # If every selected route is on time for every bucket it may serve and
+        # carries no bucket-varying policy coefficient, assigning it to the
+        # earliest allowed bucket simultaneously maximizes every cumulative
+        # coverage stage.  Later stages are then invariant to the split.
+        def bucket_metrics(index: int, bucket: int) -> tuple[Decimal, ...]:
+            offer = offers[index]
+            due = requirement.bucket_quantities[bucket][0]
+            strategic_penalty = ZERO
+            if self._concept("strategic_supplier", offer.supplier) is EvidenceStatus.FAIL:
+                strategic_options = tuple(
+                    item
+                    for item in offers
+                    if due in item.allowed_buckets
+                    and self._concept("strategic_supplier", item.supplier)
+                    is EvidenceStatus.PASS
+                )
+                if strategic_options:
+                    best = min(
+                        strategic_options,
+                        key=lambda item: item.catalog.unit_price,
+                    )
+                    savings = (
+                        ZERO
+                        if best.catalog.unit_price == ZERO
+                        else (
+                            best.catalog.unit_price - offer.catalog.unit_price
+                        )
+                        / best.catalog.unit_price
+                    )
+                    if savings <= Decimal("0.15"):
+                        strategic_penalty = Decimal("1")
+            sustainability_penalty = ZERO
+            rating = _rating(offer.supplier.sustainability_rating)
+            if rating is not None:
+                comparable = tuple(
+                    item
+                    for item in offers
+                    if due in item.allowed_buckets
+                    and _rating(item.supplier.sustainability_rating) is not None
+                    and _rating(item.supplier.sustainability_rating) > rating
+                    and (
+                        item.catalog.unit_price == offer.catalog.unit_price
+                        if min(
+                            item.catalog.unit_price, offer.catalog.unit_price
+                        )
+                        == ZERO
+                        else abs(
+                            item.catalog.unit_price
+                            - offer.catalog.unit_price
+                        )
+                        / min(
+                            item.catalog.unit_price, offer.catalog.unit_price
+                        )
+                        <= Decimal("0.10")
+                    )
+                    and _business_days(
+                        item.material_available, offer.material_available
+                    )
+                    <= 5
+                )
+                if comparable:
+                    best_rating = max(
+                        _rating(item.supplier.sustainability_rating)
+                        for item in comparable
+                    )
+                    assert best_rating is not None
+                    sustainability_penalty = best_rating - rating
+            return (
+                Decimal(max(0, (offer.material_available - due).days)),
+                Decimal(
+                    offer.international and offer.condition_for(due) != "b"
+                ),
+                strategic_penalty,
+                sustainability_penalty,
+            )
+
+        if len(selected) == 1:
+            index = selected[0]
+            offer = offers[index]
+            total = allocation[index]
+            phased: dict[tuple[int, int], Decimal] = {}
+            assigned = ZERO
+            for bucket_index, (due, _quantity) in enumerate(
+                requirement.bucket_quantities
+            ):
+                if offer.material_available > due:
+                    continue
+                eligible = tuple(
+                    candidate
+                    for candidate in allowed[index]
+                    if candidate <= bucket_index
+                )
+                if not eligible:
+                    continue
+                required = min(
+                    total,
+                    max(
+                        ZERO,
+                        requirement.cumulative_demand(due)
+                        - requirement.on_time_supply(due),
+                    ),
+                )
+                increment_required = max(ZERO, required - assigned)
+                if increment_required == ZERO:
+                    continue
+                target = min(
+                    eligible,
+                    key=lambda candidate: (bucket_metrics(index, candidate), candidate),
+                )
+                phased[(index, target)] = (
+                    phased.get((index, target), ZERO) + increment_required
+                )
+                assigned += increment_required
+            remainder = total - assigned
+            if remainder > ZERO:
+                target = min(
+                    allowed[index],
+                    key=lambda candidate: (bucket_metrics(index, candidate), candidate),
+                )
+                phased[(index, target)] = phased.get((index, target), ZERO) + remainder
+            return self._synthetic_objective(
+                snapshot,
+                requirement,
+                offers,
+                allocation,
+                phased,
+                q_min,
+            )
+
+        if all(len(indexes) == 1 for indexes in allowed.values()):
+            phased = {
+                (index, allowed[index][0]): quantity
+                for index, quantity in allocation.items()
+                if quantity > ZERO
+            }
+            return self._synthetic_objective(
+                snapshot,
+                requirement,
+                offers,
+                allocation,
+                phased,
+                q_min,
+            )
+
+        constant = True
+        for index in selected:
+            metrics = {
+                bucket_metrics(index, bucket)
+                for bucket in allowed[index]
+            }
+            if len(metrics) != 1 or next(iter(metrics))[0] != ZERO:
+                constant = False
+                break
+        if constant:
+            phased = {
+                (index, min(allowed[index])): quantity
+                for index, quantity in allocation.items()
+                if quantity > ZERO
+            }
+            return self._synthetic_objective(
+                snapshot,
+                requirement,
+                offers,
+                allocation,
+                phased,
+                q_min,
+            )
+
+        best: tuple[Decimal, ...] | None = None
+        phased_units: dict[tuple[int, int], int] = {}
+
+        def distributions(
+            total: int,
+            buckets: tuple[int, ...],
+            position: int = 0,
+        ) -> Iterable[tuple[int, ...]]:
+            nodes[0] += 1
+            if nodes[0] > self.enumeration_node_limit:
+                return
+            if position == len(buckets) - 1:
+                yield (total,)
+                return
+            for quantity in range(total + 1):
+                for remainder in distributions(
+                    total - quantity, buckets, position + 1
+                ):
+                    yield (quantity, *remainder)
+
+        def visit(position: int) -> None:
+            nonlocal best
+            if nodes[0] > self.enumeration_node_limit:
+                return
+            if position == len(selected):
+                phased = {
+                    key: Decimal(quantity) * atom
+                    for key, quantity in phased_units.items()
+                    if quantity
+                }
+                objective = self._synthetic_objective(
+                    snapshot,
+                    requirement,
+                    offers,
+                    allocation,
+                    phased,
+                    q_min,
+                )
+                if best is None or objective < best:
+                    best = objective
+                return
+            index = selected[position]
+            scaled = allocation[index] / atom
+            if scaled != scaled.to_integral_value():
+                nodes[0] = self.enumeration_node_limit + 1
+                return
+            buckets = allowed[index]
+            for distribution in distributions(int(scaled), buckets):
+                for bucket, quantity in zip(buckets, distribution, strict=True):
+                    phased_units[(index, bucket)] = quantity
+                visit(position + 1)
+                for bucket in buckets:
+                    phased_units.pop((index, bucket), None)
+                if nodes[0] > self.enumeration_node_limit:
+                    return
+
+        visit(0)
+        return best
 
     # ---- separate integer enumeration --------------------------------
 
@@ -984,7 +1707,7 @@ class IndependentPlanValidator:
         if requirement is None:
             return IndependentSolve(SolverStatus.ERROR, (), certificate_complete=False)
         offers = self._offers(snapshot, requirement, decision.evidence_contract)
-        increment = self._increment(requirement.component)
+        base_increment = self._increment(requirement.component)
         secondary = self._minimum_secondary(snapshot, requirement.component)
         named_check = self._named_primary(snapshot, requirement.component)
         named_supplier = None
@@ -996,6 +1719,9 @@ class IndependentPlanValidator:
         ):
             named_supplier = named_check.supplier_id
         catalogs = tuple(item.catalog for item in offers)
+        increment = self._enumeration_increment(
+            requirement, offers, secondary
+        )
         derived = self.derive_upper_bounds(snapshot, requirement, catalogs)
         group_bound = max(
             [requirement.eventual_gap]
@@ -1007,8 +1733,22 @@ class IndependentPlanValidator:
         nodes = [0]
         best_q: tuple[Decimal, dict[int, Decimal]] | None = None
         best_baseline: tuple[tuple[Decimal, Decimal], dict[int, Decimal]] | None = None
+        cheapest_unit_price = min(
+            (item.catalog.unit_price for item in offers),
+            default=ZERO,
+        )
         # Q first establishes the maximum coverage and then the least total.
-        for total_units in range(0 if target_units == 0 else 1, maximum_units + 1):
+        total_range: Iterable[int]
+        if solve_kind is SolveKind.QUANTITY_CALIBRATION:
+            total_range = (
+                *range(target_units, maximum_units + 1),
+                *range(target_units - 1, -1, -1),
+            )
+        elif solve_kind is SolveKind.BASELINE:
+            total_range = range(0 if target_units == 0 else 1, maximum_units + 1)
+        else:
+            total_range = ()
+        for total_units in total_range:
             vectors = self._vectors_for_total(total_units, offers, increment, secondary, named_supplier, nodes)
             for vector in vectors:
                 total = Decimal(total_units) * increment
@@ -1022,14 +1762,28 @@ class IndependentPlanValidator:
                     best_baseline = (key, vector)
             if nodes[0] > self.enumeration_node_limit:
                 return IndependentSolve(SolverStatus.RESOURCE_LIMIT, (), certificate_complete=False)
-            if solve_kind is SolveKind.QUANTITY_CALIBRATION and best_q is not None and best_q[0] == requirement.eventual_gap:
+            if solve_kind is SolveKind.QUANTITY_CALIBRATION and best_q is not None:
                 total = sum(best_q[1].values(), ZERO)
+                uncovered = requirement.eventual_gap - best_q[0]
                 return IndependentSolve(
                     SolverStatus.OPTIMAL,
-                    (ZERO, total),
+                    (uncovered, total),
                     tuple(sorted((offers[index].supplier.supplier_id, quantity) for index, quantity in best_q[1].items())),
                     minimum_compliant_total=total,
                 )
+            if (
+                solve_kind is SolveKind.BASELINE
+                and best_baseline is not None
+                and best_baseline[0][0] == ZERO
+                and cheapest_unit_price > ZERO
+                and Decimal(total_units + 1) * increment * cheapest_unit_price
+                > best_baseline[0][1]
+            ):
+                # Every unvisited allocation contains at least the next total
+                # quantity and cannot cost less than this exact lower bound.
+                # The strict comparison retains all equal-cost allocations;
+                # solve 0 certifies only the (gap, cost) vector.
+                break
         if solve_kind is SolveKind.QUANTITY_CALIBRATION:
             if best_q is None:
                 return IndependentSolve(SolverStatus.INFEASIBLE, (requirement.eventual_gap, ZERO))
@@ -1050,20 +1804,44 @@ class IndependentPlanValidator:
         if q_result.status is not SolverStatus.OPTIMAL or baseline.status is not SolverStatus.OPTIMAL or q_result.minimum_compliant_total is None or baseline.cheapest_covering_cost is None:
             return IndependentSolve(SolverStatus.UNRESOLVED, (), certificate_complete=False)
         q_min = q_result.minimum_compliant_total
+        # Solve Q may land on a finer legal unit if a ratio boundary does not
+        # divide the coarser lattice.  That case already forced
+        # _enumeration_increment back to the base unit; retain the explicit
+        # guard here so executable enumeration never rounds a calibration.
+        if q_min / increment != (q_min / increment).to_integral_value():
+            increment = base_increment
+            maximum_units = _floor_units(group_bound, increment)
         lower_units = _ceil_units(q_min, increment)
         surplus_limit = self.autonomy.max_surplus_fraction * requirement.eventual_gap
         if self.autonomy.max_surplus_units is not None:
             surplus_limit = min(surplus_limit, self.autonomy.max_surplus_units)
         upper_units = min(maximum_units, _floor_units(q_min + surplus_limit, increment))
-        best: tuple[tuple[Decimal, ...], dict[int, Decimal]] | None = None
+        best: tuple[
+            tuple[Decimal, ...],
+            tuple[tuple[str, str, Decimal], ...],
+            dict[int, Decimal],
+        ] | None = None
         nodes = [0]
         for total_units in range(lower_units, upper_units + 1):
             for vector in self._vectors_for_total(total_units, offers, increment, secondary, named_supplier, nodes):
-                objective = self._synthetic_objective(snapshot, requirement, offers, vector, q_min)
-                if objective[-4] - baseline.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
+                objective = self._best_phased_objective(
+                    snapshot,
+                    requirement,
+                    offers,
+                    vector,
+                    q_min,
+                    nodes,
+                )
+                if objective is None:
                     continue
-                if best is None or objective < best[0]:
-                    best = (objective, vector)
+                cost_index = len(requirement.bucket_quantities) + _EXECUTABLE_OBJECTIVE_SUFFIX.index(
+                    "stage_09_known_landed_cost"
+                )
+                if objective[cost_index] - baseline.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
+                    continue
+                semantic_tie = self._semantic_tie_key(offers, vector)
+                if best is None or (objective, semantic_tie) < best[:2]:
+                    best = (objective, semantic_tie, vector)
             if nodes[0] > self.enumeration_node_limit:
                 return IndependentSolve(SolverStatus.RESOURCE_LIMIT, (), certificate_complete=False)
         if best is None:
@@ -1071,9 +1849,94 @@ class IndependentPlanValidator:
         return IndependentSolve(
             SolverStatus.OPTIMAL,
             best[0],
-            tuple(sorted((offers[index].supplier.supplier_id, quantity) for index, quantity in best[1].items())),
+            tuple(sorted((offers[index].supplier.supplier_id, quantity) for index, quantity in best[2].items())),
             minimum_compliant_total=q_min,
             cheapest_covering_cost=baseline.cheapest_covering_cost,
+        )
+
+    def independently_check_b_or_better(
+        self,
+        snapshot: ScenarioSnapshot,
+        component_id: str,
+        contract: EvidenceContract,
+    ) -> IndependentSolve:
+        """Certify whether full coverage exists without a below-B supplier.
+
+        This is a separate predicate solve for the sustainability gate.  It
+        intentionally omits named-primary shaping: a B-or-better plan is an
+        alternative even when a memo would rank a different supplier first.
+        Hard eligibility, MOQ, and prospective secondary allocation remain.
+        """
+
+        sink = _IssueSink([])
+        requirement = self._source_requirements(snapshot, sink).get(component_id)
+        if requirement is None:
+            return IndependentSolve(
+                SolverStatus.ERROR,
+                (),
+                certificate_complete=False,
+            )
+        boundary = _rating("B")
+        assert boundary is not None
+        offers = tuple(
+            item
+            for item in self._offers(snapshot, requirement, contract)
+            if (rating := _rating(item.supplier.sustainability_rating)) is not None
+            and rating >= boundary
+        )
+        increment = self._increment(requirement.component)
+        secondary = self._minimum_secondary(snapshot, requirement.component)
+        catalogs = tuple(item.catalog for item in offers)
+        derived = self.derive_upper_bounds(snapshot, requirement, catalogs)
+        group_bound = (
+            max(
+                [requirement.eventual_gap]
+                + list(derived.values())
+                + [
+                    sum(
+                        (item.minimum_order_quantity for item in catalogs),
+                        ZERO,
+                    )
+                ]
+            )
+            if offers
+            else ZERO
+        )
+        maximum_units = _floor_units(group_bound, increment)
+        nodes = [0]
+        for total_units in range(1, maximum_units + 1):
+            for vector in self._vectors_for_total(
+                total_units,
+                offers,
+                increment,
+                secondary,
+                None,
+                nodes,
+            ):
+                total = Decimal(total_units) * increment
+                if total >= requirement.eventual_gap:
+                    return IndependentSolve(
+                        SolverStatus.OPTIMAL,
+                        (ZERO, total),
+                        tuple(
+                            sorted(
+                                (
+                                    offers[index].supplier.supplier_id,
+                                    quantity,
+                                )
+                                for index, quantity in vector.items()
+                            )
+                        ),
+                    )
+            if nodes[0] > self.enumeration_node_limit:
+                return IndependentSolve(
+                    SolverStatus.RESOURCE_LIMIT,
+                    (),
+                    certificate_complete=False,
+                )
+        return IndependentSolve(
+            SolverStatus.INFEASIBLE,
+            (requirement.eventual_gap,),
         )
 
     # ---- invariant checks ---------------------------------------------
@@ -1113,11 +1976,52 @@ class IndependentPlanValidator:
         plan_id = plan.plan_id
         suppliers = {item.supplier_id: item for item in snapshot.suppliers}
         catalogs = {(item.component_id, item.supplier_id): item for item in snapshot.catalog_lines}
+        compliance_diagnostic = (
+            not plan.disposition.writes_purchase_order
+            and plan.summary.startswith(_COMPLIANCE_DIAGNOSTIC_PREFIX)
+        )
+        baseline_vector_diagnostic = (
+            compliance_diagnostic and len(plan.objective_vector) == 2
+        )
+        sub_moq_rule_ids = {
+            rule.rule_id
+            for rule in self._rules(
+                snapshot.configuration.current_date,
+                "sub_moq_written_approval",
+            )
+        }
+        represented_sub_moq_approval = (
+            plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+            and bool(
+                sub_moq_rule_ids
+                & set(plan.relaxed_rule_ids)
+                & set(plan.unresolved_approval_ids)
+            )
+        )
         group_ids = {line.allocation_group_id for line in plan.lines}
         if len(group_ids) != 1:
             sink.error("ALLOCATION_GROUP_MISMATCH", "All lines for one component/run must share one allocation group.", component_id=component_id, plan_id=plan_id)
         increment = self._increment(requirement.component)
-        derived_u = self.derive_upper_bounds(snapshot, requirement, tuple(item for item in snapshot.catalog_lines if item.component_id == component_id))
+        derived_u = self.derive_upper_bounds(
+            snapshot,
+            requirement,
+            tuple(item.catalog for item in offers),
+        )
+        offer_catalogs = tuple(
+            {
+                (item.catalog.component_id, item.catalog.supplier_id): item.catalog
+                for item in offers
+            }.values()
+        )
+        secondary_rule_id = self._minimum_secondary_rule_id(
+            snapshot,
+            requirement.component,
+        )
+        forced_exception_surplus = self._forced_allocation_surplus(
+            requirement,
+            offer_catalogs,
+            self._minimum_secondary(snapshot, requirement.component),
+        )
         exception_totals: dict[str, Decimal] = defaultdict(Decimal)
         exception_dates: dict[str, set[date]] = defaultdict(set)
         for line in plan.lines:
@@ -1128,7 +2032,10 @@ class IndependentPlanValidator:
                 continue
             if line.unit_price != catalog.unit_price:
                 sink.error("CATALOG_PRICE_MISMATCH", "Plan unit price differs from the source catalog Decimal.", component_id=component_id, plan_id=plan_id)
-            if line.quantity < catalog.minimum_order_quantity:
+            if (
+                line.quantity < catalog.minimum_order_quantity
+                and not represented_sub_moq_approval
+            ):
                 sink.error("MOQ_VIOLATION", "Plan quantity is below the catalog MOQ without represented approval.", component_id=component_id, plan_id=plan_id)
             if line.quantity / increment != (line.quantity / increment).to_integral_value():
                 sink.error("QUANTITY_PRECISION", "Plan quantity violates the independently derived unit increment.", component_id=component_id, plan_id=plan_id)
@@ -1170,7 +2077,7 @@ class IndependentPlanValidator:
                     sink.error("AIR_EXCEPTION_SCOPE", "Air-freight allocation lacks its active memo authorization and bucket predicate.", component_id=component_id, plan_id=plan_id)
                 for exception_id in allocation.exception_ids:
                     exception_totals[exception_id] += allocation.quantity
-                    exception_dates[exception_id].add(allocation.due_date)
+                    exception_dates[exception_id].update(offer.allowed_buckets)
                     if "condition_" in exception_id and not exception_id.endswith(f"condition_{condition}"):
                         sink.error("EXCEPTION_PREDICATE_MISMATCH", "Allocation exception label disagrees with the recomputed bucket predicate.", component_id=component_id, plan_id=plan_id)
             if plan.disposition.writes_purchase_order:
@@ -1180,6 +2087,11 @@ class IndependentPlanValidator:
                         sink.error("UNAPPROVED_ORDER_VALUE", "Executable line exceeds an approval threshold without runtime approval evidence.", component_id=component_id, plan_id=plan_id, rule_ids=(rule.rule_id,))
         for exception_id, quantity in exception_totals.items():
             allowance = sum((requirement.bucket_shortage(due) for due in exception_dates[exception_id]), ZERO)
+            if (
+                exception_id.endswith("condition_b")
+                and secondary_rule_id not in plan.relaxed_rule_ids
+            ):
+                allowance += forced_exception_surplus
             if quantity > allowance:
                 sink.error("EXCEPTION_AGGREGATE_CAP", "Exception quantity exceeds the aggregate net shortage of qualifying buckets.", component_id=component_id, plan_id=plan_id)
         total_quantity = sum((line.quantity for line in plan.lines), ZERO)
@@ -1198,22 +2110,73 @@ class IndependentPlanValidator:
                 cap = min(cap, self.autonomy.max_surplus_units)
             if plan.discretionary_surplus > cap and plan.disposition.writes_purchase_order:
                 sink.error("AUTONOMY_SURPLUS_EXCEEDED", "Executable plan exceeds the inclusive discretionary-surplus bound.", component_id=component_id, plan_id=plan_id)
-        exact_objective = self._objective(snapshot, requirement, plan, offers)
-        if plan.unit_late_days != exact_objective[len(requirement.bucket_quantities)]:
+        exact_objective = (
+            (plan.residual_gap, plan.total_cost)
+            if baseline_vector_diagnostic
+            else self._objective(snapshot, requirement, plan, offers)
+        )
+        if (
+            not baseline_vector_diagnostic
+            and plan.unit_late_days
+            != exact_objective[len(requirement.bucket_quantities)]
+        ):
             sink.error("UNIT_LATE_DAYS_MISMATCH", "Unit-late-days was not exactly recomputed from material availability and allocations.", component_id=component_id, plan_id=plan_id)
-        if plan.objective_vector != exact_objective:
+        allocation_rule_ids = {
+            rule.rule_id
+            for rule in self.registry.active_rules(
+                snapshot.configuration.current_date
+            )
+            if isinstance(rule.data.get("constraint"), Mapping)
+            and rule.data["constraint"].get("kind")
+            in {"minimum_secondary_fraction", "supplier_volume_cap"}
+        }
+        compliance_cost_diagnostic = (
+            not plan.disposition.writes_purchase_order
+            and bool(set(plan.relaxed_rule_ids) & allocation_rule_ids)
+            and len(plan.objective_vector) == 2
+        )
+        if compliance_cost_diagnostic:
+            diagnostic_objective = (
+                max(ZERO, requirement.eventual_gap - total_quantity),
+                plan.total_cost,
+            )
+            if plan.objective_vector != diagnostic_objective:
+                sink.error("OBJECTIVE_VECTOR_MISMATCH", "Compliance-cost diagnostic does not match the independently recomputed baseline vector.", component_id=component_id, plan_id=plan_id)
+        elif plan.objective_vector != exact_objective:
             sink.error("OBJECTIVE_VECTOR_MISMATCH", "Plan objective vector differs from the validator's exact Decimal vector.", component_id=component_id, plan_id=plan_id)
         secondary = self._minimum_secondary(snapshot, requirement.component)
-        if secondary is not None:
+        secondary_relaxed = (
+            not plan.disposition.writes_purchase_order
+            and secondary_rule_id is not None
+            and secondary_rule_id in plan.relaxed_rule_ids
+        )
+        if secondary is not None and not secondary_relaxed:
             quantities: dict[str, Decimal] = defaultdict(Decimal)
             for line in plan.lines:
                 quantities[line.supplier_id] += line.quantity
             eligible_count = len({offer.supplier.supplier_id for offer in offers})
+            secondary_rule_ids = {
+                rule.rule_id
+                for rule in self._rules(
+                    snapshot.configuration.current_date,
+                    "minimum_secondary_fraction",
+                )
+            }
+            represented_secondary_diagnostic = (
+                not plan.disposition.writes_purchase_order
+                and bool(set(plan.relaxed_rule_ids) & secondary_rule_ids)
+            )
             if eligible_count >= 2:
                 maximum = (Decimal("1") - secondary) * total_quantity
-                if any(value > maximum for value in quantities.values()):
+                if (
+                    any(value > maximum for value in quantities.values())
+                    and not represented_secondary_diagnostic
+                ):
                     sink.error("SECONDARY_ALLOCATION_VIOLATION", "Per-order minimum-secondary allocation is violated.", component_id=component_id, plan_id=plan_id)
-            elif plan.disposition.writes_purchase_order:
+            elif (
+                plan.disposition.writes_purchase_order
+                or not represented_secondary_diagnostic
+            ):
                 sink.error("SECONDARY_ALLOCATION_UNSATISFIABLE", "An executable plan cannot silently drop a minimum-secondary rule with fewer than two eligible suppliers.", component_id=component_id, plan_id=plan_id)
         named_deviation = self._named_deviation(snapshot, requirement.component, {supplier: sum((line.quantity for line in plan.lines if line.supplier_id == supplier), ZERO) for supplier in {line.supplier_id for line in plan.lines}})
         if named_deviation > ZERO:
@@ -1221,6 +2184,31 @@ class IndependentPlanValidator:
                 sink.error("NAMED_PRIMARY_DEVIATION", "Executable plan lies outside named-primary membership.", component_id=component_id, plan_id=plan_id)
             elif plan.disposition is not PlanDisposition.DECISION_REQUIRED:
                 sink.error("NAMED_PRIMARY_DISPOSITION", "A named-primary-deviating alternative must be DECISION_REQUIRED.", component_id=component_id, plan_id=plan_id)
+        boundary = _rating("B")
+        assert boundary is not None
+        uses_below_b = any(
+            (rating := _rating(suppliers[line.supplier_id].sustainability_rating))
+            is not None
+            and rating < boundary
+            for line in plan.lines
+            if line.supplier_id in suppliers
+        )
+        if plan.disposition.writes_purchase_order and uses_below_b:
+            no_alternative = self.independently_check_b_or_better(
+                snapshot,
+                component_id,
+                decision.evidence_contract,
+            )
+            if (
+                no_alternative.status is not SolverStatus.INFEASIBLE
+                or not no_alternative.certificate_complete
+            ):
+                sink.error(
+                    "BELOW_B_NO_ALTERNATIVE_UNPROVEN",
+                    "An executable below-B route lacks an independently completed no-alternative proof.",
+                    component_id=component_id,
+                    plan_id=plan_id,
+                )
         self._check_evidence(snapshot, decision, plan, sink)
 
     def _check_evidence(self, snapshot: ScenarioSnapshot, decision: DecisionRecord, plan: CandidatePlan, sink: _IssueSink) -> None:
@@ -1386,7 +2374,7 @@ class IndependentPlanValidator:
         source = self._source_requirements(snapshot, sink)
         by_component: dict[str, list[DecisionRecord]] = defaultdict(list)
         requirement_ids: set[str] = set()
-        action_keys: set[tuple[object, ...]] = set()
+        executable_action_keys: set[tuple[object, ...]] = set()
         solver_verified = True
         for decision in decision_tuple:
             by_component[decision.component_id].append(decision)
@@ -1401,11 +2389,17 @@ class IndependentPlanValidator:
             offers = self._offers(snapshot, requirement, decision.evidence_contract, include_unapproved=True)
             for plan in tuple(item for item in (decision.selected_plan, *decision.alternatives) if item is not None):
                 self._check_plan(snapshot, decision, requirement, plan, offers, sink)
+                plan_action_keys: set[tuple[object, ...]] = set()
                 for line in plan.lines:
                     key = (decision.requirement_id, line.component_id, line.supplier_id, line.route_id, line.order_date)
-                    if key in action_keys:
+                    if key in plan_action_keys or (
+                        plan.disposition.writes_purchase_order
+                        and key in executable_action_keys
+                    ):
                         sink.error("DUPLICATE_ACTION", "Semantic action identity is duplicated.", component_id=decision.component_id, plan_id=plan.plan_id)
-                    action_keys.add(key)
+                    plan_action_keys.add(key)
+                    if plan.disposition.writes_purchase_order:
+                        executable_action_keys.add(key)
             self._check_capacity(snapshot, decision, sink)
             existing_coverage = min(requirement.total_demand, requirement.eventual_supply)
             planned = decision.selected_plan.eventual_covered_quantity if decision.selected_plan is not None else ZERO
