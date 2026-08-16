@@ -798,6 +798,7 @@ class PlanLine:
     material_available_date: date
     allocation_group_id: str
     bucket_allocations: tuple[BucketAllocation, ...]
+    approval_rule_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("route_id", "component_id", "supplier_id", "allocation_group_id"):
@@ -815,6 +816,11 @@ class PlanLine:
         if sum((item.quantity for item in allocations), ZERO) != self.quantity:
             raise ValueError("bucket allocations must sum exactly to line quantity")
         object.__setattr__(self, "bucket_allocations", allocations)
+        object.__setattr__(
+            self,
+            "approval_rule_ids",
+            _text_tuple(self.approval_rule_ids, "approval_rule_ids"),
+        )
 
     @property
     def line_total(self) -> Decimal:
@@ -909,14 +915,30 @@ class CandidatePlan:
         object.__setattr__(self, "evidence", tuple(sorted(evidence, key=lambda item: item.rule_id)))
         _require_text(self.summary, "summary")
 
+        line_approval_ids = {
+            rule_id
+            for line in lines
+            for rule_id in line.approval_rule_ids
+        }
+        if set(self.unresolved_approval_ids) != line_approval_ids:
+            raise ValueError(
+                "unresolved_approval_ids must equal the union of line approval rules"
+            )
+        if (
+            self.disposition is PlanDisposition.RECOMMEND_APPROVAL
+            and not line_approval_ids
+        ):
+            raise ValueError("RECOMMEND_APPROVAL requires a line-level approval rule")
+
         if self.disposition.writes_purchase_order:
-            if self.unresolved_approval_ids:
+            if line_approval_ids:
                 raise ValueError("an executable plan cannot have unresolved approvals")
             if self.minimum_compliant_total is None or self.cheapest_covering_cost is None:
                 raise ValueError("an executable plan requires certified calibration and baseline values")
+        if self.minimum_compliant_total is not None:
             total_quantity = sum((item.quantity for item in lines), ZERO)
             if total_quantity < self.minimum_compliant_total:
-                raise ValueError("executable quantity cannot be below the calibrated minimum")
+                raise ValueError("certified quantity cannot be below the calibrated minimum")
             expected_forced = max(ZERO, self.minimum_compliant_total - self.net_requirement)
             if self.recovery_quantity > max(
                 ZERO,
@@ -935,6 +957,7 @@ class CandidatePlan:
                 raise ValueError("forced_surplus is inconsistent with calibration")
             if self.discretionary_surplus != expected_discretionary:
                 raise ValueError("discretionary_surplus is inconsistent with calibration")
+        if self.disposition.writes_purchase_order:
             for result in evidence:
                 proven_hard_failure = (
                     result.severity is RuleSeverity.HARD

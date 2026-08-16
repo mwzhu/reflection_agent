@@ -105,6 +105,38 @@ class AssembledCliTests(unittest.TestCase):
             connection.commit()
         return scenario
 
+    def isolated_housing_scenario(
+        self,
+        name: str,
+        *,
+        requirement: int,
+    ) -> Path:
+        """Build a temporary exact CMP-008 requirement at the catalog $85."""
+
+        scenario = Path(self.temporary_directory.name) / name
+        shutil.copy2(SOURCE, scenario)
+        with closing(sqlite3.connect(scenario)) as connection:
+            connection.execute(
+                "UPDATE production_schedule SET product_id = ?, quantity = ?",
+                ("FG-1002", requirement),
+            )
+            connection.execute(
+                "DELETE FROM bom WHERE product_id = ? AND component_id <> ?",
+                ("FG-1002", "CMP-008"),
+            )
+            connection.execute(
+                "UPDATE bom SET quantity_per = 1 "
+                "WHERE product_id = ? AND component_id = ?",
+                ("FG-1002", "CMP-008"),
+            )
+            connection.execute(
+                "UPDATE inventory SET quantity_on_hand = 0 "
+                "WHERE component_id = ?",
+                ("CMP-008",),
+            )
+            connection.commit()
+        return scenario
+
     def test_dry_run_is_offline_deterministic_and_writes_nothing(self) -> None:
         before = output_rows(self.path)
         arguments = ["--scenario", str(self.path), "--dry-run", "--json"]
@@ -464,18 +496,245 @@ class AssembledCliTests(unittest.TestCase):
                     "--dry-run",
                 )
 
-                self.assertIn(completed.returncode, {0, 5})
+                self.assertEqual(completed.returncode, 0, completed.stderr)
                 self.assertNotIn(
                     "INDEPENDENT_SOLVE_UNPROVEN", completed.stderr
                 )
-                if completed.returncode == 5:
-                    # R03 removes the current aggregate approval cap.  Until
-                    # then, the 400-unit case may expose that independently
-                    # proven semantic mismatch, but it must not exhaust the
-                    # validator merely because quantity is large.
-                    self.assertIn(
-                        "CALIBRATION_MISMATCH", completed.stderr
-                    )
+                self.assertNotIn("CALIBRATION_MISMATCH", completed.stderr)
+
+    def test_700_unit_order_is_withheld_as_one_complete_stable_proposal(self) -> None:
+        scenario = self.isolated_housing_scenario(
+            "approval-700.sqlite",
+            requirement=700,
+        )
+        arguments = (
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        first = self.command(*arguments)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_payload = json.loads(first.stdout)
+        decision = next(
+            item
+            for item in first_payload["decisions"]
+            if item["component_id"] == "CMP-008"
+        )
+        self.assertIsNone(decision["selected_plan"])
+        proposal = next(
+            item
+            for item in decision["alternatives"]
+            if item["disposition"] == "RECOMMEND_APPROVAL"
+        )
+        self.assertEqual(proposal["minimum_compliant_total"], "700.0")
+        self.assertEqual(proposal["cheapest_covering_cost"], "59500.00")
+        self.assertEqual(proposal["total_cost"], "59500.00")
+        self.assertEqual(
+            [
+                (
+                    item["supplier_id"],
+                    item["quantity"],
+                    item["unit_price"],
+                    item["approval_rule_ids"],
+                )
+                for item in proposal["lines"]
+            ],
+            [
+                (
+                    "SUP-102",
+                    "700.0",
+                    "85.0",
+                    ["POL-PROC-001.section_7.manager_approval"],
+                )
+            ],
+        )
+        rows_after_first = output_rows(scenario)
+        self.assertEqual(rows_after_first[0], ())
+        with closing(sqlite3.connect(scenario)) as connection:
+            approval = connection.execute(
+                "SELECT description FROM alerts "
+                "WHERE description LIKE '%category=APPROVAL_REQUIRED%'"
+            ).fetchone()[0]
+            sequence_after_first = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+            ).fetchone()
+        for expected in (
+            "supplier SUP-102",
+            "full quantity 700.0",
+            "unit price 85.0",
+            "line total 59500.00",
+            "order date 2025-09-01",
+            "expected delivery 2025-09-22",
+            "material available 2025-09-22",
+            "timing impact",
+            "line total exceeds 50000",
+            "Procurement Manager",
+        ):
+            self.assertIn(expected, approval)
+
+        second = self.command(*arguments)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("collision", second.stderr.lower())
+        self.assertEqual(output_rows(scenario), rows_after_first)
+        self.assertTrue(json.loads(second.stdout)["commit"]["no_op"])
+        with closing(sqlite3.connect(scenario)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM purchase_orders "
+                    "WHERE component_id = 'CMP-008'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+                ).fetchone(),
+                sequence_after_first,
+            )
+
+    def test_scenario_six_500_unit_case_never_optimizes_to_49984(self) -> None:
+        scenario = Path(self.temporary_directory.name) / "scenario-06-500.sqlite"
+        shutil.copy2(SOURCE, scenario)
+        with closing(sqlite3.connect(scenario)) as connection:
+            connection.execute("UPDATE production_schedule SET quantity = 500")
+            connection.commit()
+
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        decision = next(
+            item
+            for item in payload["decisions"]
+            if item["component_id"] == "CMP-014"
+        )
+        self.assertIsNone(decision["selected_plan"])
+        proposal = next(
+            item
+            for item in decision["alternatives"]
+            if item["disposition"] == "RECOMMEND_APPROVAL"
+        )
+        self.assertEqual(proposal["total_cost"], "63360.00")
+        self.assertEqual(
+            [
+                (item["supplier_id"], item["quantity"], item["unit_price"])
+                for item in proposal["lines"]
+            ],
+            [("SUP-112", "1980.0", "32.0")],
+        )
+        with closing(sqlite3.connect(scenario)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM purchase_orders "
+                    "WHERE component_id = 'CMP-014'"
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM purchase_orders "
+                    "WHERE abs(quantity * unit_price - 49984) < 0.001"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_genuinely_sub_threshold_complete_line_executes(self) -> None:
+        scenario = self.isolated_housing_scenario(
+            "sub-threshold-500.sqlite",
+            requirement=500,
+        )
+
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        decision = next(
+            item
+            for item in payload["decisions"]
+            if item["component_id"] == "CMP-008"
+        )
+        selected = decision["selected_plan"]
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["total_cost"], "42500.00")
+        self.assertEqual(selected["lines"][0]["quantity"], "500.0")
+        self.assertEqual(selected["lines"][0]["approval_rule_ids"], [])
+        with closing(sqlite3.connect(scenario)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT quantity, unit_price FROM purchase_orders "
+                    "WHERE component_id = 'CMP-008'"
+                ).fetchall(),
+                [(500.0, 85.0)],
+            )
+
+    def test_line_above_150000_names_both_nested_authorities(self) -> None:
+        scenario = self.isolated_housing_scenario(
+            "nested-approval.sqlite",
+            requirement=1800,
+        )
+
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        decision = next(
+            item
+            for item in payload["decisions"]
+            if item["component_id"] == "CMP-008"
+        )
+        proposal = next(
+            item
+            for item in decision["alternatives"]
+            if item["disposition"] == "RECOMMEND_APPROVAL"
+        )
+        self.assertEqual(proposal["total_cost"], "153000.00")
+        self.assertEqual(
+            proposal["lines"][0]["approval_rule_ids"],
+            [
+                "POL-PROC-001.section_7.manager_approval",
+                "POL-PROC-001.section_7.vp_approval",
+            ],
+        )
+        with closing(sqlite3.connect(scenario)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM purchase_orders "
+                    "WHERE component_id = 'CMP-008'"
+                ).fetchone()[0],
+                0,
+            )
+            approval = connection.execute(
+                "SELECT description FROM alerts "
+                "WHERE description LIKE '%category=APPROVAL_REQUIRED%'"
+            ).fetchone()[0]
+        for expected in (
+            "line total exceeds 50000",
+            "line total exceeds 150000",
+            "Procurement Manager",
+            "VP of Operations",
+        ):
+            self.assertIn(expected, approval)
 
     def test_scenario_two_executes_forced_allocation_surplus_only(self) -> None:
         scenario = Path(self.temporary_directory.name) / SCENARIO_02.name

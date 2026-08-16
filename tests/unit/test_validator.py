@@ -282,6 +282,72 @@ class IndependentValidatorMutationTests(unittest.TestCase):
         baseline = self.validator.validate(self.snapshot, (self.decision,), self.results)
         self.assertTrue(baseline.is_valid, baseline.issues)
 
+    def test_nested_order_value_proposal_missing_vp_is_rejected(self) -> None:
+        supplier = _supplier()
+        snapshot = _snapshot(
+            demand=Decimal("1600"),
+            suppliers=(supplier,),
+            catalogs=(
+                SupplierCatalogLine(
+                    supplier.supplier_id,
+                    "component-a",
+                    Decimal("100"),
+                    3,
+                    Decimal("1"),
+                ),
+            ),
+        )
+        decision, results, validator = _decision_and_results(snapshot)
+        selected = decision.selected_plan
+        assert selected is not None
+        manager_rule = validator._rules(
+            snapshot.configuration.current_date,
+            "order_value_approval",
+        )[0].rule_id
+        proposal_line = replace(
+            selected.lines[0],
+            approval_rule_ids=(manager_rule,),
+        )
+        proposal = replace(
+            selected,
+            disposition=PlanDisposition.RECOMMEND_APPROVAL,
+            lines=(proposal_line,),
+            unresolved_approval_ids=(manager_rule,),
+            summary="Intentionally incomplete nested approval proposal.",
+        )
+        requirement = validator._source_requirements(
+            snapshot,
+            type("Sink", (), {"error": lambda *args, **kwargs: None})(),
+        )[decision.component_id]
+        withheld = replace(
+            decision,
+            selected_plan=None,
+            alternatives=(proposal,),
+            covered_quantity=Decimal("0"),
+            residual_gap=Decimal("1600"),
+            requirement_state=RequirementState(
+                FulfillmentStatus.UNFULFILLED,
+                ResolutionStatus.UNRESOLVED,
+            ),
+            alert_categories=(
+                AlertCategory.APPROVAL_REQUIRED,
+                AlertCategory.ASSUMPTION,
+                AlertCategory.LATE_ARRIVAL,
+            ),
+            deadline_lateness=validator._deadline_lateness(
+                requirement,
+                None,
+            ),
+        )
+        claims = (
+            *results[:-1],
+            replace(results[-1], candidate_plan=proposal),
+        )
+
+        result = validator.validate(snapshot, (withheld,), claims)
+
+        self.assertIn("ORDER_VALUE_APPROVAL_CLASSIFICATION", _codes(result))
+
     def validate_mutation(self, decision: DecisionRecord) -> set[str]:
         result = self.validator.validate(self.snapshot, (decision,), self.results)
         self.assertFalse(result.is_valid)
@@ -472,6 +538,7 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
             selected.lines[0],
             quantity=Decimal("1"),
             bucket_allocations=(BucketAllocation(DUE, Decimal("1")),),
+            approval_rule_ids=(sub_moq_rule,),
         )
         proposal = replace(
             selected,
@@ -507,7 +574,21 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
         )
         result = validator.validate(
             snapshot,
-            (replace(decision, alternatives=(proposal,)),),
+            (
+                replace(
+                    decision,
+                    alternatives=(proposal,),
+                    alert_categories=tuple(
+                        sorted(
+                            {
+                                *decision.alert_categories,
+                                AlertCategory.APPROVAL_REQUIRED,
+                            },
+                            key=lambda item: item.value,
+                        )
+                    ),
+                ),
+            ),
             results,
         )
         self.assertNotIn("MOQ_VIOLATION", _codes(result))

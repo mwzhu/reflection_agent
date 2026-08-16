@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime
 from decimal import Decimal
 from itertools import product
@@ -116,7 +116,15 @@ class SafetyContractTests(unittest.TestCase):
 
     def test_unapproved_plan_cannot_have_executable_disposition(self) -> None:
         with self.assertRaises(ValueError):
-            make_executable_plan(unresolved_approval_ids=("approval-alpha",))
+            make_executable_plan(
+                lines=(
+                    replace(
+                        make_line(),
+                        approval_rule_ids=("approval-alpha",),
+                    ),
+                ),
+                unresolved_approval_ids=("approval-alpha",),
+            )
 
     def test_production_contract_decision_unknown_cannot_execute(self) -> None:
         unknown = EvidenceResult(

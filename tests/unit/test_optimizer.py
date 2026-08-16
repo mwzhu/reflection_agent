@@ -1109,18 +1109,137 @@ class HighsDifferentialTests(unittest.TestCase):
             autonomy=EconomicAutonomy(max_surplus_fraction=Decimal("1")),
         )
         outcome = ProcurementOptimizer(self.solver()).optimize(problem)
-        self.assertIsNotNone(outcome.selected_plan)
-        self.assertEqual(outcome.selected_plan.total_cost, Decimal("100"))
-        self.assertEqual(outcome.selected_plan.residual_gap, Decimal("1"))
+        self.assertIsNone(outcome.selected_plan)
         proposal = next(
-            item
-            for item in outcome.alternatives
-            if item.relaxed_rule_ids == ("rule-order-approval",)
+            item for item in outcome.alternatives
+            if item.disposition is PlanDisposition.RECOMMEND_APPROVAL
         )
         self.assertEqual(proposal.disposition, PlanDisposition.RECOMMEND_APPROVAL)
         self.assertEqual(proposal.total_cost, Decimal("200"))
-        self.assertEqual(outcome.requirement_state.fulfillment, FulfillmentStatus.PARTIALLY_FULFILLED)
+        self.assertEqual(proposal.lines[0].quantity, Decimal("2"))
+        self.assertEqual(
+            proposal.lines[0].approval_rule_ids,
+            ("rule-order-approval",),
+        )
+        self.assertEqual(proposal.minimum_compliant_total, Decimal("2"))
+        self.assertEqual(proposal.cheapest_covering_cost, Decimal("200"))
+        self.assertEqual(outcome.calibration.objective_vector, (ZERO, Decimal("2")))
+        self.assertEqual(outcome.baseline.objective_vector, (ZERO, Decimal("200")))
+        self.assertNotIn(
+            "rule-order-approval", outcome.emitted_constraint_rule_ids
+        )
+        self.assertEqual(outcome.requirement_state.fulfillment, FulfillmentStatus.UNFULFILLED)
         self.assertEqual(outcome.requirement_state.resolution, ResolutionStatus.UNRESOLVED)
+
+    def test_nested_order_value_approvals_are_both_attached_to_the_full_line(self) -> None:
+        supplier = _supplier("nested-approval")
+        rules = (
+            OrderApprovalConstraint("rule-manager", Decimal("50000"), "Manager"),
+            OrderApprovalConstraint("rule-vp", Decimal("150000"), "VP"),
+        )
+        problem = _problem(
+            (_route(supplier, "nested-approval", price="100"),),
+            (supplier,),
+            quantities=("1600",),
+            order_approval_constraints=rules,
+            autonomy=EconomicAutonomy(max_surplus_fraction=Decimal("1")),
+        )
+
+        outcome = ProcurementOptimizer(self.solver()).optimize(problem)
+
+        self.assertIsNone(outcome.selected_plan)
+        proposal = next(
+            item for item in outcome.alternatives
+            if item.disposition is PlanDisposition.RECOMMEND_APPROVAL
+        )
+        self.assertEqual(proposal.lines[0].quantity, Decimal("1600"))
+        self.assertEqual(proposal.total_cost, Decimal("160000"))
+        self.assertEqual(
+            proposal.lines[0].approval_rule_ids,
+            ("rule-manager", "rule-vp"),
+        )
+        self.assertEqual(
+            proposal.unresolved_approval_ids,
+            ("rule-manager", "rule-vp"),
+        )
+
+    def test_order_value_threshold_is_per_line_not_component_total(self) -> None:
+        first = _supplier("per-line-a")
+        second = _supplier("per-line-b")
+        problem = _problem(
+            (
+                _route(first, "per-line-a", price="60"),
+                _route(second, "per-line-b", price="60"),
+            ),
+            (first, second),
+            quantities=("1000",),
+            minimum_secondary_fraction=Decimal("0.50"),
+            minimum_secondary_rule_id="rule-secondary",
+            order_approval_constraints=(
+                OrderApprovalConstraint(
+                    "rule-manager",
+                    Decimal("50000"),
+                    "Manager",
+                ),
+            ),
+            autonomy=EconomicAutonomy(max_surplus_fraction=Decimal("1")),
+        )
+
+        outcome = ProcurementOptimizer(self.solver()).optimize(problem)
+
+        self.assertIsNotNone(outcome.selected_plan)
+        selected = outcome.selected_plan
+        assert selected is not None
+        self.assertEqual(selected.total_cost, Decimal("60000"))
+        self.assertEqual(len(selected.lines), 2)
+        self.assertEqual(
+            {line.line_total for line in selected.lines},
+            {Decimal("30000")},
+        )
+        self.assertTrue(
+            all(not line.approval_rule_ids for line in selected.lines)
+        )
+
+    def test_one_gated_line_withholds_its_sub_threshold_companion(self) -> None:
+        first = _supplier("atomic-a")
+        second = _supplier("atomic-b")
+        problem = _problem(
+            (
+                _route(first, "atomic-a", price="70"),
+                _route(second, "atomic-b", price="70"),
+            ),
+            (first, second),
+            quantities=("1000",),
+            minimum_secondary_fraction=Decimal("0.20"),
+            minimum_secondary_rule_id="rule-secondary",
+            order_approval_constraints=(
+                OrderApprovalConstraint(
+                    "rule-manager",
+                    Decimal("50000"),
+                    "Manager",
+                ),
+            ),
+            autonomy=EconomicAutonomy(max_surplus_fraction=Decimal("1")),
+        )
+
+        outcome = ProcurementOptimizer(self.solver()).optimize(problem)
+
+        self.assertIsNone(outcome.selected_plan)
+        proposal = next(
+            item for item in outcome.alternatives
+            if item.disposition is PlanDisposition.RECOMMEND_APPROVAL
+        )
+        self.assertEqual(proposal.total_cost, Decimal("70000"))
+        self.assertEqual(
+            sorted(
+                (line.line_total, line.approval_rule_ids)
+                for line in proposal.lines
+            ),
+            [
+                (Decimal("14000"), ()),
+                (Decimal("56000"), ("rule-manager",)),
+            ],
+        )
 
 
 ZERO = Decimal("0")
