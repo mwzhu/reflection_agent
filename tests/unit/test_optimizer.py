@@ -757,6 +757,105 @@ class HighsDifferentialTests(unittest.TestCase):
         self.assertEqual(result.candidate_plan.lines[0].quantity, Decimal("5"))
         self.assertEqual(result.cheapest_covering_cost, Decimal("50"))
 
+    def test_non_improving_forced_surplus_is_not_classified_as_recovery(self) -> None:
+        early_due = DUE
+        later_due = DUE + timedelta(days=30)
+        committed_date = DUE + timedelta(days=10)
+        executable_supplier = _supplier("executable-slow")
+        approval_supplier = _supplier("approval-fast")
+        routes = (
+            _route(
+                executable_supplier,
+                "executable-slow",
+                moq="10",
+                available=committed_date,
+                feasible=(later_due,),
+            ),
+            _route(
+                approval_supplier,
+                "approval-fast",
+                available=early_due,
+                feasible=(early_due, later_due),
+                approvals=("rule-expedite-approval",),
+            ),
+        )
+        buckets = (
+            DemandBucket(
+                "component-test",
+                early_due,
+                Decimal("10"),
+                Decimal("10"),
+                (DemandContribution("order-early", "product-test", Decimal("10")),),
+            ),
+            DemandBucket(
+                "component-test",
+                later_due,
+                Decimal("1"),
+                Decimal("11"),
+                (DemandContribution("order-later", "product-test", Decimal("1")),),
+            ),
+        )
+        inbound = InboundSupply(
+            "po-late",
+            "component-test",
+            executable_supplier.supplier_id,
+            Decimal("10"),
+            committed_date,
+        )
+        ledger = SupplyLedger(
+            "component-test",
+            Decimal("11"),
+            ZERO,
+            (inbound,),
+            Decimal("10"),
+            Decimal("1"),
+            (
+                DeadlineSupplyPosition(
+                    early_due,
+                    Decimal("10"),
+                    ZERO,
+                    Decimal("10"),
+                    Decimal("10"),
+                    Decimal("10"),
+                    Decimal("100"),
+                ),
+                DeadlineSupplyPosition(
+                    later_due,
+                    Decimal("11"),
+                    Decimal("10"),
+                    Decimal("1"),
+                    ZERO,
+                ),
+            ),
+        )
+        problem = OptimizerProblem(
+            component_id="component-test",
+            unit_of_measure="each",
+            net_requirement=Decimal("1"),
+            routes=routes,
+            demand_buckets=buckets,
+            supply_ledger=ledger,
+            suppliers=(executable_supplier, approval_supplier),
+            solve_kind=SolveKind.EXECUTABLE,
+            minimum_compliant_total=Decimal("10"),
+            coverage_target=Decimal("1"),
+            cheapest_covering_cost=Decimal("10"),
+            recovery_demand=Decimal("10"),
+            authorized_recovery_surplus=Decimal("10"),
+        )
+
+        result = self.solver().solve(problem)
+
+        self.assertTrue(result.has_executable_certificate, result)
+        assert result.candidate_plan is not None
+        self.assertEqual(result.candidate_plan.lines[0].route_id, "route-executable-slow")
+        self.assertEqual(result.candidate_plan.lines[0].quantity, Decimal("10"))
+        self.assertEqual(result.candidate_plan.forced_surplus, Decimal("9"))
+        self.assertEqual(result.candidate_plan.recovery_demand, Decimal("10"))
+        self.assertEqual(result.candidate_plan.recovery_quantity, ZERO)
+        self.assertEqual(result.candidate_plan.discretionary_surplus, ZERO)
+        self.assertEqual(result.objective_vector[10], Decimal("9"))
+
     def test_doubling_derived_u_does_not_improve_any_objective(self) -> None:
         supplier = _supplier("bound")
         problem = _problem((_route(supplier, "bound", moq="5"),), (supplier,))

@@ -363,17 +363,6 @@ class OptimizerProblem:
 
         return self.net_requirement + self.authorized_recovery_surplus
 
-    @property
-    def recovery_headroom(self) -> Decimal:
-        """Recovery quantity not already supplied by solve-Q forced surplus."""
-
-        forced = max(
-            ZERO,
-            (self.minimum_compliant_total or ZERO) - self.net_requirement,
-        )
-        return max(ZERO, self.authorized_recovery_surplus - forced)
-
-
 @dataclass(frozen=True, slots=True)
 class OptimizerAlert:
     category: AlertCategory
@@ -1154,16 +1143,75 @@ def _build_model(
         exception_caps.append((exception, maximum_atoms))
 
     q_min_atoms = _atoms(problem.minimum_compliant_total or ZERO, atom)
-    recovery_headroom_atoms = _atoms(problem.recovery_headroom, atom)
+    forced_atoms = max(0, q_min_atoms - net_atoms)
+    recovery_coefficients = {
+        recovery[route_index][segment_index]: -1
+        for route_index in range(len(routes))
+        for segment_index in range(len(recovery_segments))
+    }
+    discretionary_coefficients = {
+        discretionary: 1,
+        **{item: -1 for item in x},
+    }
+    if not recovery_segments:
+        model.add_row(
+            discretionary_coefficients,
+            lower=-q_min_atoms,
+            name="discretionary_surplus_definition",
+        )
+    elif forced_atoms == 0:
+        model.add_row(
+            {
+                **discretionary_coefficients,
+                **{
+                    variable: -coefficient
+                    for variable, coefficient in recovery_coefficients.items()
+                },
+            },
+            lower=-q_min_atoms,
+            name="discretionary_surplus_definition",
+        )
+    else:
+        recovery_credit = model.add_var("recovery_credit", 0, total_upper)
+        recovery_credit_active = model.add_var("recovery_credit_active", 0, 1)
+        model.add_row(
+            {recovery_credit: 1, **recovery_coefficients},
+            upper=0,
+            name="recovery_credit_quantity",
+        )
+        model.add_row(
+            {recovery_credit: 1, recovery_credit_active: -total_upper},
+            upper=0,
+            name="recovery_credit_activation",
+        )
+        model.add_row(
+            {
+                recovery_credit: 1,
+                **recovery_coefficients,
+                recovery_credit_active: total_upper,
+            },
+            upper=total_upper - forced_atoms,
+            name="recovery_credit_forced_overlap",
+        )
+        model.add_row(
+            {
+                **discretionary_coefficients,
+                recovery_credit: 1,
+            },
+            lower=-q_min_atoms,
+            name="discretionary_surplus_definition",
+        )
     model.add_row(
-        {discretionary: 1, **{item: -1 for item in x}},
-        lower=-(q_min_atoms + recovery_headroom_atoms),
-        name="discretionary_surplus_definition",
-    )
-    planning_atoms = _atoms(problem.planning_requirement, atom)
-    model.add_row(
-        {moq_excess: 1, **{item: -1 for item in x}},
-        lower=-planning_atoms,
+        {
+            moq_excess: 1,
+            **{item: -1 for item in x},
+            **{
+                recovery[route_index][segment_index]: 1
+                for route_index in range(len(routes))
+                for segment_index in range(len(recovery_segments))
+            },
+        },
+        lower=-net_atoms,
         name="moq_excess_definition",
     )
 
@@ -1444,17 +1492,31 @@ def _fixed_staged_objective_vector(
 
     exact = list(values)
     total = sum(values[index] for index in context.x)
-    net = _atoms(context.problem.planning_requirement, context.quantity_atom)
+    net = _atoms(context.problem.net_requirement, context.quantity_atom)
+    recovery = sum(
+        values[context.recovery[route_index][segment_index]]
+        for route_index in range(len(context.routes))
+        for segment_index in range(len(context.recovery_segments))
+    )
+    forced = max(
+        0,
+        _atoms(
+            context.problem.minimum_compliant_total or ZERO,
+            context.quantity_atom,
+        )
+        - net,
+    )
+    recovery_credit = max(0, recovery - forced)
     exact[context.discretionary] = max(
         0,
         total
         - _atoms(
-            (context.problem.minimum_compliant_total or ZERO)
-            + context.problem.recovery_headroom,
+            context.problem.minimum_compliant_total or ZERO,
             context.quantity_atom,
-        ),
+        )
+        - recovery_credit,
     )
-    exact[context.moq_excess] = max(0, total - net)
+    exact[context.moq_excess] = max(0, total - net - recovery)
 
     positions = {
         item.due_date: item for item in context.problem.supply_ledger.deadline_positions
@@ -2148,19 +2210,23 @@ class IntegerScaledSolver:
         if problem.solve_kind in {SolveKind.EXECUTABLE, SolveKind.COUNTERFACTUAL}:
             total_atoms = sum(final_values[index] for index in context.x)
             q_min_atoms = _atoms(problem.minimum_compliant_total or ZERO, context.quantity_atom)
-            recovery_headroom_atoms = _atoms(
-                problem.recovery_headroom,
-                context.quantity_atom,
+            recovery_atoms = sum(
+                final_values[context.recovery[route_index][segment_index]]
+                for route_index in range(len(context.routes))
+                for segment_index in range(len(context.recovery_segments))
             )
-            planning_atoms = _atoms(
-                problem.planning_requirement,
-                context.quantity_atom,
-            )
+            forced_atoms = max(0, q_min_atoms - _atoms(problem.net_requirement, context.quantity_atom))
+            recovery_credit_atoms = max(0, recovery_atoms - forced_atoms)
             expected_discretionary = max(
                 0,
-                total_atoms - q_min_atoms - recovery_headroom_atoms,
+                total_atoms - q_min_atoms - recovery_credit_atoms,
             )
-            expected_moq_excess = max(0, total_atoms - planning_atoms)
+            expected_moq_excess = max(
+                0,
+                total_atoms
+                - _atoms(problem.net_requirement, context.quantity_atom)
+                - recovery_atoms,
+            )
             selected_review_keys = {
                 key
                 for route_index, route in enumerate(context.routes)
@@ -2308,13 +2374,16 @@ def _build_plan(
     if context.problem.solve_kind is SolveKind.QUANTITY_CALIBRATION:
         minimum = total_quantity
     forced = max(ZERO, (minimum or ZERO) - context.problem.net_requirement)
-    recovery_quantity = min(
-        context.problem.recovery_demand,
-        max(ZERO, total_quantity - context.problem.net_requirement),
+    recovery_quantity = context.quantity(
+        sum(
+            values[context.recovery[route_index][segment_index]]
+            for route_index in range(len(context.routes))
+            for segment_index in range(len(context.recovery_segments))
+        )
     )
     recovery_headroom = max(
         ZERO,
-        context.problem.authorized_recovery_surplus - forced,
+        recovery_quantity - forced,
     )
     discretionary = max(
         ZERO,

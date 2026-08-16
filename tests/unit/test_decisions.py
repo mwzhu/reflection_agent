@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +10,7 @@ import sqlite3
 import tempfile
 import unittest
 
+import apex_procurement.decisions as decisions_module
 from apex_procurement.config import EvidenceContract
 from apex_procurement.decisions import (
     AtomicDecisionWriter,
@@ -36,8 +38,14 @@ from apex_procurement.domain import (
     ResolutionStatus,
     SupplyLedger,
     ValidationResult,
+    ExistingPurchaseOrder,
 )
-from apex_procurement.explanations import make_owned_alert, render_alerts
+from apex_procurement.explanations import (
+    make_owned_alert,
+    render_alerts,
+    render_legacy_v1_decision_rationale,
+    render_legacy_v1_line_rationale,
+)
 from apex_procurement.ledgers import build_ledgers
 from apex_procurement.repository import SQLiteRepository
 
@@ -230,7 +238,6 @@ class IdentityAndRenderingTests(unittest.TestCase):
     def test_owned_po_round_trips_full_record_and_selected_line_state(self) -> None:
         output = build_decision_outputs((make_decision(),), "policy-version-one")
         target = output.purchase_orders[0]
-        from apex_procurement.domain import ExistingPurchaseOrder
 
         stored = ExistingPurchaseOrder(
             po_number=target.po_number,
@@ -249,7 +256,74 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertEqual(parsed.action_key, target.action_key)
         self.assertEqual(parsed.decision, output.decisions[0])
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
+        self.assertIn("[APEX_AGENT:v2 ", target.rationale)
         self.assertIn("Fulfillment FULFILLED; resolution RESOLVED", target.rationale)
+
+    def test_v1_owned_po_remains_strictly_parseable_and_reconstructable(self) -> None:
+        policy_version = "policy-version-one"
+        current = build_decision_outputs(
+            (make_decision(),),
+            policy_version,
+        ).decisions[0]
+        legacy = replace(
+            current,
+            rationale=render_legacy_v1_decision_rationale(current),
+        )
+        assert legacy.selected_plan is not None
+        line = legacy.selected_plan.lines[0]
+        demand_digest = demand_fingerprint(legacy)
+        key = decisions_module.action_key(
+            demand_digest,
+            line.component_id,
+            line.supplier_id,
+            line.route_id,
+            line.order_date,
+            policy_version,
+        )
+        record_token = decisions_module._encoded(
+            decisions_module._legacy_v1_record(legacy)
+        )
+        marker = decisions_module._po_marker(
+            key=key,
+            demand_digest=demand_digest,
+            route_id=line.route_id,
+            policy_pack_version=policy_version,
+            line_index=0,
+            decision_token=record_token,
+            version=1,
+        )
+        stored = ExistingPurchaseOrder(
+            po_number=decisions_module.po_number_for_action(key),
+            component_id=line.component_id,
+            supplier_id=line.supplier_id,
+            quantity=line.quantity,
+            unit_price=line.unit_price,
+            order_date=line.order_date,
+            expected_delivery_date=line.expected_delivery_date,
+            rationale=(
+                f"{marker} {render_legacy_v1_line_rationale(legacy, line)}"
+            ),
+        )
+
+        parsed = parse_owned_purchase_order(stored)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.decision, legacy)
+        rebuilt = build_decision_outputs(
+            (parsed.decision,),
+            policy_version,
+        ).purchase_orders[0]
+        self.assertEqual(rebuilt.business_fields, (
+            stored.po_number,
+            stored.component_id,
+            stored.supplier_id,
+            stored.quantity,
+            stored.unit_price,
+            stored.order_date,
+            stored.expected_delivery_date,
+            stored.rationale,
+        ))
 
     def test_residual_assumption_decision_and_solver_alerts_are_all_owned(self) -> None:
         selected = make_plan(
@@ -366,6 +440,123 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
         self.assertEqual(
             alert_ids,
             {item.description: item.alert_id for item in after_second.alerts},
+        )
+
+    def test_legacy_v1_owned_rows_remain_an_exact_no_op_on_rerun(self) -> None:
+        policy_version = "policy-version-one"
+        current = build_decision_outputs(
+            (make_decision(),),
+            policy_version,
+        ).decisions[0]
+        legacy = replace(
+            current,
+            rationale=render_legacy_v1_decision_rationale(current),
+        )
+        legacy_outputs = build_decision_outputs(
+            (legacy,),
+            policy_version,
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            for order in legacy_outputs.purchase_orders:
+                connection.execute(
+                    "INSERT INTO purchase_orders "
+                    "(po_number, component_id, supplier_id, quantity, unit_price, "
+                    "order_date, expected_delivery_date, rationale) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        order.po_number,
+                        order.component_id,
+                        order.supplier_id,
+                        str(order.quantity),
+                        str(order.unit_price),
+                        order.order_date.isoformat(),
+                        order.expected_delivery_date.isoformat(),
+                        order.rationale,
+                    ),
+                )
+            for alert in legacy_outputs.alerts:
+                connection.execute(
+                    "INSERT INTO alerts (description) VALUES (?)",
+                    (alert.description,),
+                )
+        before = (self.table_rows("purchase_orders"), self.table_rows("alerts"))
+        snapshot = SQLiteRepository().load_snapshot(self.path)
+        stored_order = snapshot.purchase_orders[0]
+        managed_ledger = build_ledgers(snapshot).ledger_for(
+            stored_order.component_id
+        )
+        owned_inbound = next(
+            item
+            for item in managed_ledger.committed_inbound
+            if item.po_number == stored_order.po_number
+        )
+        closed = make_decision(selected_plan=None, inbound=(owned_inbound,))
+        reconciled = reconcile_managed_decisions(
+            snapshot,
+            (closed,),
+            policy_version,
+        )
+
+        result = AtomicDecisionWriter(self.path, policy_version).commit(
+            snapshot,
+            reconciled,
+            valid_validation(),
+        )
+
+        self.assertTrue(result.no_op)
+        self.assertEqual(
+            before,
+            (self.table_rows("purchase_orders"), self.table_rows("alerts")),
+        )
+
+    def test_expanded_r02_v1_marker_remains_a_no_op_after_v2_bump(self) -> None:
+        policy_version = "policy-version-one"
+        original = make_decision()
+        snapshot = SQLiteRepository().load_snapshot(self.path)
+        AtomicDecisionWriter(self.path, policy_version).commit(
+            snapshot,
+            (original,),
+            valid_validation(),
+        )
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            rationale = connection.execute(
+                "SELECT rationale FROM purchase_orders"
+            ).fetchone()[0]
+            self.assertIn("[APEX_AGENT:v2 ", rationale)
+            connection.execute(
+                "UPDATE purchase_orders SET rationale = ?",
+                (rationale.replace("[APEX_AGENT:v2 ", "[APEX_AGENT:v1 ", 1),),
+            )
+        before = (self.table_rows("purchase_orders"), self.table_rows("alerts"))
+        downgraded = SQLiteRepository().load_snapshot(self.path)
+        parsed = parse_owned_purchase_order(downgraded.purchase_orders[0])
+        assert parsed is not None
+        self.assertEqual(parsed.marker_version, 1)
+        managed_ledger = build_ledgers(downgraded).ledger_for(
+            downgraded.purchase_orders[0].component_id
+        )
+        owned_inbound = next(
+            item
+            for item in managed_ledger.committed_inbound
+            if item.po_number == downgraded.purchase_orders[0].po_number
+        )
+        closed = make_decision(selected_plan=None, inbound=(owned_inbound,))
+        reconciled = reconcile_managed_decisions(
+            downgraded,
+            (closed,),
+            policy_version,
+        )
+
+        result = AtomicDecisionWriter(self.path, policy_version).commit(
+            downgraded,
+            reconciled,
+            valid_validation(),
+        )
+
+        self.assertTrue(result.no_op)
+        self.assertEqual(
+            before,
+            (self.table_rows("purchase_orders"), self.table_rows("alerts")),
         )
 
     def test_alert_reconciliation_inserts_missing_deletes_obsolete_and_preserves_external(self) -> None:

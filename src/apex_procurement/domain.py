@@ -918,19 +918,21 @@ class CandidatePlan:
             if total_quantity < self.minimum_compliant_total:
                 raise ValueError("executable quantity cannot be below the calibrated minimum")
             expected_forced = max(ZERO, self.minimum_compliant_total - self.net_requirement)
-            expected_recovery = min(
-                self.recovery_demand,
-                max(ZERO, total_quantity - self.net_requirement),
+            if self.recovery_quantity > max(
+                ZERO,
+                total_quantity - self.net_requirement,
+            ):
+                raise ValueError("recovery quantity cannot exceed selected duplicate supply")
+            recovery_headroom = max(
+                ZERO,
+                self.recovery_quantity - expected_forced,
             )
-            recovery_headroom = max(ZERO, self.recovery_demand - expected_forced)
             expected_discretionary = max(
                 ZERO,
                 total_quantity - self.minimum_compliant_total - recovery_headroom,
             )
             if self.forced_surplus != expected_forced:
                 raise ValueError("forced_surplus is inconsistent with calibration")
-            if self.recovery_quantity != expected_recovery:
-                raise ValueError("recovery_quantity is inconsistent with the selected total")
             if self.discretionary_surplus != expected_discretionary:
                 raise ValueError("discretionary_surplus is inconsistent with calibration")
             for result in evidence:

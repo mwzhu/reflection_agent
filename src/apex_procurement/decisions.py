@@ -29,6 +29,8 @@ from .explanations import (
     parse_owned_alert,
     render_alerts,
     render_decision_rationale,
+    render_legacy_v1_decision_rationale,
+    render_legacy_v1_line_rationale,
     render_line_rationale,
     validate_stored_alert,
 )
@@ -42,7 +44,8 @@ from .repository import (
 from .serialization import canonical_dumps, canonical_loads
 
 
-PO_MARKER_VERSION = 1
+PO_MARKER_VERSION = 2
+_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, PO_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
 _TOKEN = r"[A-Za-z0-9_-]+"
 _PO_MARKER = re.compile(
@@ -137,6 +140,7 @@ class ParsedOwnedPurchaseOrder:
     route_id: str
     line_index: int
     decision: DecisionRecord
+    marker_version: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +262,54 @@ def po_number_for_action(key: str) -> str:
 
 
 def _normalized_decision(decision: DecisionRecord) -> DecisionRecord:
+    if _is_legacy_v1_decision(decision):
+        return decision
     return replace(decision, rationale=render_decision_rationale(decision))
+
+
+def _legacy_v1_record(decision: DecisionRecord) -> str:
+    """Serialize exactly the DecisionRecord schema embedded by marker v1."""
+
+    primitive = canonical_loads(canonical_dumps(decision), dict)
+    primitive.pop("deadline_lateness", None)
+    ledger = primitive.get("supply_ledger")
+    if isinstance(ledger, dict):
+        positions = ledger.get("deadline_positions")
+        if isinstance(positions, list):
+            for position in positions:
+                if isinstance(position, dict):
+                    position.pop("committed_late_quantity", None)
+                    position.pop("committed_unit_late_days", None)
+    plans = [primitive.get("selected_plan")]
+    alternatives = primitive.get("alternatives")
+    if isinstance(alternatives, list):
+        plans.extend(alternatives)
+    for plan in plans:
+        if isinstance(plan, dict):
+            plan.pop("recovery_demand", None)
+            plan.pop("recovery_quantity", None)
+    return canonical_dumps(primitive)
+
+
+def _is_legacy_v1_decision(decision: DecisionRecord) -> bool:
+    plans = tuple(
+        item
+        for item in (decision.selected_plan, *decision.alternatives)
+        if item is not None
+    )
+    return (
+        not decision.deadline_lateness
+        and all(
+            position.committed_late_quantity == 0
+            and position.committed_unit_late_days == 0
+            for position in decision.supply_ledger.deadline_positions
+        )
+        and all(
+            plan.recovery_demand == 0 and plan.recovery_quantity == 0
+            for plan in plans
+        )
+        and decision.rationale == render_legacy_v1_decision_rationale(decision)
+    )
 
 
 def _po_marker(
@@ -269,9 +320,10 @@ def _po_marker(
     policy_pack_version: str,
     line_index: int,
     decision_token: str,
+    version: int = PO_MARKER_VERSION,
 ) -> str:
     return (
-        f"[APEX_AGENT:v{PO_MARKER_VERSION} action={key} demand={demand_digest} "
+        f"[APEX_AGENT:v{version} action={key} demand={demand_digest} "
         f"route={_encoded(route_id)} policy={_encoded(policy_pack_version)} "
         f"line={line_index} record={decision_token}]"
     )
@@ -292,7 +344,11 @@ def _purchase_order_output(
         line.order_date,
         policy_pack_version,
     )
-    record_token = _encoded(canonical_dumps(decision))
+    legacy_v1 = _is_legacy_v1_decision(decision)
+    marker_version = 1 if legacy_v1 else PO_MARKER_VERSION
+    record_token = _encoded(
+        _legacy_v1_record(decision) if legacy_v1 else canonical_dumps(decision)
+    )
     marker = _po_marker(
         key=key,
         demand_digest=demand_digest,
@@ -300,8 +356,14 @@ def _purchase_order_output(
         policy_pack_version=policy_pack_version,
         line_index=line_index,
         decision_token=record_token,
+        version=marker_version,
     )
-    rationale = f"{marker} {render_line_rationale(decision, line)}"
+    line_rationale = (
+        render_legacy_v1_line_rationale(decision, line)
+        if legacy_v1
+        else render_line_rationale(decision, line)
+    )
+    rationale = f"{marker} {line_rationale}"
     return PurchaseOrderOutput(
         action_key=key,
         demand_fingerprint=demand_digest,
@@ -385,24 +447,51 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
                 f"purchase order {order.po_number} has a malformed or missing ownership marker"
             )
         return None
-    if not claims_ownership or int(match.group("version")) != PO_MARKER_VERSION:
+    marker_version = int(match.group("version"))
+    if (
+        not claims_ownership
+        or marker_version not in _SUPPORTED_PO_MARKER_VERSIONS
+    ):
         raise OwnershipMarkerError(
             f"purchase order {order.po_number} has an invalid ownership marker version or number"
         )
     route_id = _decoded(match.group("route"), "route")
     policy_version = _decoded(match.group("policy"), "policy")
     record_json = _decoded(match.group("record"), "record")
+    legacy_v1_schema = False
     try:
         decision = canonical_loads(record_json, DecisionRecord)
-    except (TypeError, ValueError) as error:
-        raise OwnershipMarkerError(
-            f"purchase order {order.po_number} contains an invalid decision record"
-        ) from error
-    if _encoded(canonical_dumps(decision)) != match.group("record"):
+    except (TypeError, ValueError) as strict_error:
+        if marker_version != 1:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} contains an invalid decision record"
+            ) from strict_error
+        try:
+            decision = canonical_loads(
+                record_json,
+                DecisionRecord,
+                allow_missing_defaults=True,
+            )
+            legacy_v1_schema = True
+        except (TypeError, ValueError) as compatibility_error:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} contains an invalid decision record"
+            ) from compatibility_error
+    expected_record = (
+        _legacy_v1_record(decision)
+        if legacy_v1_schema
+        else canonical_dumps(decision)
+    )
+    if _encoded(expected_record) != match.group("record"):
         raise OwnershipMarkerError(
             f"purchase order {order.po_number} contains a non-canonical decision record"
         )
-    if decision.rationale != render_decision_rationale(decision):
+    decision_rationale = (
+        render_legacy_v1_decision_rationale(decision)
+        if legacy_v1_schema
+        else render_decision_rationale(decision)
+    )
+    if decision.rationale != decision_rationale:
         raise OwnershipMarkerError(
             f"purchase order {order.po_number} contains non-canonical decision rationale"
         )
@@ -444,8 +533,14 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         policy_pack_version=policy_version,
         line_index=line_index,
         decision_token=match.group("record"),
+        version=marker_version,
     )
-    expected_rationale = f"{marker} {render_line_rationale(decision, line)}"
+    line_rationale = (
+        render_legacy_v1_line_rationale(decision, line)
+        if legacy_v1_schema
+        else render_line_rationale(decision, line)
+    )
+    expected_rationale = f"{marker} {line_rationale}"
     expected_fields = (
         line.component_id,
         line.supplier_id,
@@ -475,6 +570,7 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         route_id=route_id,
         line_index=line_index,
         decision=decision,
+        marker_version=marker_version,
     )
 
 
@@ -771,7 +867,15 @@ class AtomicDecisionWriter:
                         raise ActionCollisionError(
                             f"purchase-order number collision at {target.po_number}"
                         )
-                    if _stored_fields(same_number) != target.business_fields:
+                    stored_fields = _stored_fields(same_number)
+                    older_marker_equivalent = (
+                        parsed.marker_version < PO_MARKER_VERSION
+                        and stored_fields[:-1] == target.business_fields[:-1]
+                    )
+                    if (
+                        stored_fields != target.business_fields
+                        and not older_marker_equivalent
+                    ):
                         raise ActionCollisionError(
                             f"action key {target.action_key} matches different business fields"
                         )
@@ -888,7 +992,7 @@ class AtomicDecisionWriter:
             raise CommitPostconditionError("purchase-order target set does not match committed rows")
         for number, target in targets.items():
             stored = after_orders.get(number)
-            if stored is None or _stored_fields(stored) != target.business_fields:
+            if stored is None:
                 raise CommitPostconditionError(
                     f"purchase order {number} failed exact business-field post-validation"
                 )
@@ -896,6 +1000,18 @@ class AtomicDecisionWriter:
             if parsed is None or parsed.action_key != target.action_key:
                 raise CommitPostconditionError(
                     f"purchase order {number} failed ownership post-validation"
+                )
+            stored_fields = _stored_fields(stored)
+            older_marker_equivalent = (
+                parsed.marker_version < PO_MARKER_VERSION
+                and stored_fields[:-1] == target.business_fields[:-1]
+            )
+            if (
+                stored_fields != target.business_fields
+                and not older_marker_equivalent
+            ):
+                raise CommitPostconditionError(
+                    f"purchase order {number} failed exact business-field post-validation"
                 )
         reconstruct_managed_decisions(after)
 

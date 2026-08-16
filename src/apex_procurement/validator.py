@@ -138,6 +138,7 @@ class IndependentSolve:
     minimum_compliant_total: Decimal | None = None
     cheapest_covering_cost: Decimal | None = None
     certificate_complete: bool = True
+    recovery_quantity: Decimal = ZERO
 
 
 @dataclass(frozen=True, slots=True)
@@ -1361,6 +1362,81 @@ class IndependentPlanValidator:
         named_quantity = quantities.get(named.supplier_id or "", ZERO)
         return max((max(ZERO, value - named_quantity) for key, value in quantities.items() if key != named.supplier_id), default=ZERO)
 
+    def _plan_recovery_capacity(
+        self,
+        requirement: _SourceRequirement,
+        plan: CandidatePlan,
+        offers: Sequence[_Offer],
+    ) -> Decimal:
+        """Bound classified recovery from the plan's actual route allocations."""
+
+        matched = {
+            line.route_id: self._match_offer(offers, line)
+            for line in plan.lines
+        }
+        source_segments = self._supply_segments(requirement)
+        total_capacity = ZERO
+        recovered = ZERO
+        for bucket_index, (due, _quantity) in enumerate(
+            requirement.bucket_quantities
+        ):
+            route_capacity: list[list[object]] = []
+            for line in plan.lines:
+                offer = matched[line.route_id]
+                if offer is None:
+                    continue
+                allocated = sum(
+                    (
+                        allocation.quantity
+                        for allocation in line.bucket_allocations
+                        if allocation.due_date == due
+                    ),
+                    ZERO,
+                )
+                if allocated > ZERO:
+                    route_capacity.append(
+                        [offer.material_available, offer.route_fingerprint, allocated]
+                    )
+            total_capacity += sum(
+                (item[2] for item in route_capacity if isinstance(item[2], Decimal)),
+                ZERO,
+            )
+            late_segments = sorted(
+                (
+                    segment
+                    for segment in source_segments
+                    if segment.bucket_index == bucket_index
+                    and segment.committed
+                    and segment.material_available is not None
+                    and segment.material_available > due
+                ),
+                key=lambda item: item.material_available or date.max,
+            )
+            for segment in late_segments:
+                remaining = segment.quantity
+                assert segment.material_available is not None
+                for route in sorted(
+                    route_capacity,
+                    key=lambda item: (item[0], item[1]),
+                    reverse=True,
+                ):
+                    material_available, _fingerprint, available = route
+                    assert isinstance(material_available, date)
+                    assert isinstance(available, Decimal)
+                    if material_available >= segment.material_available:
+                        continue
+                    assigned = min(remaining, available)
+                    remaining -= assigned
+                    route[2] = available - assigned
+                    recovered += assigned
+                    if remaining == ZERO:
+                        break
+        recovery_budget = max(
+            ZERO,
+            total_capacity - plan.eventual_covered_quantity,
+        )
+        return min(recovered, recovery_budget)
+
     def _objective(
         self,
         snapshot: ScenarioSnapshot,
@@ -1390,7 +1466,6 @@ class IndependentPlanValidator:
             ),
             ZERO,
         )
-        recovery_demand = self._recovery_demand(requirement, offers)
         # Stage 4 counts the normalized union of assumption codes.  Multiple
         # policy branches can depend on the same unknown fact, so counting
         # evidence rows or per-route totals would double-charge it.
@@ -1468,7 +1543,9 @@ class IndependentPlanValidator:
             plan.total_cost,
             max(
                 ZERO,
-                total_quantity - requirement.eventual_gap - recovery_demand,
+                total_quantity
+                - requirement.eventual_gap
+                - plan.recovery_quantity,
             ),
             weighted_lead,
             Decimal(len(plan.lines)),
@@ -2390,25 +2467,93 @@ class IndependentPlanValidator:
                 upper=0,
             )
 
-        moq_excess = model.add_variable(
-            "moq_excess", 0, sum(upper_atoms)
-        )
         planning_requirement = requirement.eventual_gap + recovery_demand
+        total_upper = sum(upper_atoms)
+        q_min_atoms = _ceil_units(q_min or ZERO, atom)
+        forced_atoms = max(0, q_min_atoms - eventual_gap_atoms)
+        recovery_coefficients = {
+            recovery_allocations[offer_index][segment_index]: -1
+            for offer_index in range(len(offers))
+            for segment_index in range(len(recovery_segments))
+        }
+        moq_excess = model.add_variable(
+            "moq_excess", 0, total_upper
+        )
         model.add_row(
-            {moq_excess: 1, **{variable: -1 for variable in x}},
-            lower=-_ceil_units(planning_requirement, atom),
+            {
+                moq_excess: 1,
+                **{variable: -1 for variable in x},
+                **{
+                    recovery_allocations[offer_index][segment_index]: 1
+                    for offer_index in range(len(offers))
+                    for segment_index in range(len(recovery_segments))
+                },
+            },
+            lower=-eventual_gap_atoms,
         )
 
         discretionary = model.add_variable(
-            "discretionary_surplus", 0, sum(upper_atoms)
+            "discretionary_surplus", 0, total_upper
         )
+        discretionary_coefficients = {
+            discretionary: 1,
+            **{variable: -1 for variable in x},
+        }
+        if not recovery_segments:
+            model.add_row(
+                discretionary_coefficients,
+                lower=-q_min_atoms,
+            )
+        elif forced_atoms == 0:
+            model.add_row(
+                {
+                    **discretionary_coefficients,
+                    **{
+                        variable: -coefficient
+                        for variable, coefficient in recovery_coefficients.items()
+                    },
+                },
+                lower=-q_min_atoms,
+            )
+        else:
+            recovery_credit = model.add_variable(
+                "recovery_credit", 0, total_upper
+            )
+            recovery_credit_active = model.add_variable(
+                "recovery_credit_active", 0, 1
+            )
+            model.add_row(
+                {recovery_credit: 1, **recovery_coefficients},
+                upper=0,
+            )
+            model.add_row(
+                {
+                    recovery_credit: 1,
+                    recovery_credit_active: -total_upper,
+                },
+                upper=0,
+            )
+            model.add_row(
+                {
+                    recovery_credit: 1,
+                    **recovery_coefficients,
+                    recovery_credit_active: total_upper,
+                },
+                upper=total_upper - forced_atoms,
+            )
+            model.add_row(
+                {
+                    **discretionary_coefficients,
+                    recovery_credit: 1,
+                },
+                lower=-q_min_atoms,
+            )
 
         if solve_kind is SolveKind.EXECUTABLE:
             if q_min is None or cheapest_covering_cost is None:
                 return IndependentSolve(
                     SolverStatus.ERROR, (), certificate_complete=False
                 )
-            q_min_atoms = _ceil_units(q_min, atom)
             model.add_row(
                 {
                     baseline_allocations[offer_index][bucket_index]: 1
@@ -2418,12 +2563,6 @@ class IndependentPlanValidator:
                     )
                 },
                 lower=_ceil_units(min(q_min, requirement.eventual_gap), atom),
-            )
-            forced = max(ZERO, q_min - requirement.eventual_gap)
-            recovery_headroom = max(ZERO, recovery_demand - forced)
-            model.add_row(
-                {discretionary: 1, **{variable: -1 for variable in x}},
-                lower=-_ceil_units(q_min + recovery_headroom, atom),
             )
             surplus_cap = (
                 self.autonomy.max_surplus_fraction
@@ -2800,6 +2939,16 @@ class IndependentPlanValidator:
                 ),
                 minimum_compliant_total=q_min,
                 cheapest_covering_cost=cheapest_covering_cost,
+                recovery_quantity=Decimal(
+                    sum(
+                        last_values[
+                            recovery_allocations[offer_index][segment_index]
+                        ]
+                        for offer_index in range(len(offers))
+                        for segment_index in range(len(recovery_segments))
+                    )
+                )
+                * atom,
             )
         except _IndependentSolveInterrupted as interrupted:
             return IndependentSolve(
@@ -3367,14 +3516,15 @@ class IndependentPlanValidator:
                 component_id=component_id,
                 plan_id=plan_id,
             )
-        expected_recovery_quantity = min(
-            independent_recovery_demand,
-            max(ZERO, total_quantity - plan.net_requirement),
+        recovery_capacity = self._plan_recovery_capacity(
+            requirement,
+            plan,
+            offers,
         )
-        if plan.recovery_quantity != expected_recovery_quantity:
+        if plan.recovery_quantity > recovery_capacity:
             sink.error(
                 "RECOVERY_QUANTITY_MISMATCH",
-                "Recovery quantity does not match the independently reconstructed authorized bridge quantity.",
+                "Recovery quantity exceeds strictly improving quantity supported by the plan's actual route allocations.",
                 component_id=component_id,
                 plan_id=plan_id,
             )
@@ -3384,7 +3534,7 @@ class IndependentPlanValidator:
             forced = max(ZERO, plan.minimum_compliant_total - plan.net_requirement)
             recovery_headroom = max(
                 ZERO,
-                independent_recovery_demand - forced,
+                plan.recovery_quantity - forced,
             )
             discretionary = max(
                 ZERO,
@@ -3715,6 +3865,18 @@ class IndependentPlanValidator:
                 != baseline_own.cheapest_covering_cost
             ):
                 sink.error("BASELINE_COST_MISMATCH", "Persisted cheapest_covering_cost differs from independent solve 0.", component_id=decision.component_id, plan_id=selected.plan_id)
+                verified = False
+            if (
+                independently_proven.get(SolveKind.EXECUTABLE)
+                and executable_own.recovery_quantity
+                != selected.recovery_quantity
+            ):
+                sink.error(
+                    "RECOVERY_QUANTITY_MISMATCH",
+                    "Persisted recovery quantity differs from the independent executable solve's classified recovery allocation.",
+                    component_id=decision.component_id,
+                    plan_id=selected.plan_id,
+                )
                 verified = False
             if (
                 independently_proven.get(SolveKind.BASELINE)

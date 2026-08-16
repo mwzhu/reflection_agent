@@ -8,7 +8,7 @@ untrusted JSON.
 
 from __future__ import annotations
 
-from dataclasses import fields, is_dataclass
+from dataclasses import MISSING, fields, is_dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
@@ -95,7 +95,12 @@ def canonical_dumps(value: object) -> str:
     )
 
 
-def _from_primitive(value: object, expected_type: Any) -> object:
+def _from_primitive(
+    value: object,
+    expected_type: Any,
+    *,
+    allow_missing_defaults: bool,
+) -> object:
     if expected_type is Any:
         return value
 
@@ -109,7 +114,11 @@ def _from_primitive(value: object, expected_type: Any) -> object:
             if option is type(None):
                 continue
             try:
-                return _from_primitive(value, option)
+                return _from_primitive(
+                    value,
+                    option,
+                    allow_missing_defaults=allow_missing_defaults,
+                )
             except (TypeError, ValueError, KeyError) as error:
                 failures.append(error)
         raise TypeError(f"value does not match {expected_type!r}") from failures[-1]
@@ -118,11 +127,22 @@ def _from_primitive(value: object, expected_type: Any) -> object:
         if not isinstance(value, list):
             raise TypeError("serialized tuple must be a JSON array")
         if len(arguments) == 2 and arguments[1] is Ellipsis:
-            return tuple(_from_primitive(item, arguments[0]) for item in value)
+            return tuple(
+                _from_primitive(
+                    item,
+                    arguments[0],
+                    allow_missing_defaults=allow_missing_defaults,
+                )
+                for item in value
+            )
         if len(value) != len(arguments):
             raise ValueError("serialized fixed tuple has the wrong length")
         return tuple(
-            _from_primitive(item, item_type)
+            _from_primitive(
+                item,
+                item_type,
+                allow_missing_defaults=allow_missing_defaults,
+            )
             for item, item_type in zip(value, arguments, strict=True)
         )
 
@@ -147,16 +167,35 @@ def _from_primitive(value: object, expected_type: Any) -> object:
         if not isinstance(value, dict):
             raise TypeError("serialized dataclass must be a JSON object")
         hints = get_type_hints(expected_type)
-        expected_names = {field.name for field in fields(expected_type)}
+        dataclass_fields = fields(expected_type)
+        expected_names = {field.name for field in dataclass_fields}
         actual_names = set(value)
-        if actual_names != expected_names:
-            missing = sorted(expected_names - actual_names)
-            extra = sorted(actual_names - expected_names)
-            raise ValueError(f"serialized fields differ; missing={missing}, extra={extra}")
+        missing_required = sorted(
+            field.name
+            for field in dataclass_fields
+            if field.name not in actual_names
+            and (
+                not allow_missing_defaults
+                or (
+                    field.default is MISSING
+                    and field.default_factory is MISSING
+                )
+            )
+        )
+        extra = sorted(actual_names - expected_names)
+        if missing_required or extra:
+            raise ValueError(
+                f"serialized fields differ; missing={missing_required}, extra={extra}"
+            )
         return expected_type(
             **{
-                field.name: _from_primitive(value[field.name], hints[field.name])
-                for field in fields(expected_type)
+                field.name: _from_primitive(
+                    value[field.name],
+                    hints[field.name],
+                    allow_missing_defaults=allow_missing_defaults,
+                )
+                for field in dataclass_fields
+                if field.name in actual_names
             }
         )
     if expected_type is bool:
@@ -171,6 +210,10 @@ def _from_primitive(value: object, expected_type: Any) -> object:
         if not isinstance(value, str):
             raise TypeError("expected str")
         return value
+    if expected_type is dict:
+        if not isinstance(value, dict):
+            raise TypeError("expected object")
+        return value
     if expected_type is type(None):
         if value is not None:
             raise TypeError("expected null")
@@ -178,7 +221,12 @@ def _from_primitive(value: object, expected_type: Any) -> object:
     raise TypeError(f"unsupported deserialization type: {expected_type!r}")
 
 
-def canonical_loads(payload: str, expected_type: type[SerializableT]) -> SerializableT:
+def canonical_loads(
+    payload: str,
+    expected_type: type[SerializableT],
+    *,
+    allow_missing_defaults: bool = False,
+) -> SerializableT:
     """Deserialize deterministic JSON into an explicitly supplied safe type."""
 
     if not isinstance(payload, str):
@@ -211,7 +259,11 @@ def canonical_loads(payload: str, expected_type: type[SerializableT]) -> Seriali
         )
     except RecursionError as error:
         raise ValueError("serialized payload is nested too deeply") from error
-    return _from_primitive(primitive, expected_type)  # type: ignore[return-value]
+    return _from_primitive(  # type: ignore[return-value]
+        primitive,
+        expected_type,
+        allow_missing_defaults=allow_missing_defaults,
+    )
 
 
 __all__ = [
