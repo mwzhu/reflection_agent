@@ -454,6 +454,64 @@ class IndependentValidatorMutationTests(unittest.TestCase):
 
 
 class IndependentValidatorEdgeTests(unittest.TestCase):
+    def test_represented_sub_moq_proposal_may_share_the_selected_route(self) -> None:
+        snapshot = _snapshot(demand=Decimal("1"), moq=Decimal("5"))
+        decision, results, validator = _decision_and_results(
+            snapshot,
+            quantity=Decimal("5"),
+        )
+        selected = decision.selected_plan
+        assert selected is not None
+        sub_moq_rule = validator._rules(
+            snapshot.configuration.current_date,
+            "sub_moq_written_approval",
+        )[0].rule_id
+        line = replace(
+            selected.lines[0],
+            quantity=Decimal("1"),
+            bucket_allocations=(BucketAllocation(DUE, Decimal("1")),),
+        )
+        proposal = replace(
+            selected,
+            plan_id="sub-moq-proposal",
+            disposition=PlanDisposition.RECOMMEND_APPROVAL,
+            lines=(line,),
+            total_cost=line.line_total,
+            minimum_compliant_total=None,
+            cheapest_covering_cost=None,
+            forced_surplus=Decimal("0"),
+            relaxed_rule_ids=(sub_moq_rule,),
+            unresolved_approval_ids=(sub_moq_rule,),
+            summary="Sub-MOQ proposal awaiting written supplier approval.",
+        )
+        requirement = validator._source_requirements(
+            snapshot,
+            type("Sink", (), {"error": lambda *args, **kwargs: None})(),
+        )[decision.component_id]
+        offers = validator._offers(
+            snapshot,
+            requirement,
+            decision.evidence_contract,
+            include_unapproved=True,
+        )
+        proposal = replace(
+            proposal,
+            objective_vector=validator._objective(
+                snapshot,
+                requirement,
+                proposal,
+                offers,
+            ),
+        )
+        result = validator.validate(
+            snapshot,
+            (replace(decision, alternatives=(proposal,)),),
+            results,
+        )
+        self.assertNotIn("MOQ_VIOLATION", _codes(result))
+        self.assertNotIn("DUPLICATE_ACTION", _codes(result))
+        self.assertTrue(result.is_valid, result.issues)
+
     def test_forced_surplus_is_not_ratio_gated(self) -> None:
         snapshot = _snapshot(demand=Decimal("1"), moq=Decimal("5"))
         decision, results, validator = _decision_and_results(snapshot, quantity=Decimal("5"))
@@ -561,6 +619,62 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
 
 
 class IndependentInvariantRecomputationTests(unittest.TestCase):
+    def test_aggregate_critical_inference_remains_unknown_after_child_negative(self) -> None:
+        component = Component(
+            "component-pcb",
+            "PCB Assembly (6-layer)",
+            None,
+            "Electronic Component",
+            "each",
+            False,
+        )
+        self.assertEqual(
+            IndependentPlanValidator()._concept("critical_component", component),
+            EvidenceStatus.UNKNOWN,
+        )
+
+    def test_fractional_increment_executable_skips_redundant_calibration_sweep(self) -> None:
+        component = Component(
+            "component-liquid",
+            "Generated Liquid",
+            None,
+            "Raw Material",
+            "kg",
+            False,
+        )
+        first = _supplier("supplier-a", name="Generated First Supply")
+        second = _supplier("supplier-b", name="Generated Second Supply")
+        snapshot = _snapshot(
+            demand=Decimal("5"),
+            component=component,
+            suppliers=(first, second),
+            catalogs=(
+                SupplierCatalogLine(
+                    first.supplier_id,
+                    component.component_id,
+                    Decimal("9.5"),
+                    3,
+                    Decimal("25"),
+                ),
+                SupplierCatalogLine(
+                    second.supplier_id,
+                    component.component_id,
+                    Decimal("8.75"),
+                    3,
+                    Decimal("50"),
+                ),
+            ),
+        )
+        decision, _results, _validator = _decision_and_results(
+            snapshot,
+            quantity=Decimal("25"),
+        )
+        result = IndependentPlanValidator(
+            enumeration_node_limit=10_000
+        ).independently_solve(snapshot, decision, SolveKind.EXECUTABLE)
+        self.assertEqual(result.status, SolverStatus.OPTIMAL)
+        self.assertTrue(result.certificate_complete)
+
     def test_complete_objective_schema_has_every_documented_subobjective(self) -> None:
         snapshot = _snapshot()
         decision, _results, validator = _decision_and_results(snapshot)
