@@ -2244,7 +2244,8 @@ class ProcurementOptimizer:
                 relaxed_rule_id=None,
             )
             diagnostic_result = self.solver.solve(diagnostic_problem)
-            if diagnostic_result.candidate_plan is not None:
+            diagnostic_plan = diagnostic_result.candidate_plan
+            if diagnostic_plan is not None:
                 ignored_rules = tuple(
                     sorted(
                         {
@@ -2258,16 +2259,15 @@ class ProcurementOptimizer:
                         }
                     )
                 )
-                alternatives.append(
-                    replace(
-                        diagnostic_result.candidate_plan,
-                        relaxed_rule_ids=ignored_rules,
-                        summary=(
-                            "Non-executable compliance-cost diagnostic; allocation "
-                            "rules are intentionally excluded and no waiver is claimed."
-                        ),
-                    )
+                diagnostic_plan = replace(
+                    diagnostic_plan,
+                    relaxed_rule_ids=ignored_rules,
+                    summary=(
+                        "Non-executable compliance-cost diagnostic; allocation "
+                        "rules are intentionally excluded and no waiver is claimed."
+                    ),
                 )
+                alternatives.append(diagnostic_plan)
             secondary_counterfactuals: list[SolverResult] = []
             if kind is SecondaryShortageKind.RELAXABLE:
                 relaxation_candidates = tuple(
@@ -2333,7 +2333,7 @@ class ProcurementOptimizer:
                     "SECONDARY_ALLOCATION_UNSATISFIABLE",
                     f"The prospective secondary-allocation rule is {kind.value}ly unsatisfiable with fewer than two eligible suppliers.",
                     problem.component_id,
-                    diagnostic_result.candidate_plan,
+                    diagnostic_plan,
                     (problem.minimum_secondary_rule_id,) if problem.minimum_secondary_rule_id else (),
                 )
             )
