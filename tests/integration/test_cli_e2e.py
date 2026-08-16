@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import closing, redirect_stdout
 from dataclasses import replace
+from decimal import Decimal
 from io import StringIO
 from pathlib import Path
 import shutil
@@ -15,11 +16,14 @@ from unittest.mock import patch
 
 from apex_procurement.cli import PlanningFailure, main, run
 from apex_procurement.config import RuntimeConfig
-from apex_procurement.domain import ValidationIssue, ValidationSeverity
+from apex_procurement.domain import SolveKind, ValidationIssue, ValidationSeverity
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = PROJECT_ROOT / "data" / "scenarios" / "scenario_06_simple.sqlite"
+SCENARIO_04 = (
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_04_low_inventory.sqlite"
+)
 ASSIGNED_SCENARIOS = (
     PROJECT_ROOT / "data" / "scenarios" / "scenario_01_baseline.sqlite",
     PROJECT_ROOT / "data" / "scenarios" / "scenario_03_tight_timeline.sqlite",
@@ -139,6 +143,28 @@ class AssembledCliTests(unittest.TestCase):
                 self.assertTrue(
                     all(row[1] <= 0.8 * magnet_total for row in magnet_rows)
                 )
+
+    def test_scenario_four_baselines_match_independent_late_supply_oracle(self) -> None:
+        scenario = Path(self.temporary_directory.name) / SCENARIO_04.name
+        shutil.copy2(SCENARIO_04, scenario)
+
+        artifacts = run(RuntimeConfig(scenario))
+        baselines = {
+            item.component_id: item.objective_vector
+            for item in artifacts.solver_results
+            if item.solve_kind is SolveKind.BASELINE
+        }
+
+        self.assertEqual(
+            baselines["CMP-013"],
+            (Decimal("0"), Decimal("337.500")),
+        )
+        self.assertEqual(
+            baselines["CMP-015"],
+            (Decimal("0"), Decimal("240.500")),
+        )
+        self.assertTrue(artifacts.validation.is_valid)
+        self.assertGreater(len(artifacts.commit.committed_po_numbers), 0)
 
     def test_strict_warning_fails_before_any_write(self) -> None:
         before = output_rows(self.path)
