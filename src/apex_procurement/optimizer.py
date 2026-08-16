@@ -1130,17 +1130,21 @@ def _strategic_coefficients(context: _ModelContext) -> dict[int, Fraction]:
     return result
 
 
-def _objectives(context: _ModelContext) -> tuple[tuple[_Objective, ...], ...]:
+def _objectives(
+    context: _ModelContext,
+    *,
+    staged: bool = False,
+) -> tuple[tuple[_Objective, ...], ...]:
     """Return stages; a stage may contain ordered sub-objectives."""
 
     size = len(context.model.names)
     zero = tuple(Fraction() for _ in range(size))
-    if context.problem.solve_kind is SolveKind.QUANTITY_CALIBRATION:
+    if not staged and context.problem.solve_kind is SolveKind.QUANTITY_CALIBRATION:
         return (
             (_Objective("quantity_calibration_coverage", _coefficients(context, {context.eventual_gap: 1}), _fraction(context.quantity_atom)),),
             (_Objective("quantity_calibration_total", _coefficients(context, {item: 1 for item in context.x}), _fraction(context.quantity_atom)),),
         )
-    if context.problem.solve_kind is SolveKind.BASELINE:
+    if not staged and context.problem.solve_kind is SolveKind.BASELINE:
         cost = {
             context.x[index]: _fraction(route.unit_price * context.quantity_atom)
             for index, route in enumerate(context.routes)
@@ -1202,6 +1206,90 @@ def _objectives(context: _ModelContext) -> tuple[tuple[_Objective, ...], ...]:
             ),
         ),
     )
+
+
+def _fixed_staged_objective_vector(
+    context: _ModelContext,
+    values: Sequence[int],
+) -> tuple[Decimal, ...]:
+    """Evaluate the literal staged objectives for a solve-0 fixed plan."""
+
+    exact = list(values)
+    total = sum(values[index] for index in context.x)
+    net = _atoms(context.problem.net_requirement, context.quantity_atom)
+    exact[context.discretionary] = 0
+    exact[context.moq_excess] = max(0, total - net)
+
+    positions = {
+        item.due_date: item for item in context.problem.supply_ledger.deadline_positions
+    }
+    for bucket_index, bucket in enumerate(context.buckets):
+        required = _atoms(
+            max(
+                ZERO,
+                bucket.cumulative_quantity
+                - positions[bucket.due_date].on_time_supply,
+            ),
+            context.quantity_atom,
+        )
+        available = sum(
+            values[context.z[route_index][allocated_index]]
+            for route_index, route in enumerate(context.routes)
+            if route.material_available_date <= bucket.due_date
+            for allocated_index in range(bucket_index + 1)
+        )
+        exact[context.unresolved[bucket_index]] = max(0, required - available)
+
+    review_routes: dict[str, list[int]] = defaultdict(list)
+    for route_index, route in enumerate(context.routes):
+        for key in _review_keys(route):
+            review_routes[key].append(route_index)
+    for variable, (_key, route_indexes) in zip(
+        context.review_exposure,
+        sorted(review_routes.items()),
+        strict=True,
+    ):
+        exact[variable] = int(any(values[context.y[index]] for index in route_indexes))
+
+    named_indexes = tuple(
+        index
+        for index, route in enumerate(context.routes)
+        if route.supplier_id == context.problem.named_primary_supplier_id
+    )
+    named_quantity = sum(values[context.x[index]] for index in named_indexes)
+    exact[context.named_deviation] = max(
+        (
+            max(
+                0,
+                sum(
+                    values[context.x[index]]
+                    for index, route in enumerate(context.routes)
+                    if route.supplier_id == supplier_id
+                )
+                - named_quantity,
+            )
+            for supplier_id in {
+                route.supplier_id
+                for route in context.routes
+                if route.supplier_id != context.problem.named_primary_supplier_id
+            }
+        ),
+        default=0,
+    ) if context.problem.named_primary_supplier_id is not None else 0
+
+    result: list[Decimal] = []
+    for stage in _objectives(context, staged=True):
+        for objective in stage:
+            if not objective.emitted:
+                continue
+            coefficients, scale = objective.integer_coefficients()
+            result.append(
+                _decimal(
+                    Fraction(_objective_value(coefficients, exact), scale)
+                    * objective.divisor
+                )
+            )
+    return tuple(result)
 
 
 def _objective_value(coefficients: Sequence[int], values: Sequence[int]) -> int:
@@ -1851,10 +1939,16 @@ class IntegerScaledSolver:
                 )
 
         disposition = _disposition(problem, context, final_values)
+        plan_objective_vector = tuple(objective_vector)
+        if problem.solve_kind is SolveKind.BASELINE:
+            plan_objective_vector = _fixed_staged_objective_vector(
+                context,
+                final_values,
+            )
         plan = _build_plan(
             context,
             final_values,
-            tuple(objective_vector),
+            plan_objective_vector,
             disposition,
             exact=True,
         )
