@@ -450,9 +450,17 @@ def build_ledgers(
             availability.material_available_date
         )
 
+    # Import locally to avoid making the physical-ledger module part of the
+    # decisions module's initialization path.
+    from .decisions import parse_owned_purchase_order
+
     inbound_by_component: dict[str, list[InboundSupply]] = defaultdict(list)
     current_date = snapshot.configuration.current_date
     for purchase_order in snapshot.purchase_orders:
+        # Ownership is established from the validated full marker, never from
+        # the APX prefix alone.  Managed rows remain physical inbound, but the
+        # canonical action fingerprint must be able to exclude them.
+        managed = parse_owned_purchase_order(purchase_order)
         delivery_date = purchase_order.expected_delivery_date
         if delivery_date is None:
             alerts.append(
@@ -485,6 +493,11 @@ def build_ledgers(
                 expected_delivery_date=delivery_date,
                 order_date=purchase_order.order_date,
                 unit_price=purchase_order.unit_price,
+                agent_owned=managed is not None,
+                action_key=managed.action_key if managed is not None else None,
+                demand_fingerprint=(
+                    managed.demand_fingerprint if managed is not None else None
+                ),
             )
         )
 
