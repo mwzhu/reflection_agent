@@ -42,6 +42,7 @@ from apex_procurement.domain import (
     SupplyLedger,
 )
 from apex_procurement.validator import (
+    _EXECUTABLE_OBJECTIVE_SUFFIX,
     IndependentPlanValidator,
     NamedEntityOutcome,
 )
@@ -410,11 +411,21 @@ class IndependentValidatorMutationTests(unittest.TestCase):
         )
         self.assertIn("REQUIREMENT_STATE_MISMATCH", self.validate_mutation(self.decision))
 
-    def test_objective_vector_mutation_is_caught(self) -> None:
+    def test_every_executable_objective_field_mutation_is_caught(self) -> None:
         plan = self.decision.selected_plan
         assert plan is not None
-        object.__setattr__(plan, "objective_vector", plan.objective_vector[:-1] + (Decimal("99"),))
-        self.assertIn("OBJECTIVE_VECTOR_MISMATCH", self.validate_mutation(self.decision))
+        labels = ("stage_01_unresolved",) + _EXECUTABLE_OBJECTIVE_SUFFIX
+        self.assertEqual(len(plan.objective_vector), len(labels))
+        for index, label in enumerate(labels):
+            with self.subTest(label=label):
+                values = list(plan.objective_vector)
+                values[index] += Decimal("1")
+                mutated = replace(plan, objective_vector=tuple(values))
+                decision = replace(self.decision, selected_plan=mutated)
+                self.assertIn(
+                    "OBJECTIVE_VECTOR_MISMATCH",
+                    self.validate_mutation(decision),
+                )
 
     def test_feasible_but_suboptimal_incumbent_is_rejected(self) -> None:
         second = _supplier("supplier-b", name="Generated Cheap Supply")
@@ -538,6 +549,84 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
 
 
 class IndependentInvariantRecomputationTests(unittest.TestCase):
+    def test_complete_objective_schema_has_every_documented_subobjective(self) -> None:
+        snapshot = _snapshot()
+        decision, _results, validator = _decision_and_results(snapshot)
+        plan = decision.selected_plan
+        assert plan is not None
+        self.assertEqual(
+            plan.objective_vector,
+            (
+                Decimal("0"),   # stage 1 deadline gap
+                Decimal("0"),   # stage 2 unit-late-days
+                Decimal("0"),   # stage 3 discretionary surplus
+                Decimal("1"),   # stage 4 review exposure
+                Decimal("0"),   # stage 5 named-primary deviation
+                Decimal("0"),   # stage 6 international volume
+                Decimal("0"),   # stage 7 strategic shift
+                Decimal("0"),   # stage 8 sustainability band
+                Decimal("10"),  # stage 9 known landed cost
+                Decimal("5"),   # stage 9 total, affine to MOQ excess
+                Decimal("15"),  # stage 10 total lead time
+                Decimal("1"),   # stage 10 line count
+                Decimal("5"),   # stage 10 ID-free fingerprint rank
+            ),
+        )
+
+    def test_stage_4_counts_reviewed_rules_not_assumption_codes(self) -> None:
+        component = Component(
+            "component-review",
+            "Pressure Transducer",
+            "0-100 PSI sensor",
+            "Electronic Component",
+            "each",
+            False,
+        )
+        snapshot = _snapshot(component=component)
+        decision, _results, _validator = _decision_and_results(snapshot)
+        plan = decision.selected_plan
+        assert plan is not None
+        self.assertEqual(plan.assumption_codes, ("ROLLING_HISTORY_UNKNOWN",))
+        self.assertEqual(plan.objective_vector[3], Decimal("2"))
+
+    def test_stage_10_fingerprint_rank_excludes_surrogate_supplier_ids(self) -> None:
+        first = _supplier("supplier-first", name="Generated Alpha Supply")
+        second = _supplier("supplier-second", name="Generated Beta Supply")
+        catalogs = (
+            SupplierCatalogLine(first.supplier_id, "component-a", Decimal("2"), 3, Decimal("1")),
+            SupplierCatalogLine(second.supplier_id, "component-a", Decimal("3"), 3, Decimal("1")),
+        )
+        snapshot = _snapshot(suppliers=(first, second), catalogs=catalogs)
+        decision, _results, validator = _decision_and_results(snapshot)
+        plan = decision.selected_plan
+        assert plan is not None
+        requirement = validator._source_requirements(
+            snapshot, type("Sink", (), {"error": lambda *args, **kwargs: None})()
+        )["component-a"]
+        offers = validator._offers(snapshot, requirement, EvidenceContract.BENCHMARK)
+        selected_offer = validator._match_offer(offers, plan.lines[0])
+        assert selected_offer is not None
+        expected = plan.lines[0].quantity * Decimal(
+            validator._fingerprint_ranks(offers)[selected_offer]
+        )
+        self.assertEqual(plan.objective_vector[-1], expected)
+
+        renamed_first = replace(first, supplier_id="renamed-first")
+        renamed_second = replace(second, supplier_id="renamed-second")
+        renamed = _snapshot(
+            suppliers=(renamed_first, renamed_second),
+            catalogs=(
+                replace(catalogs[0], supplier_id=renamed_first.supplier_id),
+                replace(catalogs[1], supplier_id=renamed_second.supplier_id),
+            ),
+        )
+        renamed_decision, _renamed_results, _renamed_validator = _decision_and_results(renamed)
+        assert renamed_decision.selected_plan is not None
+        self.assertEqual(
+            renamed_decision.selected_plan.objective_vector[-1],
+            plan.objective_vector[-1],
+        )
+
     def test_larger_quantity_case_completes_all_three_independent_solves(self) -> None:
         second = _supplier("supplier-b", name="Generated Alternate")
         snapshot = _snapshot(

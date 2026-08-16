@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
+import hashlib
 from itertools import combinations
+import json
 import re
 import unicodedata
 
@@ -65,6 +67,20 @@ _SYNTHETIC_RULE_PREFIXES = (
     "MASTER-DATA.",
     "DATA-QUALITY.",
     "VALIDATOR.",
+)
+_EXECUTABLE_OBJECTIVE_SUFFIX = (
+    "stage_02_unit_late_days",
+    "stage_03_discretionary_surplus",
+    "stage_04_policy_review_exposure",
+    "stage_05_named_primary_deviation",
+    "stage_06_international_volume",
+    "stage_07_strategic_shift",
+    "stage_08_sustainability_band",
+    "stage_09_known_landed_cost",
+    "stage_09_moq_excess",
+    "stage_10_total_lead_time",
+    "stage_10_line_count",
+    "stage_10_id_free_tie",
 )
 
 
@@ -155,10 +171,12 @@ class _Offer:
     lead_days: int
     shipping_method: str
     international: bool
-    assumption: bool
+    review_exposure: int
     allowed_buckets: tuple[date, ...]
     gate_conditions: tuple[tuple[date, str], ...]
     upper_bound: Decimal
+    supplier_fingerprint: str
+    route_fingerprint: str
 
     def condition_for(self, due: date) -> str | None:
         return dict(self.gate_conditions).get(due)
@@ -217,12 +235,32 @@ def _normal_name(value: str) -> str:
     return " ".join(_tokens(value))
 
 
+def _normal_text(value: str | None) -> str | None:
+    return None if value is None else " ".join(_tokens(value))
+
+
 def _phrase(haystack: tuple[str, ...], phrase: str) -> bool:
     needle = _tokens(phrase)
     return bool(needle) and any(
         haystack[index : index + len(needle)] == needle
         for index in range(len(haystack) - len(needle) + 1)
     )
+
+
+def _source_term_overlap(tokens: tuple[str, ...], terms: Iterable[object]) -> bool:
+    target = frozenset(tokens)
+    for raw_term in terms:
+        text_value = str(raw_term)
+        significant = tuple(token for token in _tokens(text_value) if len(token) > 2)
+        if significant and set(significant).issubset(target):
+            return True
+        acronyms = {
+            token.casefold()
+            for token in re.findall(r"\b[A-Z][A-Z0-9]{1,}\b", text_value)
+        }
+        if acronyms.intersection(target):
+            return True
+    return False
 
 
 def _certification(value: str) -> str:
@@ -235,6 +273,64 @@ def _certifications(values: Iterable[str]) -> frozenset[str]:
         for value in values
         for part in _CERT_SPLIT_RE.split(value)
         if part.strip()
+    )
+
+
+def _canonical_hash(payload: Mapping[str, object]) -> str:
+    """Hash semantic facts without importing candidate construction code."""
+
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _supplier_fingerprint(supplier: Supplier) -> str:
+    return _canonical_hash(
+        {
+            "legal_name": _normal_name(supplier.name),
+            "country": _normal_text(supplier.country),
+            "certifications": tuple(sorted(_certifications(supplier.certifications))),
+            "relationship_tier": _normal_text(supplier.relationship_tier),
+            "sustainability_rating": _normal_text(supplier.sustainability_rating),
+        }
+    )
+
+
+def _component_fingerprint(component: Component) -> str:
+    return _canonical_hash(
+        {
+            "name": _normal_text(component.name),
+            "description": _normal_text(component.description),
+            "category": _normal_text(component.category),
+            "unit_of_measure": _normal_text(component.unit_of_measure),
+            "is_hazardous": component.is_hazardous,
+            "required_certifications": tuple(
+                sorted(_certifications(component.required_certifications))
+            ),
+        }
+    )
+
+
+def _route_fingerprint(
+    component: Component,
+    catalog: SupplierCatalogLine,
+    shipping_method: str,
+    lead_days: int,
+) -> str:
+    return _canonical_hash(
+        {
+            "component": _component_fingerprint(component),
+            "unit_price": str(catalog.unit_price),
+            "minimum_order_quantity": str(catalog.minimum_order_quantity),
+            "catalog_lead_time_days": catalog.lead_time_days,
+            "effective_lead_time_days": lead_days,
+            "shipping_method": _normal_text(shipping_method),
+            "catalog_notes": _normal_text(catalog.notes),
+        }
     )
 
 
@@ -385,8 +481,14 @@ class IndependentPlanValidator:
             return EvidenceStatus.PASS
         if concept_id == "electronic_component" and _tokens(entity.category or "") == ("electronic", "component"):
             return EvidenceStatus.PASS
-        terms = tuple(concept.get("synonyms", ())) + tuple(concept.get("source_terms", ()))
-        return EvidenceStatus.PASS if any(_phrase(identity, str(item)) for item in terms) else EvidenceStatus.FAIL
+        if any(_phrase(identity, str(item)) for item in concept.get("synonyms", ())):
+            return EvidenceStatus.PASS
+        if (
+            str(concept.get("resolution")) == "enumerated_both_ways"
+            and _source_term_overlap(identity, concept.get("source_terms", ()))
+        ):
+            return EvidenceStatus.UNKNOWN
+        return EvidenceStatus.FAIL
 
     def resolve_source_named_entity(
         self, reference: Mapping[str, object], suppliers: Sequence[Supplier]
@@ -462,6 +564,87 @@ class IndependentPlanValidator:
     def _relationship_predates(self, supplier: Supplier, effective: date) -> bool:
         years = tuple(int(item) for item in _YEAR_RE.findall(supplier.notes or ""))
         return bool(years) and min(years) < effective.year
+
+    def _selector_status(self, rule: PolicyRule, component: Component) -> EvidenceStatus:
+        selector = rule.data.get("selector")
+        if not isinstance(selector, Mapping) or selector.get("entity") != "component":
+            return EvidenceStatus.PASS
+        tags = tuple(str(item) for item in selector.get("semantic_tags", ()))
+        if not tags:
+            return EvidenceStatus.PASS
+        statuses = tuple(self._concept(tag, component) for tag in tags)
+        operator = str(selector.get("operator", "all"))
+        if operator == "any":
+            if EvidenceStatus.PASS in statuses:
+                return EvidenceStatus.PASS
+            return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.FAIL
+        if operator == "none":
+            if EvidenceStatus.PASS in statuses:
+                return EvidenceStatus.FAIL
+            return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.PASS
+        if EvidenceStatus.FAIL in statuses:
+            return EvidenceStatus.FAIL
+        return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.PASS
+
+    def _rolling_review_exposure(
+        self,
+        snapshot: ScenarioSnapshot,
+        component: Component,
+        contract: EvidenceContract,
+    ) -> int:
+        if contract is not EvidenceContract.BENCHMARK:
+            return 0
+        applicable = {
+            rule.rule_id: rule
+            for rule in self.registry.active_rules(snapshot.configuration.current_date)
+            if rule.evidence_basis == EvidenceBasis.ROLLING_WINDOW.value
+            and self._selector_status(rule, component) is not EvidenceStatus.FAIL
+        }
+        # A narrower rule erases its broader predecessor only when membership
+        # is proven.  UNKNOWN membership retains both robust branches.
+        for rule in tuple(applicable.values()):
+            if self._selector_status(rule, component) is not EvidenceStatus.PASS:
+                continue
+            precedence = rule.data.get("precedence")
+            if not isinstance(precedence, Mapping):
+                continue
+            for relation in ("supersedes", "outranks"):
+                for target in precedence.get(relation, ()):
+                    applicable.pop(str(target), None)
+        return len(applicable)
+
+    def _review_exposure(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        supplier: Supplier,
+        contract: EvidenceContract,
+    ) -> int:
+        """Reconstruct route-level stage-4 review coefficients from source facts."""
+
+        count = self._rolling_review_exposure(snapshot, requirement.component, contract)
+        pcb_rules = self._rules(snapshot.configuration.current_date, "incumbent_supplier_only")
+        if (
+            contract is EvidenceContract.BENCHMARK
+            and pcb_rules
+            and self._concept("printed_circuit_board_component", requirement.component)
+            is EvidenceStatus.PASS
+            and (requirement.component.component_id, supplier.supplier_id)
+            not in self.accepted_shipment_pairs
+        ):
+            prior = any(
+                item.component_id == requirement.component.component_id
+                and item.supplier_id == supplier.supplier_id
+                for item in snapshot.purchase_orders
+            )
+            if prior or self._relationship_predates(supplier, pcb_rules[0].effective_from):
+                count += 1
+        rating = _rating(supplier.sustainability_rating)
+        if rating is not None and rating < _rating("B"):
+            named = self._named_primary(snapshot, requirement.component)
+            if named is not None and named.resolved and named.supplier_id == supplier.supplier_id:
+                count += 1
+        return count
 
     def _hard_eligible(
         self,
@@ -625,7 +808,7 @@ class IndependentPlanValidator:
         }
         upper = self.derive_upper_bounds(snapshot, requirement, catalogs)
         result: list[_Offer] = []
-        for supplier, catalog, assumption in eligible:
+        for supplier, catalog, _assumption in eligible:
             international = self._concept("international_supplier", supplier) is EvidenceStatus.PASS
             allowed_buckets = tuple(
                 due for due, _quantity in requirement.bucket_quantities if not international or gate[due] is not None
@@ -641,6 +824,13 @@ class IndependentPlanValidator:
                 bound = min(bound, allowance)
             if bound < catalog.minimum_order_quantity:
                 continue
+            review_exposure = self._review_exposure(
+                snapshot, requirement, supplier, contract
+            )
+            supplier_hash = _supplier_fingerprint(supplier)
+            route_hash = _route_fingerprint(
+                requirement.component, catalog, "standard", catalog.lead_time_days
+            )
             result.append(
                 _Offer(
                     requirement.component,
@@ -651,10 +841,12 @@ class IndependentPlanValidator:
                     catalog.lead_time_days,
                     "standard",
                     international,
-                    assumption,
+                    review_exposure,
                     allowed_buckets,
                     tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
                     bound,
+                    supplier_hash,
+                    route_hash,
                 )
             )
             air_rules = self._rules(snapshot.configuration.current_date, "air_freight_authorization")
@@ -688,6 +880,9 @@ class IndependentPlanValidator:
             )
             if air_bound < catalog.minimum_order_quantity:
                 continue
+            air_route_hash = _route_fingerprint(
+                requirement.component, catalog, "air freight", air_lead
+            )
             result.append(
                 _Offer(
                     requirement.component,
@@ -698,13 +893,23 @@ class IndependentPlanValidator:
                     air_lead,
                     "air freight",
                     international,
-                    assumption,
+                    review_exposure,
                     air_allowed,
                     tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
                     air_bound,
+                    supplier_hash,
+                    air_route_hash,
                 )
             )
-        return tuple(sorted(result, key=lambda item: (_normal_name(item.supplier.name), item.catalog.unit_price)))
+        return tuple(
+            sorted(
+                result,
+                key=lambda item: (
+                    item.supplier_fingerprint,
+                    item.route_fingerprint,
+                ),
+            )
+        )
 
     # ---- exact plan arithmetic and objective reconstruction ------------
 
@@ -718,6 +923,21 @@ class IndependentPlanValidator:
             and item.material_available == line.material_available_date
         )
         return matches[0] if len(matches) == 1 else None
+
+    def _fingerprint_ranks(self, offers: Sequence[_Offer]) -> dict[_Offer, int]:
+        return {
+            offer: rank
+            for rank, offer in enumerate(
+                sorted(
+                    offers,
+                    key=lambda item: (
+                        item.supplier_fingerprint,
+                        item.route_fingerprint,
+                    ),
+                ),
+                start=1,
+            )
+        }
 
     def _named_deviation(
         self, snapshot: ScenarioSnapshot, component: Component, quantities: Mapping[str, Decimal]
@@ -736,6 +956,7 @@ class IndependentPlanValidator:
         offers: Sequence[_Offer],
     ) -> tuple[Decimal, ...]:
         matched = {line.route_id: self._match_offer(offers, line) for line in plan.lines}
+        total_quantity = sum((line.quantity for line in plan.lines), ZERO)
         physical_gaps: list[Decimal] = []
         for due, _quantity in requirement.bucket_quantities:
             planned = sum(
@@ -750,10 +971,17 @@ class IndependentPlanValidator:
             ),
             ZERO,
         )
-        # Assumption codes are the normalized, de-duplicated representation of
-        # policy-review exposure.  Counting the backing UNKNOWN evidence again
-        # would double-charge one disclosed assumption.
-        review = Decimal(len(plan.assumption_codes))
+        # Stage 4 is route review exposure, not the number of normalized
+        # assumption codes.  One UNKNOWN rule can disclose several codes, and
+        # robust both-ways evaluation can expose two rules with shared codes.
+        review = sum(
+            (
+                Decimal(offer.review_exposure)
+                for offer in matched.values()
+                if offer is not None
+            ),
+            ZERO,
+        )
         quantities: dict[str, Decimal] = defaultdict(Decimal)
         for line in plan.lines:
             quantities[line.supplier_id] += line.quantity
@@ -804,10 +1032,17 @@ class IndependentPlanValidator:
                         best_rating = max(_rating(item.supplier.sustainability_rating) for item in comparable)
                         assert best_rating is not None
                         sustainability_penalty += (best_rating - current_rating) * allocation.quantity
-        total_quantity = sum((line.quantity for line in plan.lines), ZERO)
-        moq_excess = max(ZERO, total_quantity - plan.net_requirement)
         weighted_lead = sum(
             (line.quantity * Decimal((line.expected_delivery_date - line.order_date).days) for line in plan.lines), ZERO
+        )
+        fingerprint_ranks = self._fingerprint_ranks(offers)
+        fingerprint_tie = sum(
+            (
+                line.quantity * Decimal(fingerprint_ranks[offer])
+                for line in plan.lines
+                if (offer := matched[line.route_id]) is not None
+            ),
+            ZERO,
         )
         return tuple(physical_gaps) + (
             unit_late,
@@ -818,9 +1053,13 @@ class IndependentPlanValidator:
             strategic_penalty,
             sustainability_penalty,
             plan.total_cost,
-            moq_excess,
+            # The integer certificate records total ordered quantity.  Since
+            # net requirement is fixed inside a solve, this is exactly the
+            # affine MOQ-excess subobjective documented by §8.
+            total_quantity,
             weighted_lead,
             Decimal(len(plan.lines)),
+            fingerprint_tie,
         )
 
     def _synthetic_objective(
@@ -846,8 +1085,10 @@ class IndependentPlanValidator:
         sustainable = ZERO
         cost = ZERO
         lead = ZERO
-        used_assumption = False
+        review = ZERO
         quantities: dict[str, Decimal] = defaultdict(Decimal)
+        fingerprint_ranks = self._fingerprint_ranks(offers)
+        fingerprint_tie = ZERO
         for index, quantity in allocation.items():
             if quantity == ZERO:
                 continue
@@ -855,7 +1096,8 @@ class IndependentPlanValidator:
             quantities[offer.supplier.supplier_id] += quantity
             cost += quantity * offer.catalog.unit_price
             lead += quantity * Decimal(offer.lead_days)
-            used_assumption = used_assumption or offer.assumption
+            review += Decimal(offer.review_exposure)
+            fingerprint_tie += quantity * Decimal(fingerprint_ranks[offer])
             due = min(
                 offer.allowed_buckets,
                 key=lambda item: (
@@ -896,15 +1138,16 @@ class IndependentPlanValidator:
         return physical_gaps + (
             unit_late,
             max(ZERO, total - q_min),
-            Decimal(1 if used_assumption else 0),
+            review,
             named,
             international,
             strategic,
             sustainable,
             cost,
-            max(ZERO, total - requirement.eventual_gap),
+            total,
             lead,
             Decimal(sum(1 for value in allocation.values() if value > ZERO)),
+            fingerprint_tie,
         )
 
     # ---- separate integer enumeration --------------------------------
@@ -1060,7 +1303,10 @@ class IndependentPlanValidator:
         for total_units in range(lower_units, upper_units + 1):
             for vector in self._vectors_for_total(total_units, offers, increment, secondary, named_supplier, nodes):
                 objective = self._synthetic_objective(snapshot, requirement, offers, vector, q_min)
-                if objective[-4] - baseline.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
+                cost_index = len(requirement.bucket_quantities) + _EXECUTABLE_OBJECTIVE_SUFFIX.index(
+                    "stage_09_known_landed_cost"
+                )
+                if objective[cost_index] - baseline.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
                     continue
                 if best is None or objective < best[0]:
                     best = (objective, vector)
