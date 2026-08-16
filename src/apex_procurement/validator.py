@@ -2234,6 +2234,7 @@ class IndependentPlanValidator:
         solve_kind: SolveKind,
         *,
         named_supplier: str | None,
+        coverage_target: Decimal | None = None,
         q_min: Decimal | None = None,
         cheapest_covering_cost: Decimal | None = None,
     ) -> IndependentSolve:
@@ -2426,6 +2427,19 @@ class IndependentPlanValidator:
             },
             lower=eventual_gap_atoms,
         )
+        if solve_kind is SolveKind.BASELINE and coverage_target is not None:
+            target_atoms = _ceil_units(coverage_target, atom)
+            model.add_row(
+                {
+                    baseline_allocations[offer_index][bucket_index]: 1
+                    for offer_index in range(len(offers))
+                    for bucket_index in range(
+                        len(requirement.bucket_quantities)
+                    )
+                },
+                lower=target_atoms,
+                upper=target_atoms,
+            )
         unresolved: list[int] = []
         for bucket_index, (due, _quantity) in enumerate(
             requirement.bucket_quantities
@@ -3035,6 +3049,29 @@ class IndependentPlanValidator:
             not in self.capacity_confirmed_supplier_ids
         ):
             named_supplier = named_check.supplier_id
+        if solve_kind is SolveKind.BASELINE:
+            q_result = self.independently_solve(
+                snapshot, decision, SolveKind.QUANTITY_CALIBRATION
+            )
+            if (
+                q_result.status
+                not in {SolverStatus.OPTIMAL, SolverStatus.INFEASIBLE}
+                or not q_result.certificate_complete
+                or not q_result.objective_vector
+            ):
+                return IndependentSolve(
+                    q_result.status, (), certificate_complete=False
+                )
+            return self._independently_solve_milp(
+                snapshot,
+                requirement,
+                offers,
+                solve_kind,
+                named_supplier=named_supplier,
+                coverage_target=(
+                    requirement.eventual_gap - q_result.objective_vector[0]
+                ),
+            )
         if solve_kind is not SolveKind.EXECUTABLE:
             return self._independently_solve_milp(
                 snapshot,
@@ -3109,6 +3146,24 @@ class IndependentPlanValidator:
         ) if offers else ZERO
         maximum_units = _floor_units(group_bound, increment)
         target_units = _ceil_units(requirement.eventual_gap, increment)
+        coverage_target = requirement.eventual_gap
+        if solve_kind is SolveKind.BASELINE:
+            q_result = self.independently_solve(
+                snapshot, decision, SolveKind.QUANTITY_CALIBRATION
+            )
+            if (
+                q_result.status
+                not in {SolverStatus.OPTIMAL, SolverStatus.INFEASIBLE}
+                or not q_result.certificate_complete
+                or not q_result.objective_vector
+            ):
+                return IndependentSolve(
+                    q_result.status, (), certificate_complete=False
+                )
+            coverage_target = (
+                requirement.eventual_gap - q_result.objective_vector[0]
+            )
+            target_units = _ceil_units(coverage_target, increment)
         nodes = [0]
         best_q: tuple[Decimal, dict[int, Decimal]] | None = None
         best_baseline: tuple[tuple[Decimal, Decimal], dict[int, Decimal]] | None = None
@@ -3124,7 +3179,7 @@ class IndependentPlanValidator:
                 *range(target_units - 1, -1, -1),
             )
         elif solve_kind is SolveKind.BASELINE:
-            total_range = range(0 if target_units == 0 else 1, maximum_units + 1)
+            total_range = range(target_units, maximum_units + 1)
         else:
             total_range = ()
         for total_units in total_range:
@@ -3134,7 +3189,16 @@ class IndependentPlanValidator:
                 coverage = min(requirement.eventual_gap, total)
                 if best_q is None or coverage > best_q[0] or (coverage == best_q[0] and total < sum(best_q[1].values(), ZERO)):
                     best_q = (coverage, vector)
-                uncovered = max(ZERO, requirement.eventual_gap - coverage)
+                if (
+                    solve_kind is SolveKind.BASELINE
+                    and coverage < coverage_target
+                ):
+                    continue
+                uncovered = (
+                    requirement.eventual_gap - coverage_target
+                    if solve_kind is SolveKind.BASELINE
+                    else max(ZERO, requirement.eventual_gap - coverage)
+                )
                 cost = sum((offers[index].catalog.unit_price * quantity for index, quantity in vector.items()), ZERO)
                 key = (uncovered, cost)
                 if best_baseline is None or key < best_baseline[0]:
@@ -3405,6 +3469,11 @@ class IndependentPlanValidator:
                 & set(plan.unresolved_approval_ids)
             )
         )
+        order_value_rules = self._rules(
+            snapshot.configuration.current_date,
+            "order_value_approval",
+        )
+        order_value_rule_ids = {item.rule_id for item in order_value_rules}
         group_ids = {line.allocation_group_id for line in plan.lines}
         if len(group_ids) != 1:
             sink.error("ALLOCATION_GROUP_MISMATCH", "All lines for one component/run must share one allocation group.", component_id=component_id, plan_id=plan_id)
@@ -3487,11 +3556,40 @@ class IndependentPlanValidator:
                     exception_dates[exception_id].update(offer.allowed_buckets)
                     if "condition_" in exception_id and not exception_id.endswith(f"condition_{condition}"):
                         sink.error("EXCEPTION_PREDICATE_MISMATCH", "Allocation exception label disagrees with the recomputed bucket predicate.", component_id=component_id, plan_id=plan_id)
-            if plan.disposition.writes_purchase_order:
-                for rule in self._rules(snapshot.configuration.current_date, "order_value_approval"):
-                    threshold = Decimal(str(rule.data["constraint"]["amount_exceeds"]))
-                    if line.line_total > threshold and rule.rule_id not in self.approved_rule_ids:
-                        sink.error("UNAPPROVED_ORDER_VALUE", "Executable line exceeds an approval threshold without runtime approval evidence.", component_id=component_id, plan_id=plan_id, rule_ids=(rule.rule_id,))
+            expected_order_approvals = {
+                rule.rule_id
+                for rule in order_value_rules
+                if line.line_total
+                > Decimal(str(rule.data["constraint"]["amount_exceeds"]))
+                and rule.rule_id not in self.approved_rule_ids
+            }
+            represented_order_approvals = (
+                set(line.approval_rule_ids) & order_value_rule_ids
+            )
+            if plan.disposition.writes_purchase_order and expected_order_approvals:
+                sink.error(
+                    "UNAPPROVED_ORDER_VALUE",
+                    "Executable line exceeds one or more approval thresholds without runtime approval evidence.",
+                    component_id=component_id,
+                    plan_id=plan_id,
+                    rule_ids=tuple(sorted(expected_order_approvals)),
+                )
+            if (
+                plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+                and represented_order_approvals != expected_order_approvals
+            ):
+                sink.error(
+                    "ORDER_VALUE_APPROVAL_CLASSIFICATION",
+                    "Approval proposal does not carry exactly the active thresholds crossed by this line.",
+                    component_id=component_id,
+                    plan_id=plan_id,
+                    rule_ids=tuple(
+                        sorted(
+                            represented_order_approvals
+                            ^ expected_order_approvals
+                        )
+                    ),
+                )
         for exception_id, quantity in exception_totals.items():
             allowance = sum((requirement.bucket_shortage(due) for due in exception_dates[exception_id]), ZERO)
             if (
@@ -3776,6 +3874,30 @@ class IndependentPlanValidator:
             if result.component_id == decision.component_id:
                 by_kind[result.solve_kind].append(result)
         selected = decision.selected_plan
+        executable_results = by_kind.get(SolveKind.EXECUTABLE, ())
+        certified_plan = selected
+        if selected is None and len(executable_results) == 1:
+            claimed_plan = executable_results[0].candidate_plan
+            if (
+                claimed_plan is not None
+                and claimed_plan.disposition
+                is PlanDisposition.RECOMMEND_APPROVAL
+            ):
+                matching = tuple(
+                    item
+                    for item in decision.alternatives
+                    if item.plan_id == claimed_plan.plan_id
+                    and item.disposition
+                    is PlanDisposition.RECOMMEND_APPROVAL
+                )
+                if len(matching) == 1 and matching[0] == claimed_plan:
+                    certified_plan = matching[0]
+                else:
+                    sink.error(
+                        "APPROVAL_PROPOSAL_MISMATCH",
+                        "The certified solve-1 plan is not preserved exactly once as a complete approval proposal.",
+                        component_id=decision.component_id,
+                    )
         verified = True
         if decision.requirement_state.resolution is ResolutionStatus.INFEASIBLE:
             unlicensed = any(
@@ -3814,7 +3936,7 @@ class IndependentPlanValidator:
             if not independently_infeasible:
                 sink.error("INFEASIBILITY_NOT_REPRODUCED", "Validator did not reproduce a positive eventual remainder under completed hard-rule search.", component_id=decision.component_id)
                 verified = False
-        if selected is not None:
+        if certified_plan is not None:
             for kind in (SolveKind.QUANTITY_CALIBRATION, SolveKind.BASELINE, SolveKind.EXECUTABLE):
                 matches = by_kind.get(kind, ())
                 if len(matches) != 1:
@@ -3823,7 +3945,7 @@ class IndependentPlanValidator:
                     continue
                 result = matches[0]
                 if not result.is_certified_optimal or not result.exact_post_validated:
-                    sink.error("SOLVER_UNPROVEN", "Feasible incumbent, timeout, gap, or incomplete stage cannot support a PO.", component_id=decision.component_id)
+                    sink.error("SOLVER_UNPROVEN", "Feasible incumbent, timeout, gap, or incomplete stage cannot support an executable action or approval proposal.", component_id=decision.component_id)
                     verified = False
             if not verified:
                 return False
@@ -3852,52 +3974,51 @@ class IndependentPlanValidator:
                     verified = False
             if independently_proven.get(SolveKind.QUANTITY_CALIBRATION) and (
                 q_own.minimum_compliant_total
-                != selected.minimum_compliant_total
+                != certified_plan.minimum_compliant_total
                 or q_claim.minimum_compliant_total
                 != q_own.minimum_compliant_total
             ):
-                sink.error("CALIBRATION_MISMATCH", "Persisted minimum_compliant_total differs from independent solve Q.", component_id=decision.component_id, plan_id=selected.plan_id)
+                sink.error("CALIBRATION_MISMATCH", "Persisted minimum_compliant_total differs from independent solve Q.", component_id=decision.component_id, plan_id=certified_plan.plan_id)
                 verified = False
             if independently_proven.get(SolveKind.BASELINE) and (
                 baseline_own.cheapest_covering_cost
-                != selected.cheapest_covering_cost
+                != certified_plan.cheapest_covering_cost
                 or baseline_claim.cheapest_covering_cost
                 != baseline_own.cheapest_covering_cost
             ):
-                sink.error("BASELINE_COST_MISMATCH", "Persisted cheapest_covering_cost differs from independent solve 0.", component_id=decision.component_id, plan_id=selected.plan_id)
+                sink.error("BASELINE_COST_MISMATCH", "Persisted cheapest_covering_cost differs from independent solve 0's certified coverage target.", component_id=decision.component_id, plan_id=certified_plan.plan_id)
                 verified = False
             if (
                 independently_proven.get(SolveKind.EXECUTABLE)
                 and executable_own.recovery_quantity
-                != selected.recovery_quantity
+                != certified_plan.recovery_quantity
             ):
                 sink.error(
                     "RECOVERY_QUANTITY_MISMATCH",
                     "Persisted recovery quantity differs from the independent executable solve's classified recovery allocation.",
                     component_id=decision.component_id,
-                    plan_id=selected.plan_id,
+                    plan_id=certified_plan.plan_id,
                 )
                 verified = False
             if (
                 independently_proven.get(SolveKind.BASELINE)
-                and selected.cheapest_covering_cost is not None
-                and selected.total_cost - selected.cheapest_covering_cost
+                and certified_plan.cheapest_covering_cost is not None
+                and certified_plan.total_cost - certified_plan.cheapest_covering_cost
                 > self.autonomy.max_excess_cost_usd
             ):
-                sink.error("AUTONOMY_COST_EXCEEDED", "Executable plan exceeds the excess-cost autonomy bound.", component_id=decision.component_id, plan_id=selected.plan_id)
+                sink.error("AUTONOMY_COST_EXCEEDED", "Certified plan exceeds the excess-cost autonomy bound.", component_id=decision.component_id, plan_id=certified_plan.plan_id)
                 verified = False
-            exact = self._objective(snapshot, requirement, selected, self._offers(snapshot, requirement, decision.evidence_contract))
-            if executable_claim.candidate_plan is None or executable_claim.candidate_plan.plan_id != selected.plan_id:
-                sink.error("EXECUTABLE_PLAN_MISMATCH", "Solve-1 selected candidate differs from the decision selected plan.", component_id=decision.component_id)
+            exact = self._objective(snapshot, requirement, certified_plan, self._offers(snapshot, requirement, decision.evidence_contract))
+            if executable_claim.candidate_plan is None or executable_claim.candidate_plan.plan_id != certified_plan.plan_id:
+                sink.error("EXECUTABLE_PLAN_MISMATCH", "Solve-1 candidate differs from the selected action or complete approval proposal.", component_id=decision.component_id)
                 verified = False
             if independently_proven.get(SolveKind.EXECUTABLE) and (
                 executable_claim.objective_vector != exact
                 or executable_own.objective_vector != exact
             ):
-                sink.error("SUBOPTIMAL_INCUMBENT", "Selected feasible plan is not the independently reproduced lexicographic optimum.", component_id=decision.component_id, plan_id=selected.plan_id)
+                sink.error("SUBOPTIMAL_INCUMBENT", "Certified plan is not the independently reproduced lexicographic optimum.", component_id=decision.component_id, plan_id=certified_plan.plan_id)
                 verified = False
         else:
-            executable_results = by_kind.get(SolveKind.EXECUTABLE, ())
             if decision.requirement_state.resolution is ResolutionStatus.INFEASIBLE:
                 certified = tuple(
                     item
@@ -3970,6 +4091,21 @@ class IndependentPlanValidator:
                     plan_action_keys.add(key)
                     if plan.disposition.writes_purchase_order:
                         executable_action_keys.add(key)
+            approval_plans = tuple(
+                plan
+                for plan in decision.alternatives
+                if plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+            )
+            if (
+                approval_plans
+                and AlertCategory.APPROVAL_REQUIRED
+                not in decision.alert_categories
+            ):
+                sink.error(
+                    "APPROVAL_ALERT_MISSING",
+                    "Every complete RECOMMEND_APPROVAL proposal requires an APPROVAL_REQUIRED alert.",
+                    component_id=decision.component_id,
+                )
             self._check_capacity(snapshot, decision, sink)
             expected_lateness = self._deadline_lateness(
                 requirement,
@@ -4044,6 +4180,7 @@ class IndependentPlanValidator:
             solver_results_verified=solver_verified,
             checked_invariants=(
                 "action-uniqueness",
+                "approval-line-classification-and-complete-proposals",
                 "allocation-and-exception-scoping",
                 "catalog-asl-certification-dates",
                 "evidence-contract-and-entity-ladder",

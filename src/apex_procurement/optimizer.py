@@ -183,7 +183,7 @@ class EconomicAutonomy:
 
 @dataclass(frozen=True, slots=True)
 class OrderApprovalConstraint:
-    """A quantity-dependent order-value approval gate."""
+    """A per-line order-value classification rule applied after solving."""
 
     rule_id: str
     maximum_without_approval: Decimal
@@ -994,6 +994,7 @@ def _build_model(
         name="eventual_coverage",
     )
     if problem.coverage_target is not None and problem.solve_kind in {
+        SolveKind.BASELINE,
         SolveKind.EXECUTABLE,
         SolveKind.COUNTERFACTUAL,
     }:
@@ -1005,7 +1006,16 @@ def _build_model(
                 for bucket_index in range(len(buckets))
             },
             lower=target_atoms,
-            name="solve_q_coverage_target",
+            upper=(
+                target_atoms
+                if problem.solve_kind is SolveKind.BASELINE
+                else None
+            ),
+            name=(
+                "solve_0_certified_coverage_target"
+                if problem.solve_kind is SolveKind.BASELINE
+                else "solve_q_coverage_target"
+            ),
         )
 
     emitted: set[str] = set()
@@ -1067,19 +1077,6 @@ def _build_model(
         x[index]: _fraction(route.unit_price * atom)
         for index, route in enumerate(routes)
     }
-    approved_order_rules = set(problem.approved_order_rule_ids)
-    for approval in problem.order_approval_constraints:
-        if (
-            approval.rule_id in approved_order_rules
-            or problem.relaxed_rule_id == approval.rule_id
-        ):
-            continue
-        model.add_row(
-            route_cost_coefficients,
-            upper=_fraction(approval.maximum_without_approval),
-            name=f"order_value_approval[{approval.rule_id}]",
-        )
-        emitted.add(approval.rule_id)
 
     allowance_overrides = {item.exception_id: item for item in problem.exception_allowances}
     exception_routes: dict[str, list[int]] = defaultdict(list)
@@ -2292,13 +2289,18 @@ def _disposition(
             if values[context.x[route_index]] > 0
             for item in route.approval_requirements
         }
-        order_approval_rules = {
-            item.rule_id for item in problem.order_approval_constraints
-        } - set(problem.approved_order_rule_ids)
+        sub_moq_approval_used = (
+            problem.relaxed_rule_id == problem.sub_moq_approval_rule_id
+            and any(
+                values[context.x[route_index]] > 0
+                and context.quantity(values[context.x[route_index]])
+                < route.minimum_order_quantity
+                for route_index, route in enumerate(context.routes)
+            )
+        )
         if (
             problem.relaxed_rule_id in approval_rules
-            or problem.relaxed_rule_id in order_approval_rules
-            or problem.relaxed_rule_id == problem.sub_moq_approval_rule_id
+            or sub_moq_approval_used
         ):
             return PlanDisposition.RECOMMEND_APPROVAL
         return PlanDisposition.DECISION_REQUIRED
@@ -2343,6 +2345,14 @@ def _build_plan(
             if values[context.z[route_index][bucket_index]] > 0
         )
         quantity = context.quantity(quantity_atoms)
+        line_approval_ids = set(route.approval_requirements)
+        if (
+            disposition is PlanDisposition.RECOMMEND_APPROVAL
+            and context.problem.relaxed_rule_id
+            == context.problem.sub_moq_approval_rule_id
+            and quantity < route.minimum_order_quantity
+        ):
+            line_approval_ids.add(context.problem.relaxed_rule_id)
         group_hash = _canonical_hash(
             {
                 "component": tuple(
@@ -2363,6 +2373,7 @@ def _build_plan(
                 material_available_date=route.material_available_date,
                 allocation_group_id=f"allocation-{group_hash}",
                 bucket_allocations=allocations,
+                approval_rule_ids=tuple(line_approval_ids),
             )
         )
         selected_routes.append(route)
@@ -2470,10 +2481,14 @@ def _build_plan(
         objective_vector=objective_vector,
         relaxed_rule_ids=relaxed,
         evidence=tuple(evidence_by_key.values()),
-        unresolved_approval_ids=(
-            tuple(sorted({item for route in selected_routes for item in route.approval_requirements}))
-            if not disposition.writes_purchase_order
-            else ()
+        unresolved_approval_ids=tuple(
+            sorted(
+                {
+                    rule_id
+                    for line in lines
+                    for rule_id in line.approval_rule_ids
+                }
+            )
         ),
         assumption_codes=assumptions,
         summary=(
@@ -2482,6 +2497,76 @@ def _build_plan(
             else "Non-executable calibrated, baseline, counterfactual, or incumbent diagnostic."
         ),
     )
+
+
+def _classify_order_value_approvals(
+    problem: OptimizerProblem,
+    result: SolverResult,
+) -> SolverResult:
+    """Attach every active per-line dollar approval after a certified solve.
+
+    The solve is deliberately complete before this classification.  If any
+    line crosses an unresolved threshold, the complete plan is withheld as
+    one atomic proposal so a rerun cannot place cumulative sub-threshold
+    fragments of the same requirement.
+    """
+
+    plan = result.candidate_plan
+    if (
+        plan is None
+        or not result.is_certified_optimal
+        or not result.exact_post_validated
+    ):
+        return result
+    approved = set(problem.approved_order_rule_ids)
+    missing_any = False
+    classified_lines: list[PlanLine] = []
+    for line in plan.lines:
+        missing = {
+            approval.rule_id
+            for approval in problem.order_approval_constraints
+            if approval.rule_id not in approved
+            and line.line_total > approval.maximum_without_approval
+        }
+        missing_any = missing_any or bool(missing)
+        classified_lines.append(
+            replace(
+                line,
+                approval_rule_ids=tuple(
+                    sorted(set(line.approval_rule_ids) | missing)
+                ),
+            )
+        )
+    if not missing_any:
+        return result
+    unresolved = tuple(
+        sorted(
+            {
+                rule_id
+                for line in classified_lines
+                for rule_id in line.approval_rule_ids
+            }
+        )
+    )
+    disposition = (
+        PlanDisposition.RECOMMEND_APPROVAL
+        if plan.disposition.writes_purchase_order
+        or plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+        else plan.disposition
+    )
+    classified = replace(
+        plan,
+        disposition=disposition,
+        lines=tuple(classified_lines),
+        unresolved_approval_ids=unresolved,
+        summary=(
+            "Certified complete procurement plan withheld atomically for "
+            "per-line order-value approval."
+            if disposition is PlanDisposition.RECOMMEND_APPROVAL
+            else plan.summary
+        ),
+    )
+    return replace(result, candidate_plan=classified)
 
 
 def _coverage_state(
@@ -2624,7 +2709,11 @@ class ProcurementOptimizer:
                             problem,
                             solve_kind=SolveKind.BASELINE,
                             minimum_compliant_total=None,
-                            coverage_target=None,
+                            coverage_target=(
+                                relaxed_q.candidate_plan.eventual_covered_quantity
+                                if relaxed_q.candidate_plan is not None
+                                else ZERO
+                            ),
                             cheapest_covering_cost=None,
                             relaxed_rule_id=rule_id,
                         )
@@ -2710,7 +2799,7 @@ class ProcurementOptimizer:
             problem,
             solve_kind=SolveKind.BASELINE,
             minimum_compliant_total=None,
-            coverage_target=None,
+            coverage_target=coverage_target,
             cheapest_covering_cost=None,
             relaxed_rule_id=None,
         )
@@ -2794,13 +2883,34 @@ class ProcurementOptimizer:
             cheapest_covering_cost=cheapest,
             relaxed_rule_id=None,
         )
-        executable = self.solver.solve(executable_problem)
+        executable = _classify_order_value_approvals(
+            problem,
+            self.solver.solve(executable_problem),
+        )
         executable_emitted = (
             self.solver.last_context.emitted_rule_ids
             if self.solver.last_context is not None
             else ()
         )
         selected = executable.candidate_plan if executable.has_executable_certificate else None
+        if (
+            executable.is_certified_optimal
+            and executable.exact_post_validated
+            and executable.candidate_plan is not None
+            and executable.candidate_plan.disposition
+            is PlanDisposition.RECOMMEND_APPROVAL
+        ):
+            alternatives.append(executable.candidate_plan)
+            alerts.append(
+                OptimizerAlert(
+                    AlertCategory.APPROVAL_REQUIRED,
+                    "ORDER_VALUE_APPROVAL_REQUIRED",
+                    "The complete certified procurement plan crosses one or more per-line approval thresholds and was withheld atomically.",
+                    problem.component_id,
+                    executable.candidate_plan,
+                    executable.candidate_plan.unresolved_approval_ids,
+                )
+            )
         if selected is None and not (
             executable.is_certified_optimal and executable.exact_post_validated
         ) and executable.status is not SolverStatus.INFEASIBLE:
@@ -2832,11 +2942,6 @@ class ProcurementOptimizer:
             for route in problem.routes
             for item in route.approval_requirements
         )
-        requested_relaxations.update(
-            item.rule_id
-            for item in problem.order_approval_constraints
-            if item.rule_id not in problem.approved_order_rule_ids
-        )
         if problem.named_primary_rule_id:
             requested_relaxations.add(problem.named_primary_rule_id)
         if problem.sub_moq_approval_rule_id and any(
@@ -2854,7 +2959,10 @@ class ProcurementOptimizer:
                 cheapest_covering_cost=cheapest,
                 relaxed_rule_id=rule_id,
             )
-            result = self.solver.solve(counterfactual_problem)
+            result = _classify_order_value_approvals(
+                problem,
+                self.solver.solve(counterfactual_problem),
+            )
             counterfactuals.append(result)
             if result.candidate_plan is not None:
                 alternatives.append(result.candidate_plan)

@@ -515,18 +515,47 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
 def _approval_alert(
     decision: DecisionRecord,
     plan: CandidatePlan,
-    line: PlanLine,
-    approval: ApprovalRule,
+    approvals_by_route: Mapping[str, tuple[ApprovalRule, ...]],
 ) -> str:
+    proposal_lines: list[str] = []
+    authorities: set[str] = set()
+    for line in plan.lines:
+        approvals = approvals_by_route.get(line.route_id, ())
+        authorities.update(item.authority for item in approvals)
+        thresholds = "; ".join(
+            f"{item.threshold} under {item.rule_id}"
+            for item in approvals
+        ) or "none"
+        line_authorities = _list(item.authority for item in approvals)
+        timing = "; ".join(
+            (
+                f"{_number(allocation.quantity)} allocated to {allocation.due_date.isoformat()} "
+                + (
+                    f"is available {max(0, (allocation.due_date - line.material_available_date).days)} days before/on the deadline"
+                    if line.material_available_date <= allocation.due_date
+                    else f"is {max(0, (line.material_available_date - allocation.due_date).days)} days late"
+                )
+            )
+            for allocation in line.bucket_allocations
+        )
+        proposal_lines.append(
+            f"supplier {line.supplier_id}, full quantity {_number(line.quantity)}, unit price "
+            f"{_number(line.unit_price)}, line total {_number(line.line_total)}, order date "
+            f"{line.order_date.isoformat()}, expected delivery "
+            f"{line.expected_delivery_date.isoformat()}, material available "
+            f"{line.material_available_date.isoformat()}, timing impact [{timing}], thresholds "
+            f"crossed [{thresholds}], required authorities [{line_authorities}]"
+        )
+    authority_text = _list(authorities)
     return (
-        f"Approval proposal for component {decision.component_id}, requirement "
-        f"{decision.requirement_id}: supplier {line.supplier_id}, quantity "
-        f"{_number(line.quantity)}, unit price {_number(line.unit_price)}, line total "
-        f"{_number(line.line_total)}, expected delivery "
-        f"{line.expected_delivery_date.isoformat()}. Threshold crossed: "
-        f"{approval.threshold} under {approval.rule_id}. The agent did not place this order. "
-        f"Human action: {approval.authority} must approve the complete proposal, then the "
-        f"planner must recompute it from a fresh snapshot."
+        f"Complete approval proposal for component {decision.component_id}, requirement "
+        f"{decision.requirement_id}: [{'; '.join(proposal_lines)}]. The certified plan would "
+        f"cover {_number(plan.eventual_covered_quantity)} units and leave "
+        f"{_number(plan.residual_gap)} uncovered at the proposal snapshot. The agent withheld "
+        f"every line atomically, including any sub-threshold companion line, so repeated runs "
+        f"cannot split the requirement around an approval threshold. Human action: "
+        f"{authority_text} must approve the complete proposal, then the planner must recompute "
+        f"dates, quantities, eligibility, and price from a fresh snapshot."
     )
 
 
@@ -646,15 +675,27 @@ def render_alerts(
                     )
                 if registry is None:
                     registry = load_policy_registry()
+                approvals_by_route: dict[str, tuple[ApprovalRule, ...]] = {}
                 for line in plan.lines:
-                    for rule_id in plan.unresolved_approval_ids:
-                        details = approval_rule(registry, rule_id, line.supplier_id)
-                        add(
-                            AlertCategory.APPROVAL_REQUIRED,
-                            f"{scope}:approval:{plan.plan_id}:{line.route_id}:{rule_id}",
-                            _approval_alert(decision, plan, line, details),
-                        )
-                        approval_count += 1
+                    approvals_by_route[line.route_id] = tuple(
+                        approval_rule(registry, rule_id, line.supplier_id)
+                        for rule_id in line.approval_rule_ids
+                    )
+                represented = {
+                    item.rule_id
+                    for approvals in approvals_by_route.values()
+                    for item in approvals
+                }
+                if represented != set(plan.unresolved_approval_ids):
+                    raise ExplanationError(
+                        f"approval recommendation {plan.plan_id} has inconsistent line approvals"
+                    )
+                add(
+                    AlertCategory.APPROVAL_REQUIRED,
+                    f"{scope}:approval:{plan.plan_id}:{'-'.join(sorted(represented))}",
+                    _approval_alert(decision, plan, approvals_by_route),
+                )
+                approval_count += 1
             elif plan.disposition is PlanDisposition.DECISION_REQUIRED:
                 add(
                     AlertCategory.DECISION_REQUIRED,

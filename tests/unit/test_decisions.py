@@ -45,6 +45,7 @@ from apex_procurement.explanations import (
     render_alerts,
     render_legacy_v1_decision_rationale,
     render_legacy_v1_line_rationale,
+    render_line_rationale,
 )
 from apex_procurement.ledgers import build_ledgers
 from apex_procurement.repository import SQLiteRepository
@@ -96,7 +97,10 @@ def make_plan(
     unresolved_approval_ids: tuple[str, ...] = (),
     plan_id: str = "selected-plan",
 ) -> CandidatePlan:
-    line = make_line(quantity=quantity)
+    line = replace(
+        make_line(quantity=quantity),
+        approval_rule_ids=unresolved_approval_ids,
+    )
     executable = disposition.writes_purchase_order
     return CandidatePlan(
         plan_id=plan_id,
@@ -256,8 +260,61 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertEqual(parsed.action_key, target.action_key)
         self.assertEqual(parsed.decision, output.decisions[0])
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
-        self.assertIn("[APEX_AGENT:v2 ", target.rationale)
+        self.assertIn("[APEX_AGENT:v3 ", target.rationale)
         self.assertIn("Fulfillment FULFILLED; resolution RESOLVED", target.rationale)
+
+    def test_pre_r03_v2_record_without_line_approvals_remains_parseable(self) -> None:
+        policy_version = "policy-version-one"
+        approval_proposal = make_plan(
+            disposition=PlanDisposition.RECOMMEND_APPROVAL,
+            quantity=Decimal("2000"),
+            unresolved_approval_ids=(
+                "POL-PROC-001.section_7.manager_approval",
+            ),
+            plan_id="approval-proposal",
+        )
+        output = build_decision_outputs(
+            (
+                make_decision(
+                    alternatives=(approval_proposal,),
+                    alerts=(AlertCategory.APPROVAL_REQUIRED,),
+                ),
+            ),
+            policy_version,
+        )
+        decision = output.decisions[0]
+        target = output.purchase_orders[0]
+        assert decision.selected_plan is not None
+        line = decision.selected_plan.lines[0]
+        record_token = decisions_module._encoded(
+            decisions_module._legacy_v2_record(decision)
+        )
+        marker = decisions_module._po_marker(
+            key=target.action_key,
+            demand_digest=target.demand_fingerprint,
+            route_id=line.route_id,
+            policy_pack_version=policy_version,
+            line_index=0,
+            decision_token=record_token,
+            version=2,
+        )
+        stored = ExistingPurchaseOrder(
+            po_number=target.po_number,
+            component_id=target.component_id,
+            supplier_id=target.supplier_id,
+            quantity=target.quantity,
+            unit_price=target.unit_price,
+            order_date=target.order_date,
+            expected_delivery_date=target.expected_delivery_date,
+            rationale=f"{marker} {render_line_rationale(decision, line)}",
+        )
+
+        parsed = parse_owned_purchase_order(stored)
+
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.marker_version, 2)
+        self.assertEqual(parsed.decision, decision)
 
     def test_v1_owned_po_remains_strictly_parseable_and_reconstructable(self) -> None:
         policy_version = "policy-version-one"
@@ -364,6 +421,7 @@ class IdentityAndRenderingTests(unittest.TestCase):
     def test_approval_alert_is_a_complete_proposal_from_policy_facts(self) -> None:
         proposal = make_plan(
             disposition=PlanDisposition.RECOMMEND_APPROVAL,
+            quantity=Decimal("2000"),
             unresolved_approval_ids=("POL-PROC-001.section_7.manager_approval",),
             plan_id="approval-proposal",
         )
@@ -381,10 +439,13 @@ class IdentityAndRenderingTests(unittest.TestCase):
         )
         for expected in (
             "supplier SUP-112",
-            "quantity 20",
+            "full quantity 2000",
             "unit price 32",
-            "line total 640",
+            "line total 64000",
+            "order date 2025-09-01",
             "expected delivery 2025-09-15",
+            "material available 2025-09-15",
+            "timing impact",
             "line total exceeds 50000",
             "Procurement Manager must approve",
         ):
@@ -509,7 +570,7 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
             (self.table_rows("purchase_orders"), self.table_rows("alerts")),
         )
 
-    def test_expanded_r02_v1_marker_remains_a_no_op_after_v2_bump(self) -> None:
+    def test_expanded_r02_v1_marker_remains_a_no_op_after_v3_bump(self) -> None:
         policy_version = "policy-version-one"
         original = make_decision()
         snapshot = SQLiteRepository().load_snapshot(self.path)
@@ -522,10 +583,10 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
             rationale = connection.execute(
                 "SELECT rationale FROM purchase_orders"
             ).fetchone()[0]
-            self.assertIn("[APEX_AGENT:v2 ", rationale)
+            self.assertIn("[APEX_AGENT:v3 ", rationale)
             connection.execute(
                 "UPDATE purchase_orders SET rationale = ?",
-                (rationale.replace("[APEX_AGENT:v2 ", "[APEX_AGENT:v1 ", 1),),
+                (rationale.replace("[APEX_AGENT:v3 ", "[APEX_AGENT:v1 ", 1),),
             )
         before = (self.table_rows("purchase_orders"), self.table_rows("alerts"))
         downgraded = SQLiteRepository().load_snapshot(self.path)

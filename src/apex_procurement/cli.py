@@ -563,6 +563,11 @@ def _decision_categories(
         and selected.disposition is PlanDisposition.EXECUTE_WITH_ASSUMPTION
     ):
         categories.update({AlertCategory.ASSUMPTION, AlertCategory.EVIDENCE_CONTRACT})
+    if any(
+        item.disposition is PlanDisposition.RECOMMEND_APPROVAL
+        for item in alternatives
+    ):
+        categories.add(AlertCategory.APPROVAL_REQUIRED)
 
     plans = tuple(item for item in (selected, *alternatives) if item is not None)
     if plans:
@@ -721,13 +726,6 @@ def _nonredundant_alternatives(
         if facts in seen:
             continue
         seen.add(facts)
-        if (
-            plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
-            and not plan.unresolved_approval_ids
-        ):
-            plan = replace(
-                plan, unresolved_approval_ids=plan.relaxed_rule_ids
-            )
         result.append(plan)
     return tuple(sorted(result, key=lambda item: item.plan_id))
 

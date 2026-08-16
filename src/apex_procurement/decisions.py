@@ -44,8 +44,8 @@ from .repository import (
 from .serialization import canonical_dumps, canonical_loads
 
 
-PO_MARKER_VERSION = 2
-_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, PO_MARKER_VERSION})
+PO_MARKER_VERSION = 3
+_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, 2, PO_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
 _TOKEN = r"[A-Za-z0-9_-]+"
 _PO_MARKER = re.compile(
@@ -288,7 +288,59 @@ def _legacy_v1_record(decision: DecisionRecord) -> str:
         if isinstance(plan, dict):
             plan.pop("recovery_demand", None)
             plan.pop("recovery_quantity", None)
+            lines = plan.get("lines")
+            if isinstance(lines, list):
+                for line in lines:
+                    if isinstance(line, dict):
+                        line.pop("approval_rule_ids", None)
     return canonical_dumps(primitive)
+
+
+def _legacy_v2_record(decision: DecisionRecord) -> str:
+    """Serialize the pre-R03 record schema without line approval fields."""
+
+    primitive = canonical_loads(canonical_dumps(decision), dict)
+    plans = [primitive.get("selected_plan")]
+    alternatives = primitive.get("alternatives")
+    if isinstance(alternatives, list):
+        plans.extend(alternatives)
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        lines = plan.get("lines")
+        if not isinstance(lines, list):
+            continue
+        for line in lines:
+            if isinstance(line, dict):
+                line.pop("approval_rule_ids", None)
+    return canonical_dumps(primitive)
+
+
+def _load_legacy_decision(record_json: str) -> DecisionRecord:
+    """Upgrade pre-R03 aggregate approval IDs to the line-level contract."""
+
+    primitive = canonical_loads(record_json, dict)
+    plans = [primitive.get("selected_plan")]
+    alternatives = primitive.get("alternatives")
+    if isinstance(alternatives, list):
+        plans.extend(alternatives)
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        approval_ids = plan.get("unresolved_approval_ids", [])
+        if not isinstance(approval_ids, list):
+            approval_ids = []
+        lines = plan.get("lines")
+        if not isinstance(lines, list):
+            continue
+        for line in lines:
+            if isinstance(line, dict):
+                line.setdefault("approval_rule_ids", approval_ids)
+    return canonical_loads(
+        canonical_dumps(primitive),
+        DecisionRecord,
+        allow_missing_defaults=True,
+    )
 
 
 def _is_legacy_v1_decision(decision: DecisionRecord) -> bool:
@@ -458,28 +510,26 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
     route_id = _decoded(match.group("route"), "route")
     policy_version = _decoded(match.group("policy"), "policy")
     record_json = _decoded(match.group("record"), "record")
-    legacy_v1_schema = False
+    legacy_schema_version: int | None = None
     try:
         decision = canonical_loads(record_json, DecisionRecord)
     except (TypeError, ValueError) as strict_error:
-        if marker_version != 1:
+        if marker_version not in {1, 2}:
             raise OwnershipMarkerError(
                 f"purchase order {order.po_number} contains an invalid decision record"
             ) from strict_error
         try:
-            decision = canonical_loads(
-                record_json,
-                DecisionRecord,
-                allow_missing_defaults=True,
-            )
-            legacy_v1_schema = True
+            decision = _load_legacy_decision(record_json)
+            legacy_schema_version = marker_version
         except (TypeError, ValueError) as compatibility_error:
             raise OwnershipMarkerError(
                 f"purchase order {order.po_number} contains an invalid decision record"
             ) from compatibility_error
     expected_record = (
         _legacy_v1_record(decision)
-        if legacy_v1_schema
+        if legacy_schema_version == 1
+        else _legacy_v2_record(decision)
+        if legacy_schema_version == 2
         else canonical_dumps(decision)
     )
     if _encoded(expected_record) != match.group("record"):
@@ -488,7 +538,7 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         )
     decision_rationale = (
         render_legacy_v1_decision_rationale(decision)
-        if legacy_v1_schema
+        if legacy_schema_version == 1
         else render_decision_rationale(decision)
     )
     if decision.rationale != decision_rationale:
@@ -537,7 +587,7 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
     )
     line_rationale = (
         render_legacy_v1_line_rationale(decision, line)
-        if legacy_v1_schema
+        if legacy_schema_version == 1
         else render_line_rationale(decision, line)
     )
     expected_rationale = f"{marker} {line_rationale}"
