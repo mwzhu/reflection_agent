@@ -1,0 +1,1025 @@
+{
+  "schema_version": "1.0.0",
+  "pack_id": "apex-procurement-policy-2025-08-20",
+  "compiler": {
+    "name": "reviewed-manual-policy-compiler",
+    "version": "1.0.0",
+    "llm_used": false
+  },
+  "review_status": "approved",
+  "content_hash": "sha256:f85076dcde4b4a4745e2d74ff856daacd508f56a08dae9881bff22416400bc1e",
+  "concepts": {
+    "path": "concepts.json",
+    "content_hash": "sha256:f6671dbe7124f6a512f529f6c321282e51260b54e36712e40951d14a8eca3994"
+  },
+  "source_documents": [
+    {
+      "document_id": "POL-PROC-001",
+      "document_type": "policy",
+      "path": "data/policies/procurement_policy.pdf",
+      "sha256": "sha256:da094440489dcbbe9e8108faab7c6e3278807500ae6f9db9d960868d6f98df5d",
+      "text_sha256": "sha256:e9c544bbb44813f0c9f5e6e96170b698487b64ba8cf60700568867c38fc3f897",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "coverage": {
+        "/document_id": {"source_quote": "Document ID: POL-PROC-001", "value_literal": "POL-PROC-001", "value_format": "exact_text"},
+        "/effective_from": {"source_quote": "Effective: January 15, 2025", "value_literal": "January 15, 2025", "value_format": "date_long"}
+      },
+      "source_text": "Apex Manufacturing — Procurement Policy\n Document ID: POL-PROC-001  |  Version 3.2  |  Effective: January 15, 2025\n1. Purpose and Scope\nThis policy governs the procurement of all materials, components, and services used in manufacturing\noperations at Apex Manufacturing. It applies to all purchase orders, supplier agreements, and\nprocurement decisions across all product lines and facilities.\n2. Approved Supplier Requirements\nAll procurement must be from suppliers listed on the Approved Supplier List (ASL). The ASL is\nmaintained by the Quality Assurance department and reviewed quarterly. Suppliers that have been\nremoved from the ASL may not be used under any circumstances, regardless of pricing or availability.\n2.1 Supplier Certification\nSuppliers of electronic components, printed circuit boards, and safety-critical parts must hold current\nISO-9001 certification. Suppliers of power supply components (capacitor banks, transformer cores)\nmust additionally hold UL listing certification. Certification status is verified annually.\n3. Domestic Sourcing Preference\nApex Manufacturing prefers domestic (United States and Canada) suppliers for all components.\nInternational suppliers may be used when: (a) no domestic supplier can meet required delivery\ntimelines, (b) the domestic price premium exceeds 35% of the international price, or (c) the component\nis not available from any domestic source. Justification for international sourcing must be documented\nin the purchase order rationale.\nNote: For components classified as 'critical' (defined in Section 6), the domestic price premium threshold is\n50% rather than 35%.\n4. Supplier Concentration Limits\nTo mitigate supply chain risk, no single supplier may account for more than 70% of the total volume of\nany critical component within a rolling 12-month period. For non-critical components, the concentration\nlimit is 85%. The procurement team must maintain at least two qualified suppliers for every critical\ncomponent.\n\f\nException: Where only one supplier exists globally for a specialized component (sole-source), a Sole\nSource Justification must be documented in the purchase order rationale.\n4.1 Minimum Order Quantities\nPurchase orders must meet the supplier's stated minimum order quantity (MOQ). Orders below MOQ\nrequire written supplier approval.\n5. Hazardous Materials\nAll hazardous materials (as classified in the component database) require special receiving and\nhandling procedures and must be stored in the designated Hazmat Storage area. Orders for hazardous\nmaterials should be flagged for procurement review, as these materials are subject to additional\nreceiving requirements that may extend delivery timelines. FIFO (First In, First Out) rotation is strictly\nenforced.\n6. Critical Components\nThe following component categories are classified as critical: microcontroller ICs, power MOSFETs,\nPCB blanks, neodymium magnets, and all sensor ICs (temperature, pressure, humidity). Critical\ncomponents are subject to enhanced sourcing requirements including tighter concentration limits\n(Section 4) and higher domestic price premium thresholds (Section 3).\n7. Budget and Cost Controls\nAll procurement decisions must consider total cost of ownership, including unit price, shipping, and\nhandling costs. Orders exceeding $50,000 require Procurement Manager approval. Orders exceeding\n$150,000 require VP of Operations approval.\n7.1 Emergency Procurement\nEmergency purchase orders (required to prevent production stoppage) may bypass standard approval\nthresholds up to $75,000, but must be documented with a rationale and approved retroactively within 5\nbusiness days.\n8. Sustainability Requirements\nWhen selecting between suppliers with comparable pricing (within 10%) and delivery timelines (within 5\nbusiness days), preference should be given to suppliers with a sustainability rating of A or higher.\nSuppliers with a sustainability rating below B are subject to additional review and should only be used\nwhen no alternatives are available.\nSuppliers holding ISO-14001 certification receive preferential consideration.\n\f\n9. Strategic Supplier Relationships\nSuppliers designated as 'Strategic' tier represent key long-term partnerships. The procurement team\nshould maintain consistent order volumes with Strategic suppliers to preserve relationship stability,\neven when short-term alternatives offer moderately better pricing (up to 15% savings). Decisions to\nshift significant volume away from Strategic suppliers require VP of Operations approval.\n10. Shipping and Lead Times\nPurchase orders should be placed with sufficient lead time to ensure materials arrive before the\nscheduled production start date. The supplier catalog lists standard lead times for each component.\nInternational suppliers typically ship via ocean freight; expedited air freight may be authorized by\nmanagement memo when schedule demands require it. The expected delivery date on each purchase\norder must reflect the supplier's quoted lead time from the date of order.\n"
+    },
+    {
+      "document_id": "MEMO-2025-041",
+      "document_type": "memo",
+      "path": "data/memos/memo_2025-04-15_supplier_concentration.pdf",
+      "sha256": "sha256:89a1574e2f782a9db515261d162bf2f538e8c5f96a873bf2dceaafa01d54e4aa",
+      "text_sha256": "sha256:6b2bc9a80674888ac1ef9b25e5c7649be7ab5238549fa4533155f0263a3e10eb",
+      "effective_from": "2025-04-15",
+      "effective_through": null,
+      "coverage": {
+        "/document_id": {"source_quote": "Memo ID: MEMO-2025-041", "value_literal": "MEMO-2025-041", "value_format": "exact_text"},
+        "/effective_from": {"source_quote": "Date: April 15, 2025", "value_literal": "April 15, 2025", "value_format": "date_long"}
+      },
+      "source_text": "APEX MANUFACTURING — INTERNAL MEMORANDUM\nMemo ID: MEMO-2025-041\nDate: April 15, 2025\nFrom: Sandra Chen, VP of Operations\nTo: All Procurement Staff\nSubject: Updated Supplier Concentration Limits for Rare Earth Components\nFollowing the recent supply disruptions in Q1 2025 related to rare earth material shortages, I am\nissuing updated guidance on supplier concentration limits for neodymium magnets and related rare\nearth components.\nEffective immediately, the supplier concentration limit for neodymium magnets (RM-3003) is reduced\nfrom 70% to 50% for any single supplier. This supersedes the general critical component concentration\nlimit stated in Procurement Policy Section 4.\nAdditionally, all purchase orders for neodymium magnets must include a secondary supplier allocation\nof at least 20% of the total order volume. This applies even when the secondary supplier has a higher\nper-unit cost.\nThe procurement team should work with MagnetPro Inc. (SUP-108) to increase their qualified capacity\nfor N52-grade magnets. Until MagnetPro's capacity is confirmed sufficient, Nanjing Rare Earth Co.\n(SUP-107) remains our primary volume supplier, but orders must be structured to meet the new 50%\nconcentration cap.\nPlease update all open and future purchase orders accordingly. Questions should be directed to the\nProcurement Manager.\n"
+    },
+    {
+      "document_id": "MEMO-2025-072",
+      "document_type": "memo",
+      "path": "data/memos/memo_2025-07-01_expedited_shipping.pdf",
+      "sha256": "sha256:c978b77fe8992f77abfeb12cebc11a4d39d60f0e850b6d456772cf03d423b553",
+      "text_sha256": "sha256:809709e60239f14cf7907cc2acacb40cbf8a96872f8c82498db1384c4f04f96d",
+      "effective_from": "2025-07-01",
+      "effective_through": "2025-09-30",
+      "coverage": {
+        "/document_id": {"source_quote": "Memo ID: MEMO-2025-072", "value_literal": "MEMO-2025-072", "value_format": "exact_text"},
+        "/effective_from": {"source_quote": "Effective July 1, 2025 through September 30, 2025", "value_literal": "July 1, 2025", "value_format": "date_long"},
+        "/effective_through": {"source_quote": "Effective July 1, 2025 through September 30, 2025", "value_literal": "September 30, 2025", "value_format": "date_long"}
+      },
+      "source_text": "APEX MANUFACTURING — INTERNAL MEMORANDUM\nMemo ID: MEMO-2025-072\nDate: July 1, 2025\nFrom: David Park, Procurement Manager\nTo: Procurement Team, Production Planning\nSubject: Temporary Authorization for Expedited Shipping from International Suppliers\nDue to increased customer demand in Q3 2025, I am temporarily authorizing the use of air freight for\ninternational supplier shipments where ocean freight lead times would cause production delays.\nEffective July 1, 2025 through September 30, 2025, international suppliers may be asked to ship via\nair freight at Apex Manufacturing's expense. When air freight is used, the effective lead time for\ninternational suppliers is reduced by 14 days from their standard catalog lead time (but not below 7\ndays minimum).\nAir freight authorization is limited to components needed for confirmed production orders. Speculative\nor safety-stock orders do not qualify for air freight.\nThe additional cost of air freight (estimated at $8-12 per kg) should be documented on the purchase\norder. Total air freight expenditure is capped at $25,000 for the authorization period. The Procurement\nManager must approve each air freight request individually.\nThis authorization does not override any other procurement policy requirements including supplier\ncertification and hazardous materials handling.\n"
+    },
+    {
+      "document_id": "MEMO-2025-085",
+      "document_type": "memo",
+      "path": "data/memos/memo_2025-08-20_pcb_quality.pdf",
+      "sha256": "sha256:06ee1493ebb4fe66b4e6ed11fa9170bce87005d20e64b86222d6d0da7a75e2d1",
+      "text_sha256": "sha256:23785b324aee330d43433de6364b5e90431440e60e57d798586b201d8d3d2c22",
+      "effective_from": "2025-08-20",
+      "effective_through": null,
+      "coverage": {
+        "/document_id": {"source_quote": "Memo ID: MEMO-2025-085", "value_literal": "MEMO-2025-085", "value_format": "exact_text"},
+        "/effective_from": {"source_quote": "New requirements (effective August 20, 2025)", "value_literal": "August 20, 2025", "value_format": "date_long"}
+      },
+      "source_text": "APEX MANUFACTURING — INTERNAL MEMORANDUM\nMemo ID: MEMO-2025-085\nDate: August 20, 2025\nFrom: Maria Santos, Quality Assurance Director\nTo: Procurement Team, Production Planning, Electronics Assembly\nSubject: Enhanced Quality Requirements for PCB Components\nFollowing the identification of micro-cracking issues in two recent PCB lots, I am implementing\nenhanced quality measures for all printed circuit board components (RM-3005) effective immediately.\nNew requirements (effective August 20, 2025):\n1. PCB suppliers must provide a Certificate of Conformance (CoC) with each shipment including\ncross-section analysis results. Shipments without a CoC will be rejected at receiving and returned to\nthe supplier.\n2. Until further notice, we are suspending new supplier qualification for PCB components. Only\nsuppliers from whom we have previously received and accepted PCB shipments may be used. If a PCB\nsupplier is new to us, we cannot order PCBs from them at this time.\nThese measures will remain in effect until the root cause investigation is complete and corrective\nactions are verified, estimated 60-90 days.\n"
+    }
+  ],
+  "evidence_bases": {
+    "prospective_order": {
+      "resolution_strategy": "always_satisfiable",
+      "derived_from": "derivation:evidence_prospective_order"
+    },
+    "entity_attribute": {
+      "resolution_strategy": "both_ways",
+      "derived_from": "derivation:evidence_entity_attribute"
+    },
+    "rolling_window": {
+      "resolution_strategy": "contract_disposition",
+      "derived_from": "derivation:evidence_contract_disposition"
+    },
+    "external_system": {
+      "resolution_strategy": "contract_disposition",
+      "derived_from": "derivation:evidence_contract_disposition"
+    }
+  },
+  "contracts": {
+    "benchmark": {
+      "rolling_window": {
+        "disposition": "EXECUTE_WITH_ASSUMPTION",
+        "derived_from": "derivation:benchmark_rolling_window"
+      },
+      "external_system": {
+        "disposition": "RECOMMEND_APPROVAL",
+        "derived_from": "derivation:external_system_approval"
+      },
+      "rule_resolutions": {
+        "MEMO-2025-085.pcb_incumbent_only": {
+          "resolution_strategy": "documented_inference",
+          "missing_disposition": "EXECUTE_WITH_ASSUMPTION",
+          "strategy_derived_from": "derivation:pcb_benchmark_strategy",
+          "disposition_derived_from": "derivation:pcb_benchmark_disposition"
+        }
+      }
+    },
+    "production": {
+      "rolling_window": {
+        "disposition": "DECISION_REQUIRED",
+        "derived_from": "derivation:production_rolling_window"
+      },
+      "external_system": {
+        "disposition": "RECOMMEND_APPROVAL",
+        "derived_from": "derivation:external_system_approval"
+      },
+      "rule_resolutions": {
+        "MEMO-2025-085.pcb_incumbent_only": {
+          "resolution_strategy": "affirmative_record_required",
+          "missing_disposition": "DECISION_REQUIRED",
+          "strategy_derived_from": "derivation:pcb_production_strategy",
+          "disposition_derived_from": "derivation:pcb_production_disposition"
+        }
+      }
+    }
+  },
+  "precedence_model": {
+    "steps": [
+      "effective_window",
+      "explicit_supersedes",
+      "narrower_selector",
+      "later_equal_authority"
+    ],
+    "conflict_result": "UNKNOWN_BLOCK_AND_ALERT",
+    "derived_from": "MERGED_PLAN#5.1/precedence"
+  },
+  "derivations": [
+    {"derivation_id": "evidence_prospective_order", "value": "always_satisfiable", "source_pointer": "MERGED_PLAN#5.1/evidence_bases/prospective_order", "review_status": "approved", "reasoning": "A prospective allocation is provable from the order under construction."},
+    {"derivation_id": "evidence_entity_attribute", "value": "both_ways", "source_pointer": "MERGED_PLAN#5.3/entity_attributes", "review_status": "approved", "reasoning": "Unresolved entity attributes use robust both-ways evaluation."},
+    {"derivation_id": "evidence_contract_disposition", "value": "contract_disposition", "source_pointer": "MERGED_PLAN#5.1/evidence_bases", "review_status": "approved", "reasoning": "Missing historical or external evidence is resolved by the active evidence contract."},
+    {"derivation_id": "benchmark_rolling_window", "value": "EXECUTE_WITH_ASSUMPTION", "source_pointer": "MERGED_PLAN#3/benchmark/rolling_window", "review_status": "approved", "reasoning": "Absent rolling history is unknown rather than zero under the benchmark contract."},
+    {"derivation_id": "production_rolling_window", "value": "DECISION_REQUIRED", "source_pointer": "MERGED_PLAN#3/production/rolling_window", "review_status": "approved", "reasoning": "Production requires real rolling history."},
+    {"derivation_id": "external_system_approval", "value": "RECOMMEND_APPROVAL", "source_pointer": "MERGED_PLAN#3/approval_state", "review_status": "approved", "reasoning": "Unrepresented approvals remain recommendations in both contracts."},
+    {"derivation_id": "selector_match_all", "value": "all", "source_pointer": "MERGED_PLAN#5.1/semantic_selectors", "review_status": "approved", "reasoning": "The universal selector is represented explicitly rather than by an identifier list."},
+    {"derivation_id": "allocation_group", "value": "allocation_group", "source_pointer": "MERGED_PLAN#5.1/allocation_unit", "review_status": "approved", "reasoning": "All new orders for one component in one run form the policy allocation unit."},
+    {"derivation_id": "diagnostic_enforcement", "value": "diagnostic", "source_pointer": "MERGED_PLAN#5.1/rule_kinds", "review_status": "approved", "reasoning": "The two-qualified-supplier obligation diagnoses the supply base and is not an allocation constraint."},
+    {"derivation_id": "catalog_moq_attribute", "value": "minimum_order_quantity", "source_pointer": "MERGED_PLAN#5.1/sub_moq", "review_status": "approved", "reasoning": "The catalog MOQ is the structured source for the quantity rule."},
+    {"derivation_id": "unsupported_emergency_predicate", "value": "unsupported", "source_pointer": "MERGED_PLAN#3/emergency_procurement", "review_status": "approved", "reasoning": "The supplied schema cannot establish a production stoppage."},
+    {"derivation_id": "quoted_lead_time_calculation", "value": "order_date_plus_quoted_lead_time", "source_pointer": "MERGED_PLAN#2.2/stored_dates", "review_status": "approved", "reasoning": "Generated dates use the order date plus quoted lead time."},
+    {"derivation_id": "primary_largest_share", "value": "largest_share", "source_pointer": "MERGED_PLAN#5.1/allocation_unit", "review_status": "approved", "reasoning": "Primary means the supplier holding the largest share of the allocation group."},
+    {"derivation_id": "secondary_non_primary", "value": "all_non_primary_suppliers", "source_pointer": "MERGED_PLAN#5.1/allocation_unit", "review_status": "approved", "reasoning": "Secondary allocation is the total share of all non-primary suppliers."},
+    {"derivation_id": "precedence_explicit", "value": "explicit", "source_pointer": "MERGED_PLAN#5.1/precedence", "review_status": "approved", "reasoning": "The source explicitly says that the memo supersedes the policy limit."},
+    {"derivation_id": "precedence_inferred", "value": "inferred", "source_pointer": "MERGED_PLAN#5.1/named_primary_precedence", "review_status": "approved", "reasoning": "The memo-over-policy and narrower-over-broader precedence is inferred, not asserted by the source."},
+    {"derivation_id": "magnet_precedence_reasoning", "value": "memo-over-policy and narrower-scope-over-broader", "source_pointer": "MERGED_PLAN#5.1/named_primary_precedence", "review_status": "approved", "reasoning": "The named-primary direction outranks the general domestic preference within its narrow scope."},
+    {"derivation_id": "capacity_predicate", "value": "capacity_confirmed_sufficient", "source_pointer": "MERGED_PLAN#5.1/release_condition", "review_status": "approved", "reasoning": "The source phrase is compiled into an affirmative release predicate."},
+    {"derivation_id": "capacity_evidence_source", "value": "capacity_confirmation_service", "source_pointer": "MERGED_PLAN#3/capacity_confirmation", "review_status": "approved", "reasoning": "Current confirmation belongs to an external evidence provider, not the immutable pack."},
+    {"derivation_id": "affirmative_release", "value": "affirmative_record_required", "source_pointer": "MERGED_PLAN#5.1/release_condition", "review_status": "approved", "reasoning": "Missing confirmation does not release the directive."},
+    {"derivation_id": "capacity_disclosure_condition", "value": "positive_allocation_and_no_numeric_capacity", "source_pointer": "MERGED_PLAN#5.1/capacity_disclosure", "review_status": "approved", "reasoning": "Only positive allocation to the release subject without numeric capacity triggers disclosure."},
+    {"derivation_id": "capacity_disclosure_kind", "value": "CAPACITY_UNKNOWN", "source_pointer": "MERGED_PLAN#5.1/capacity_disclosure", "review_status": "approved", "reasoning": "The named disclosure category distinguishes unknown capacity from a numeric allocation limit."},
+    {"derivation_id": "release_subject_pointer", "value": "release_condition.subject", "source_pointer": "MERGED_PLAN#5.1/capacity_disclosure", "review_status": "approved", "reasoning": "Capacity disclosure is scoped solely to the release-condition subject."},
+    {"derivation_id": "non_dispositive", "value": "none", "source_pointer": "MERGED_PLAN#5.1/capacity_disclosure", "review_status": "approved", "reasoning": "Capacity uncertainty is a disclosure and not an allocation gate."},
+    {"derivation_id": "named_primary_deviation", "value": "DECISION_REQUIRED", "source_pointer": "MERGED_PLAN#5.1/named_primary", "review_status": "approved", "reasoning": "Deviation from the VP directive requires a customer decision."},
+    {"derivation_id": "standard_lead_time_delay", "value": "standard_lead_time_causes_production_delay", "source_pointer": "MERGED_PLAN#5.1/air_freight", "review_status": "approved", "reasoning": "Air freight is conditional on the standard route missing the production date."},
+    {"derivation_id": "authorization_period", "value": "authorization_period", "source_pointer": "MERGED_PLAN#5.1/effective_windows", "review_status": "approved", "reasoning": "The memo-wide spend cap uses the memo authorization window."},
+    {"derivation_id": "air_freight_used", "value": "air_freight_used", "source_pointer": "MERGED_PLAN#5.1/air_freight", "review_status": "approved", "reasoning": "The documentation, spend, and approval clauses attach only to routes that use air freight."},
+    {"derivation_id": "explicit_non_override", "value": "explicit", "source_pointer": "MERGED_PLAN#5.1/precedence", "review_status": "approved", "reasoning": "The memo explicitly says it does not override other requirements."},
+    {"derivation_id": "reject_and_return", "value": "reject_and_return", "source_pointer": "MERGED_PLAN#5.1/rule_kinds", "review_status": "approved", "reasoning": "The source's receiving consequence is represented as a shipment disposition."},
+    {"derivation_id": "pcb_benchmark_inference", "value": "prior_order_or_predating_relationship", "source_pointer": "MERGED_PLAN#5.3/pcb_incumbency", "review_status": "approved", "reasoning": "Benchmark mode permits the documented incumbency inference; production requires receipt evidence."},
+    {"derivation_id": "pcb_benchmark_strategy", "value": "documented_inference", "source_pointer": "MERGED_PLAN#3/benchmark/pcb_history", "review_status": "approved", "reasoning": "The benchmark contract permits the declared prior-order or predating-relationship inference."},
+    {"derivation_id": "pcb_benchmark_disposition", "value": "EXECUTE_WITH_ASSUMPTION", "source_pointer": "MERGED_PLAN#5.3/pcb_incumbency", "review_status": "approved", "reasoning": "An order relying on the benchmark incumbency inference carries the named assumption."},
+    {"derivation_id": "pcb_production_strategy", "value": "affirmative_record_required", "source_pointer": "MERGED_PLAN#3/production/pcb_history", "review_status": "approved", "reasoning": "Production requires an approved incumbent list or accepted-shipment record."},
+    {"derivation_id": "pcb_production_disposition", "value": "DECISION_REQUIRED", "source_pointer": "MERGED_PLAN#3/production/pcb_history", "review_status": "approved", "reasoning": "Missing production receipt evidence blocks the affected decision."},
+    {"derivation_id": "two_qualified_suppliers", "value": 2, "source_pointer": "MERGED_PLAN#5.1/dual_source_diagnostic", "review_status": "approved", "reasoning": "The source word 'two' compiles to the integer minimum of two qualified suppliers."}
+  ],
+  "rules": [
+    {
+      "rule_id": "POL-PROC-001.section_2.approved_supplier",
+      "source_document": "POL-PROC-001",
+      "title": "Approved Supplier List eligibility",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "approved_supplier_required", "on_approved_list": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/approved_supplier_required"},
+        "/constraint/on_approved_list": {"source_quote": "All procurement must be from suppliers listed on the Approved Supplier List (ASL).", "value_literal": "must", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_2_1.iso_9001",
+      "source_document": "POL-PROC-001",
+      "title": "ISO-9001 certification for electronic, PCB, and safety-critical parts",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["electronic_component", "printed_circuit_board", "safety_critical_part"], "operator": "any"},
+      "constraint": {"kind": "required_certification", "certification": "ISO-9001", "must_be_current": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:electronic_component"},
+        "/selector/semantic_tags/1": {"derived_from": "concept:printed_circuit_board"},
+        "/selector/semantic_tags/2": {"derived_from": "concept:safety_critical_part"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/any"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/required_certification"},
+        "/constraint/certification": {"source_quote": "must hold current ISO-9001 certification", "value_literal": "ISO-9001", "value_format": "normalized_token"},
+        "/constraint/must_be_current": {"source_quote": "must hold current ISO-9001 certification", "value_literal": "current", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_2_1.ul_listing",
+      "source_document": "POL-PROC-001",
+      "title": "Additional UL listing for power-supply components",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["power_supply_component"], "operator": "any"},
+      "constraint": {"kind": "required_certification", "certification": "UL listing", "additional": true, "must_be_current": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:power_supply_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/any"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/required_certification"},
+        "/constraint/certification": {"source_quote": "must additionally hold UL listing certification", "value_literal": "UL listing", "value_format": "normalized_token"},
+        "/constraint/additional": {"source_quote": "must additionally hold UL listing certification", "value_literal": "additionally", "value_format": "affirmed_boolean"},
+        "/constraint/must_be_current": {"source_quote": "Suppliers of electronic components, printed circuit boards, and safety-critical parts must hold current ISO-9001 certification. Suppliers of power supply components (capacitor banks, transformer cores) must additionally hold UL listing certification.", "value_literal": "current", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_3.domestic_preference",
+      "source_document": "POL-PROC-001",
+      "title": "Domestic sourcing preference and non-critical premium threshold",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["critical_component"], "operator": "none"},
+      "constraint": {"kind": "domestic_supplier_preference", "maximum_premium_fraction": "0.35", "allow_when_no_domestic_timeline": true, "allow_when_no_domestic_source": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:critical_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/none"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/domestic_supplier_preference"},
+        "/constraint/maximum_premium_fraction": {"source_quote": "the domestic price premium exceeds 35% of the international price", "value_literal": "35%", "value_format": "percent_fraction"},
+        "/constraint/allow_when_no_domestic_timeline": {"source_quote": "no domestic supplier can meet required delivery timelines", "value_literal": "no domestic supplier", "value_format": "affirmed_boolean"},
+        "/constraint/allow_when_no_domestic_source": {"source_quote": "the component is not available from any domestic source", "value_literal": "not available", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_3.critical_premium_threshold",
+      "source_document": "POL-PROC-001",
+      "title": "Critical-component domestic premium threshold",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["critical_component"], "operator": "any"},
+      "constraint": {"kind": "domestic_supplier_preference", "maximum_premium_fraction": "0.50", "allow_when_no_domestic_timeline": true, "allow_when_no_domestic_source": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:critical_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/any"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/domestic_supplier_preference"},
+        "/constraint/maximum_premium_fraction": {"source_quote": "the domestic price premium threshold is 50% rather than 35%", "value_literal": "50%", "value_format": "percent_fraction"},
+        "/constraint/allow_when_no_domestic_timeline": {"source_quote": "no domestic supplier can meet required delivery timelines", "value_literal": "no domestic supplier", "value_format": "affirmed_boolean"},
+        "/constraint/allow_when_no_domestic_source": {"source_quote": "the component is not available from any domestic source", "value_literal": "not available", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_3.international_justification",
+      "source_document": "POL-PROC-001",
+      "title": "International sourcing rationale",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["international_supplier"], "operator": "all"},
+      "constraint": {"kind": "international_sourcing_justification", "required": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:international_supplier"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/international_sourcing_justification"},
+        "/constraint/required": {"source_quote": "Justification for international sourcing must be documented in the purchase order rationale.", "value_literal": "must", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4.critical_cap",
+      "source_document": "POL-PROC-001",
+      "title": "Critical-component rolling supplier concentration cap",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "rolling_window",
+      "selector": {"entity": "component", "semantic_tags": ["critical_component"], "operator": "any"},
+      "constraint": {"kind": "supplier_volume_cap", "maximum_fraction": "0.70", "window_months": 12},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/rolling_window"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:critical_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/any"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/supplier_volume_cap"},
+        "/constraint/maximum_fraction": {"source_quote": "no single supplier may account for more than 70% of the total volume of any critical component", "value_literal": "70%", "value_format": "percent_fraction"},
+        "/constraint/window_months": {"source_quote": "within a rolling 12-month period", "value_literal": "12", "value_format": "integer"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4.noncritical_cap",
+      "source_document": "POL-PROC-001",
+      "title": "Non-critical rolling supplier concentration cap",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "rolling_window",
+      "selector": {"entity": "component", "semantic_tags": ["critical_component"], "operator": "none"},
+      "constraint": {"kind": "supplier_volume_cap", "maximum_fraction": "0.85", "window_months": 12},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/rolling_window"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:critical_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/none"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/supplier_volume_cap"},
+        "/constraint/maximum_fraction": {"source_quote": "For non-critical components, the concentration limit is 85%.", "value_literal": "85%", "value_format": "percent_fraction"},
+        "/constraint/window_months": {"derived_from": "rule:POL-PROC-001.section_4.critical_cap#/constraint/window_months"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4.dual_supplier_base",
+      "source_document": "POL-PROC-001",
+      "title": "Two-qualified-supplier critical-component diagnostic",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["critical_component"], "operator": "any"},
+      "constraint": {"kind": "minimum_qualified_suppliers", "minimum_count": 2, "enforcement": "diagnostic"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:critical_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/any"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/minimum_qualified_suppliers"},
+        "/constraint/minimum_count": {"derived_from": "derivation:two_qualified_suppliers"},
+        "/constraint/enforcement": {"derived_from": "derivation:diagnostic_enforcement"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4.sole_source_justification",
+      "source_document": "POL-PROC-001",
+      "title": "Sole-source rationale requirement",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "sole_source_justification", "condition": "only one supplier exists globally for a specialized component", "document": "Sole Source Justification", "permits_concentration_exception": true},
+      "precedence": {"exception_to": ["POL-PROC-001.section_4.critical_cap", "POL-PROC-001.section_4.noncritical_cap"], "basis": "explicit"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/sole_source_justification"},
+        "/constraint/condition": {"source_quote": "Where only one supplier exists globally for a specialized component (sole-source)", "value_literal": "only one supplier exists globally for a specialized component", "value_format": "exact_text"},
+        "/constraint/document": {"source_quote": "a Sole Source Justification must be documented", "value_literal": "Sole Source Justification", "value_format": "exact_text"},
+        "/constraint/permits_concentration_exception": {"source_quote": "Exception: Where only one supplier exists globally for a specialized component (sole-source)", "value_literal": "Exception", "value_format": "affirmed_boolean"},
+        "/precedence/exception_to/0": {"derived_from": "rule:POL-PROC-001.section_4.critical_cap#/rule_id"},
+        "/precedence/exception_to/1": {"derived_from": "rule:POL-PROC-001.section_4.noncritical_cap#/rule_id"},
+        "/precedence/basis": {"derived_from": "derivation:precedence_explicit"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4_1.moq",
+      "source_document": "POL-PROC-001",
+      "title": "Catalog minimum order quantity",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "catalog_minimum_order_quantity", "source_attribute": "minimum_order_quantity"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/catalog_minimum_order_quantity"},
+        "/constraint/source_attribute": {"derived_from": "derivation:catalog_moq_attribute"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_4_1.sub_moq_approval",
+      "source_document": "POL-PROC-001",
+      "title": "Written supplier approval for sub-MOQ orders",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "sub_moq_written_approval", "approval": "written supplier approval"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/sub_moq_written_approval"},
+        "/constraint/approval": {"source_quote": "Orders below MOQ require written supplier approval.", "value_literal": "written supplier approval", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_5.hazardous_handling",
+      "source_document": "POL-PROC-001",
+      "title": "Hazardous-material receiving, storage, and FIFO",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "semantic_tags": ["hazardous_material"], "operator": "all"},
+      "constraint": {"kind": "hazardous_receiving_and_storage", "special_receiving_and_handling": true, "storage_area": "Hazmat Storage", "fifo": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:hazardous_material"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/hazardous_receiving_and_storage"},
+        "/constraint/special_receiving_and_handling": {"source_quote": "require special receiving and handling procedures", "value_literal": "require", "value_format": "affirmed_boolean"},
+        "/constraint/storage_area": {"source_quote": "must be stored in the designated Hazmat Storage area", "value_literal": "Hazmat Storage", "value_format": "exact_text"},
+        "/constraint/fifo": {"source_quote": "FIFO (First In, First Out) rotation is strictly enforced.", "value_literal": "enforced", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_5.hazardous_review",
+      "source_document": "POL-PROC-001",
+      "title": "Hazardous-material procurement review",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "component", "semantic_tags": ["hazardous_material"], "operator": "all"},
+      "constraint": {"kind": "hazardous_procurement_review", "required": true, "delivery_extension_possible": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:hazardous_material"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/hazardous_procurement_review"},
+        "/constraint/required": {"source_quote": "Orders for hazardous materials should be flagged for procurement review", "value_literal": "should", "value_format": "affirmed_boolean"},
+        "/constraint/delivery_extension_possible": {"source_quote": "additional receiving requirements that may extend delivery timelines", "value_literal": "may", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_6.critical_categories",
+      "source_document": "POL-PROC-001",
+      "title": "Enumerated critical-component categories",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "component", "match": "all"},
+      "constraint": {"kind": "critical_component_categories", "categories": ["microcontroller_ic", "power_mosfet", "pcb_blank", "neodymium_magnet", "sensor_ic"]},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/critical_component_categories"},
+        "/constraint/categories/0": {"derived_from": "concept:microcontroller_ic"},
+        "/constraint/categories/1": {"derived_from": "concept:power_mosfet"},
+        "/constraint/categories/2": {"derived_from": "concept:pcb_blank"},
+        "/constraint/categories/3": {"derived_from": "concept:neodymium_magnet"},
+        "/constraint/categories/4": {"derived_from": "concept:sensor_ic"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_7.total_cost",
+      "source_document": "POL-PROC-001",
+      "title": "Total cost of ownership",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "total_cost_of_ownership", "included_costs": ["unit price", "shipping", "handling costs"]},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/total_cost_of_ownership"},
+        "/constraint/included_costs/0": {"source_quote": "including unit price, shipping, and handling costs", "value_literal": "unit price", "value_format": "exact_text"},
+        "/constraint/included_costs/1": {"source_quote": "including unit price, shipping, and handling costs", "value_literal": "shipping", "value_format": "exact_text"},
+        "/constraint/included_costs/2": {"source_quote": "including unit price, shipping, and handling costs", "value_literal": "handling costs", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_7.manager_approval",
+      "source_document": "POL-PROC-001",
+      "title": "Procurement Manager approval threshold",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "order_value_approval", "amount_exceeds": "50000", "authority": "Procurement Manager"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/order_value_approval"},
+        "/constraint/amount_exceeds": {"source_quote": "Orders exceeding $50,000 require Procurement Manager approval.", "value_literal": "$50,000", "value_format": "currency"},
+        "/constraint/authority": {"source_quote": "Orders exceeding $50,000 require Procurement Manager approval.", "value_literal": "Procurement Manager", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_7.vp_approval",
+      "source_document": "POL-PROC-001",
+      "title": "VP of Operations approval threshold",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "order_value_approval", "amount_exceeds": "150000", "authority": "VP of Operations"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/order_value_approval"},
+        "/constraint/amount_exceeds": {"source_quote": "Orders exceeding $150,000 require VP of Operations approval.", "value_literal": "$150,000", "value_format": "currency"},
+        "/constraint/authority": {"source_quote": "Orders exceeding $150,000 require VP of Operations approval.", "value_literal": "VP of Operations", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_7_1.emergency",
+      "source_document": "POL-PROC-001",
+      "title": "Emergency procurement bypass (unsupported predicate)",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "emergency_approval_bypass", "qualifying_predicate": "required to prevent production stoppage", "amount_up_to": "75000", "retroactive_approval_business_days": 5, "implementation_status": "unsupported"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/emergency_approval_bypass"},
+        "/constraint/qualifying_predicate": {"source_quote": "Emergency purchase orders (required to prevent production stoppage)", "value_literal": "required to prevent production stoppage", "value_format": "exact_text"},
+        "/constraint/amount_up_to": {"source_quote": "may bypass standard approval thresholds up to $75,000", "value_literal": "$75,000", "value_format": "currency"},
+        "/constraint/retroactive_approval_business_days": {"source_quote": "approved retroactively within 5 business days", "value_literal": "5", "value_format": "integer"},
+        "/constraint/implementation_status": {"derived_from": "derivation:unsupported_emergency_predicate"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_8.sustainability_preference",
+      "source_document": "POL-PROC-001",
+      "title": "Sustainability rating preference for comparable routes",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "sustainability_preference", "comparable_price_fraction": "0.10", "comparable_delivery_days": 5, "preferred_minimum_rating": "A"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/sustainability_preference"},
+        "/constraint/comparable_price_fraction": {"source_quote": "comparable pricing (within 10%)", "value_literal": "10%", "value_format": "percent_fraction"},
+        "/constraint/comparable_delivery_days": {"source_quote": "delivery timelines (within 5 business days)", "value_literal": "5", "value_format": "integer"},
+        "/constraint/preferred_minimum_rating": {"source_quote": "a sustainability rating of A or higher", "value_literal": "A", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_8.below_b_review",
+      "source_document": "POL-PROC-001",
+      "title": "Review gate for suppliers below sustainability rating B",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "below_rating_review", "below_rating": "B", "additional_review": true, "only_when": "no alternatives are available"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/below_rating_review"},
+        "/constraint/below_rating": {"source_quote": "a sustainability rating below B", "value_literal": "B", "value_format": "exact_text"},
+        "/constraint/additional_review": {"source_quote": "are subject to additional review", "value_literal": "subject", "value_format": "affirmed_boolean"},
+        "/constraint/only_when": {"source_quote": "should only be used when no alternatives are available", "value_literal": "no alternatives are available", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_8.iso_14001_preference",
+      "source_document": "POL-PROC-001",
+      "title": "ISO-14001 supplier preference",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "supplier_route", "match": "all"},
+      "constraint": {"kind": "certification_preference", "certification": "ISO-14001"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/certification_preference"},
+        "/constraint/certification": {"source_quote": "Suppliers holding ISO-14001 certification receive preferential consideration.", "value_literal": "ISO-14001", "value_format": "normalized_token"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_9.strategic_continuity",
+      "source_document": "POL-PROC-001",
+      "title": "Strategic supplier volume continuity",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["strategic_supplier"], "operator": "all"},
+      "constraint": {"kind": "strategic_supplier_continuity", "maintain_consistent_volume": true, "maximum_alternative_savings_fraction": "0.15"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:strategic_supplier"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/strategic_supplier_continuity"},
+        "/constraint/maintain_consistent_volume": {"source_quote": "should maintain consistent order volumes with Strategic suppliers", "value_literal": "should", "value_format": "affirmed_boolean"},
+        "/constraint/maximum_alternative_savings_fraction": {"source_quote": "alternatives offer moderately better pricing (up to 15% savings)", "value_literal": "15%", "value_format": "percent_fraction"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_9.strategic_shift_approval",
+      "source_document": "POL-PROC-001",
+      "title": "Approval for significant strategic-supplier volume shift",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["strategic_supplier"], "operator": "all"},
+      "constraint": {"kind": "strategic_volume_shift_approval", "shift_scale": "significant", "authority": "VP of Operations"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:strategic_supplier"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/strategic_volume_shift_approval"},
+        "/constraint/shift_scale": {"source_quote": "Decisions to shift significant volume away from Strategic suppliers", "value_literal": "significant", "value_format": "exact_text"},
+        "/constraint/authority": {"source_quote": "require VP of Operations approval", "value_literal": "VP of Operations", "value_format": "exact_text"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_10.on_time_arrival",
+      "source_document": "POL-PROC-001",
+      "title": "Arrival before production start",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "on_time_arrival", "arrive_before_scheduled_start": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/on_time_arrival"},
+        "/constraint/arrive_before_scheduled_start": {"source_quote": "ensure materials arrive before the scheduled production start date", "value_literal": "ensure", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "POL-PROC-001.section_10.delivery_date",
+      "source_document": "POL-PROC-001",
+      "title": "Expected delivery from quoted lead time",
+      "review_status": "approved",
+      "effective_from": "2025-01-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "entity_attribute",
+      "selector": {"entity": "purchase_order", "match": "all"},
+      "constraint": {"kind": "quoted_lead_time_delivery_date", "calculation": "order_date_plus_quoted_lead_time"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:POL-PROC-001#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/entity_attribute"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/quoted_lead_time_delivery_date"},
+        "/constraint/calculation": {"derived_from": "derivation:quoted_lead_time_calculation"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-041.magnet_rolling_cap",
+      "source_document": "MEMO-2025-041",
+      "title": "Neodymium magnet rolling concentration cap",
+      "review_status": "approved",
+      "effective_from": "2025-04-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "rolling_window",
+      "selector": {"entity": "component", "semantic_tags": ["neodymium_magnet"], "operator": "all"},
+      "constraint": {"kind": "supplier_volume_cap", "maximum_fraction": "0.50", "window_months": 12},
+      "precedence": {"supersedes": ["POL-PROC-001.section_4.critical_cap"], "basis": "explicit"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-041#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/rolling_window"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:neodymium_magnet"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/supplier_volume_cap"},
+        "/constraint/maximum_fraction": {"source_quote": "the supplier concentration limit for neodymium magnets (RM-3003) is reduced from 70% to 50% for any single supplier", "value_literal": "50%", "value_format": "percent_fraction"},
+        "/constraint/window_months": {"derived_from": "rule:POL-PROC-001.section_4.critical_cap#/constraint/window_months"},
+        "/precedence/supersedes/0": {"derived_from": "rule:POL-PROC-001.section_4.critical_cap#/rule_id"},
+        "/precedence/basis": {"derived_from": "derivation:precedence_explicit"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-041.magnet_secondary_allocation",
+      "source_document": "MEMO-2025-041",
+      "title": "Prospective neodymium magnet secondary allocation",
+      "review_status": "approved",
+      "effective_from": "2025-04-15",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "component", "semantic_tags": ["neodymium_magnet"], "operator": "all"},
+      "constraint": {"kind": "minimum_secondary_fraction", "value": "0.20", "group": "allocation_group", "primary_definition": "largest_share", "secondary_definition": "all_non_primary_suppliers", "applies_despite_higher_cost": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-041#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:neodymium_magnet"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/minimum_secondary_fraction"},
+        "/constraint/value": {"source_quote": "a secondary supplier allocation of at least 20% of the total order volume", "value_literal": "20%", "value_format": "percent_fraction"},
+        "/constraint/group": {"derived_from": "derivation:allocation_group"},
+        "/constraint/primary_definition": {"derived_from": "derivation:primary_largest_share"},
+        "/constraint/secondary_definition": {"derived_from": "derivation:secondary_non_primary"},
+        "/constraint/applies_despite_higher_cost": {"source_quote": "This applies even when the secondary supplier has a higher per-unit cost.", "value_literal": "applies", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-041.magnet_named_primary",
+      "source_document": "MEMO-2025-041",
+      "title": "Nanjing named-primary directive pending MagnetPro capacity confirmation",
+      "review_status": "approved",
+      "effective_from": "2025-04-15",
+      "effective_through": null,
+      "severity": "shaping",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "component", "semantic_tags": ["neodymium_magnet"], "operator": "all"},
+      "directive": {"kind": "named_primary_supplier", "supplier": {"source_id": "SUP-107", "legal_name": "Nanjing Rare Earth Co."}, "group": "allocation_group", "primary_definition": "largest_share", "deviation_disposition": "DECISION_REQUIRED"},
+      "release_condition": {"predicate": "capacity_confirmed_sufficient", "subject": {"source_id": "SUP-108", "legal_name": "MagnetPro Inc."}, "evidence_source": "capacity_confirmation_service", "resolution": "affirmative_record_required"},
+      "risk_disclosure": {"kind": "CAPACITY_UNKNOWN", "subject_from": "release_condition.subject", "when": "positive_allocation_and_no_numeric_capacity", "disposition_effect": "none"},
+      "precedence": {"outranks": ["POL-PROC-001.section_3.domestic_preference"], "basis": "inferred", "reasoning": "memo-over-policy and narrower-scope-over-broader"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-041#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/shaping"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:neodymium_magnet"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/directive/kind": {"derived_from": "registry:directive_kind/named_primary_supplier"},
+        "/directive/supplier/source_id": {"source_quote": "Nanjing Rare Earth Co. (SUP-107) remains our primary volume supplier", "value_literal": "SUP-107", "value_format": "exact_text"},
+        "/directive/supplier/legal_name": {"source_quote": "Nanjing Rare Earth Co. (SUP-107) remains our primary volume supplier", "value_literal": "Nanjing Rare Earth Co.", "value_format": "exact_text"},
+        "/directive/group": {"derived_from": "derivation:allocation_group"},
+        "/directive/primary_definition": {"derived_from": "derivation:primary_largest_share"},
+        "/directive/deviation_disposition": {"derived_from": "derivation:named_primary_deviation"},
+        "/release_condition/predicate": {"derived_from": "derivation:capacity_predicate"},
+        "/release_condition/subject/source_id": {"source_quote": "MagnetPro Inc. (SUP-108) to increase their qualified capacity", "value_literal": "SUP-108", "value_format": "exact_text"},
+        "/release_condition/subject/legal_name": {"source_quote": "MagnetPro Inc. (SUP-108) to increase their qualified capacity", "value_literal": "MagnetPro Inc.", "value_format": "exact_text"},
+        "/release_condition/evidence_source": {"derived_from": "derivation:capacity_evidence_source"},
+        "/release_condition/resolution": {"derived_from": "derivation:affirmative_release"},
+        "/risk_disclosure/kind": {"derived_from": "derivation:capacity_disclosure_kind"},
+        "/risk_disclosure/subject_from": {"derived_from": "derivation:release_subject_pointer"},
+        "/risk_disclosure/when": {"derived_from": "derivation:capacity_disclosure_condition"},
+        "/risk_disclosure/disposition_effect": {"derived_from": "derivation:non_dispositive"},
+        "/precedence/outranks/0": {"derived_from": "rule:POL-PROC-001.section_3.domestic_preference#/rule_id"},
+        "/precedence/basis": {"derived_from": "derivation:precedence_inferred"},
+        "/precedence/reasoning": {"derived_from": "derivation:magnet_precedence_reasoning"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-072.air_freight_authorization",
+      "source_document": "MEMO-2025-072",
+      "title": "Conditional international air-freight lead-time modifier",
+      "review_status": "approved",
+      "effective_from": "2025-07-01",
+      "effective_through": "2025-09-30",
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["international_supplier", "confirmed_production_order"], "operator": "all"},
+      "constraint": {"kind": "air_freight_authorization", "shipping_mode": "air freight", "standard_lead_time_condition": "standard_lead_time_causes_production_delay", "lead_time_reduction_days": 14, "minimum_lead_time_days": 7},
+      "precedence": {"does_not_override": ["POL-PROC-001.section_2_1.iso_9001", "POL-PROC-001.section_5.hazardous_handling"], "basis": "explicit"},
+      "coverage": {
+        "/effective_from": {"source_quote": "Effective July 1, 2025 through September 30, 2025", "value_literal": "July 1, 2025", "value_format": "date_long"},
+        "/effective_through": {"source_quote": "Effective July 1, 2025 through September 30, 2025", "value_literal": "September 30, 2025", "value_format": "date_long"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:international_supplier"},
+        "/selector/semantic_tags/1": {"derived_from": "concept:confirmed_production_order"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/air_freight_authorization"},
+        "/constraint/shipping_mode": {"source_quote": "authorizing the use of air freight for international supplier shipments", "value_literal": "air freight", "value_format": "exact_text"},
+        "/constraint/standard_lead_time_condition": {"derived_from": "derivation:standard_lead_time_delay"},
+        "/constraint/lead_time_reduction_days": {"source_quote": "reduced by 14 days from their standard catalog lead time", "value_literal": "14", "value_format": "integer"},
+        "/constraint/minimum_lead_time_days": {"source_quote": "but not below 7 days minimum", "value_literal": "7", "value_format": "integer"},
+        "/precedence/does_not_override/0": {"derived_from": "rule:POL-PROC-001.section_2_1.iso_9001#/rule_id"},
+        "/precedence/does_not_override/1": {"derived_from": "rule:POL-PROC-001.section_5.hazardous_handling#/rule_id"},
+        "/precedence/basis": {"derived_from": "derivation:explicit_non_override"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-072.air_freight_cost_documentation",
+      "source_document": "MEMO-2025-072",
+      "title": "Air-freight cost documentation",
+      "review_status": "approved",
+      "effective_from": "2025-07-01",
+      "effective_through": "2025-09-30",
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["international_supplier"], "operator": "all", "route_conditions": ["air_freight_used"]},
+      "constraint": {"kind": "air_freight_cost_documentation", "estimated_minimum_cost_per_kg": "8", "estimated_maximum_cost_per_kg": "12", "required": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-072#/effective_from"},
+        "/effective_through": {"derived_from": "source:MEMO-2025-072#/effective_through"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:international_supplier"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/selector/route_conditions/0": {"derived_from": "derivation:air_freight_used"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/air_freight_cost_documentation"},
+        "/constraint/estimated_minimum_cost_per_kg": {"source_quote": "The additional cost of air freight (estimated at $8-12 per kg) should be documented", "value_literal": "$8", "value_format": "currency"},
+        "/constraint/estimated_maximum_cost_per_kg": {"source_quote": "The additional cost of air freight (estimated at $8-12 per kg) should be documented", "value_literal": "12", "value_format": "currency"},
+        "/constraint/required": {"source_quote": "should be documented on the purchase order", "value_literal": "should", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-072.air_freight_period_cap",
+      "source_document": "MEMO-2025-072",
+      "title": "Authorization-period air-freight expenditure cap",
+      "review_status": "approved",
+      "effective_from": "2025-07-01",
+      "effective_through": "2025-09-30",
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "purchase_order", "match": "all", "route_conditions": ["air_freight_used"]},
+      "constraint": {"kind": "air_freight_period_spend_cap", "maximum_amount": "25000", "window": "authorization_period"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-072#/effective_from"},
+        "/effective_through": {"derived_from": "source:MEMO-2025-072#/effective_through"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/purchase_order"},
+        "/selector/match": {"derived_from": "derivation:selector_match_all"},
+        "/selector/route_conditions/0": {"derived_from": "derivation:air_freight_used"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/air_freight_period_spend_cap"},
+        "/constraint/maximum_amount": {"source_quote": "Total air freight expenditure is capped at $25,000 for the authorization period.", "value_literal": "$25,000", "value_format": "currency"},
+        "/constraint/window": {"derived_from": "derivation:authorization_period"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-072.air_freight_approval",
+      "source_document": "MEMO-2025-072",
+      "title": "Individual Procurement Manager air-freight approval",
+      "review_status": "approved",
+      "effective_from": "2025-07-01",
+      "effective_through": "2025-09-30",
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "supplier_route", "semantic_tags": ["international_supplier"], "operator": "all", "route_conditions": ["air_freight_used"]},
+      "constraint": {"kind": "air_freight_individual_approval", "authority": "Procurement Manager", "each_request": true},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-072#/effective_from"},
+        "/effective_through": {"derived_from": "source:MEMO-2025-072#/effective_through"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/supplier_route"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:international_supplier"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/selector/route_conditions/0": {"derived_from": "derivation:air_freight_used"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/air_freight_individual_approval"},
+        "/constraint/authority": {"source_quote": "The Procurement Manager must approve each air freight request individually.", "value_literal": "Procurement Manager", "value_format": "exact_text"},
+        "/constraint/each_request": {"source_quote": "must approve each air freight request individually", "value_literal": "must", "value_format": "affirmed_boolean"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-085.pcb_conformance_certificate",
+      "source_document": "MEMO-2025-085",
+      "title": "PCB Certificate of Conformance with cross-section analysis",
+      "review_status": "approved",
+      "effective_from": "2025-08-20",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "prospective_order",
+      "selector": {"entity": "component", "semantic_tags": ["printed_circuit_board_component"], "operator": "all"},
+      "constraint": {"kind": "shipment_certificate_of_conformance", "document": "Certificate of Conformance (CoC)", "must_include": "cross-section analysis results", "missing_disposition": "reject_and_return"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-085#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/prospective_order"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:printed_circuit_board_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/shipment_certificate_of_conformance"},
+        "/constraint/document": {"source_quote": "must provide a Certificate of Conformance (CoC) with each shipment", "value_literal": "Certificate of Conformance (CoC)", "value_format": "exact_text"},
+        "/constraint/must_include": {"source_quote": "including cross-section analysis results", "value_literal": "cross-section analysis results", "value_format": "exact_text"},
+        "/constraint/missing_disposition": {"derived_from": "derivation:reject_and_return"}
+      }
+    },
+    {
+      "rule_id": "MEMO-2025-085.pcb_incumbent_only",
+      "source_document": "MEMO-2025-085",
+      "title": "PCB supplier incumbency freeze",
+      "review_status": "approved",
+      "effective_from": "2025-08-20",
+      "effective_through": null,
+      "severity": "hard",
+      "evidence_basis": "external_system",
+      "selector": {"entity": "component", "semantic_tags": ["printed_circuit_board_component"], "operator": "all"},
+      "constraint": {"kind": "incumbent_supplier_only", "accepted_shipment_history_required": true, "new_supplier_qualification_suspended": true, "estimated_duration_days": {"minimum": 60, "maximum": 90}, "benchmark_inference": "prior_order_or_predating_relationship"},
+      "coverage": {
+        "/effective_from": {"derived_from": "source:MEMO-2025-085#/effective_from"},
+        "/severity": {"derived_from": "registry:severity/hard"},
+        "/evidence_basis": {"derived_from": "registry:evidence_basis/external_system"},
+        "/selector/entity": {"derived_from": "registry:selector_entity/component"},
+        "/selector/semantic_tags/0": {"derived_from": "concept:printed_circuit_board_component"},
+        "/selector/operator": {"derived_from": "registry:selector_operator/all"},
+        "/constraint/kind": {"derived_from": "registry:constraint_kind/incumbent_supplier_only"},
+        "/constraint/accepted_shipment_history_required": {"source_quote": "Only suppliers from whom we have previously received and accepted PCB shipments may be used.", "value_literal": "may", "value_format": "affirmed_boolean"},
+        "/constraint/new_supplier_qualification_suspended": {"source_quote": "we are suspending new supplier qualification for PCB components", "value_literal": "suspending", "value_format": "affirmed_boolean"},
+        "/constraint/estimated_duration_days/minimum": {"source_quote": "estimated 60-90 days", "value_literal": "60", "value_format": "integer"},
+        "/constraint/estimated_duration_days/maximum": {"source_quote": "estimated 60-90 days", "value_literal": "90", "value_format": "integer"},
+        "/constraint/benchmark_inference": {"derived_from": "derivation:pcb_benchmark_inference"}
+      }
+    }
+  ]
+}
