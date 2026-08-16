@@ -1,0 +1,26 @@
+[
+  {
+    "file": "scenario_01_baseline.sqlite",
+    "current_date": "2025-09-01"
+  },
+  {
+    "file": "scenario_02_partial_procurement.sqlite",
+    "current_date": "2025-09-01"
+  },
+  {
+    "file": "scenario_03_tight_timeline.sqlite",
+    "current_date": "2025-09-01"
+  },
+  {
+    "file": "scenario_04_low_inventory.sqlite",
+    "current_date": "2025-09-01"
+  },
+  {
+    "file": "scenario_05_competing_demand.sqlite",
+    "current_date": "2025-10-05"
+  },
+  {
+    "file": "scenario_06_simple.sqlite",
+    "current_date": "2025-09-01"
+  }
+]
