@@ -398,6 +398,14 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(len(outcome.alternatives), 1)
         self.assertEqual(outcome.alternatives[0].disposition, PlanDisposition.DECISION_REQUIRED)
         self.assertEqual(outcome.alternatives[0].total_cost, Decimal("20"))
+        # Regression: a solve-0 diagnostic once carried ``(gap, cost)`` as
+        # its CandidatePlan vector, placing cost in the stage-2 lateness slot.
+        # The candidate now carries the literal staged vector while solve 0
+        # retains its separate cheapest-covering certificate.
+        self.assertEqual(len(outcome.alternatives[0].objective_vector), 12)
+        self.assertEqual(outcome.alternatives[0].objective_vector[1], ZERO)
+        self.assertEqual(outcome.alternatives[0].objective_vector[8], Decimal("20"))
+        self.assertEqual(outcome.alternatives[0].objective_vector[9], ZERO)
 
     def test_relaxable_second_supplier_produces_one_rule_counterfactual(self) -> None:
         first = _supplier("available")
