@@ -5,6 +5,7 @@ from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
 from importlib import metadata
+import json
 from pathlib import Path
 import shutil
 import socket
@@ -71,6 +72,38 @@ class AssembledCliTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def recovery_scenario(self, name: str, *, lead_days: int = 14) -> Path:
+        scenario = Path(self.temporary_directory.name) / name
+        shutil.copy2(SOURCE, scenario)
+        with closing(sqlite3.connect(scenario)) as connection:
+            connection.execute(
+                "UPDATE inventory SET quantity_on_hand = 0 "
+                "WHERE component_id = 'CMP-014'"
+            )
+            connection.execute(
+                "UPDATE supplier_catalog SET lead_time_days = ? "
+                "WHERE component_id = 'CMP-014' AND supplier_id = 'SUP-112'",
+                (lead_days,),
+            )
+            connection.execute(
+                "INSERT INTO purchase_orders "
+                "(po_number, component_id, supplier_id, quantity, unit_price, "
+                "order_date, expected_delivery_date, rationale) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "EXT-LATE-COMMITMENT",
+                    "CMP-014",
+                    "SUP-112",
+                    40,
+                    32,
+                    "2025-09-01",
+                    "2025-10-25",
+                    "External committed receipt; the agent must not modify it.",
+                ),
+            )
+            connection.commit()
+        return scenario
 
     def test_dry_run_is_offline_deterministic_and_writes_nothing(self) -> None:
         before = output_rows(self.path)
@@ -141,6 +174,174 @@ class AssembledCliTests(unittest.TestCase):
                     ).fetchone()
                 self.assertEqual(accounting_count, 1)
                 self.assertEqual(order_counts[0], order_counts[1])
+
+    def test_late_committed_inbound_uses_strictly_earlier_recovery_and_reruns_no_op(self) -> None:
+        scenario = self.recovery_scenario("strictly-earlier-recovery.sqlite")
+        arguments = (
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        first = self.command(*arguments)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        payload = json.loads(first.stdout)
+        decision = next(
+            item for item in payload["decisions"] if item["component_id"] == "CMP-014"
+        )
+        selected = decision["selected_plan"]
+        self.assertEqual(decision["initial_eventual_gap"], "0")
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["recovery_demand"], "40.0")
+        self.assertEqual(selected["recovery_quantity"], "40.0")
+        self.assertEqual(selected["discretionary_surplus"], "0")
+        self.assertEqual(
+            [(item["supplier_id"], item["quantity"], item["material_available_date"]) for item in selected["lines"]],
+            [("SUP-112", "40.0", "2025-09-15")],
+        )
+        self.assertIn("RECOVERY_SURPLUS", decision["alert_categories"])
+        self.assertEqual(decision["deadline_lateness"], [])
+
+        rows_after_first = output_rows(scenario)
+        with closing(sqlite3.connect(scenario)) as connection:
+            sequence_after_first = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+            ).fetchone()
+            managed_recovery = connection.execute(
+                "SELECT COUNT(*) FROM purchase_orders "
+                "WHERE component_id = 'CMP-014' AND rationale LIKE '[APEX_AGENT:%'"
+            ).fetchone()[0]
+        self.assertEqual(managed_recovery, 1)
+
+        second = self.command(*arguments)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(output_rows(scenario), rows_after_first)
+        with closing(sqlite3.connect(scenario)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+                ).fetchone(),
+                sequence_after_first,
+            )
+        second_payload = json.loads(second.stdout)
+        self.assertEqual(
+            second_payload["commit"],
+            {
+                "committed_po_numbers": [],
+                "deleted_alert_count": 0,
+                "inserted_alert_count": 0,
+                "no_op": True,
+            },
+        )
+
+    def test_equal_or_later_route_does_not_create_recovery_order(self) -> None:
+        for lead_days in (54, 60):
+            with self.subTest(lead_days=lead_days):
+                scenario = self.recovery_scenario(
+                    f"non-improving-{lead_days}.sqlite",
+                    lead_days=lead_days,
+                )
+                with closing(sqlite3.connect(scenario)) as connection:
+                    connection.execute(
+                        "DELETE FROM supplier_catalog "
+                        "WHERE component_id = 'CMP-014' "
+                        "AND supplier_id <> 'SUP-112'"
+                    )
+                    connection.execute(
+                        "UPDATE supplier_catalog SET lead_time_days = ? "
+                        "WHERE component_id = 'CMP-014'",
+                        (lead_days,),
+                    )
+                    connection.commit()
+                completed = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                payload = json.loads(completed.stdout)
+                decision = next(
+                    item
+                    for item in payload["decisions"]
+                    if item["component_id"] == "CMP-014"
+                )
+                self.assertEqual(decision["initial_eventual_gap"], "0")
+                self.assertIsNone(decision["selected_plan"])
+                self.assertNotIn("RECOVERY_SURPLUS", decision["alert_categories"])
+                self.assertIn("LATE_ARRIVAL", decision["alert_categories"])
+                with closing(sqlite3.connect(scenario)) as connection:
+                    managed_recovery = connection.execute(
+                        "SELECT COUNT(*) FROM purchase_orders "
+                        "WHERE component_id = 'CMP-014' "
+                        "AND rationale LIKE '[APEX_AGENT:%'"
+                    ).fetchone()[0]
+                self.assertEqual(managed_recovery, 0)
+
+    def test_scenarios_one_and_three_disclose_every_missed_deadline(self) -> None:
+        expected = {
+            "scenario_01_baseline.sqlite": {
+                "CMP-003": (("2025-09-12", "80.0", "240.0"),),
+            },
+            "scenario_03_tight_timeline.sqlite": {
+                "CMP-003": (("2025-09-12", "80.0", "240.0"),),
+                "CMP-005": (("2025-09-10", "60.0", "60.0"),),
+                "CMP-017": (("2025-09-10", "20.0", "20.0"),),
+                "CMP-018": (("2025-09-10", "30.0", "30.0"),),
+            },
+        }
+        for source in ASSIGNED_SCENARIOS:
+            with self.subTest(scenario=source.name):
+                scenario = Path(self.temporary_directory.name) / f"late-{source.name}"
+                shutil.copy2(source, scenario)
+                completed = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                payload = json.loads(completed.stdout)
+                actual = {
+                    item["component_id"]: tuple(
+                        (
+                            late["due_date"],
+                            late["late_quantity"],
+                            late["unit_late_days"],
+                        )
+                        for late in item["deadline_lateness"]
+                    )
+                    for item in payload["decisions"]
+                    if item["deadline_lateness"]
+                }
+                self.assertEqual(actual, expected[source.name])
+                for item in payload["decisions"]:
+                    if item["deadline_lateness"]:
+                        self.assertIn("LATE_ARRIVAL", item["alert_categories"])
+                magnet = next(
+                    item
+                    for item in payload["decisions"]
+                    if item["component_id"] == "CMP-003"
+                )
+                self.assertGreaterEqual(
+                    Decimal(magnet["selected_plan"]["unit_late_days"]),
+                    Decimal("240"),
+                )
+                with closing(sqlite3.connect(scenario)) as connection:
+                    late_alerts = connection.execute(
+                        "SELECT COUNT(*) FROM alerts "
+                        "WHERE description LIKE '%category=LATE_ARRIVAL%'"
+                    ).fetchone()[0]
+                self.assertEqual(
+                    late_alerts,
+                    sum(len(value) for value in expected[source.name].values()),
+                )
 
     def test_changed_inventory_creates_a_new_action_without_replacing_commitments(self) -> None:
         scenario = Path(self.temporary_directory.name) / "changed-inventory.sqlite"

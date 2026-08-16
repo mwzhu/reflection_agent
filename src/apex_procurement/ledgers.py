@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal, ROUND_CEILING
 import unicodedata
@@ -18,10 +18,12 @@ import unicodedata
 from .domain import (
     AlertCategory,
     BomLine,
+    DeadlineLateness,
     DeadlineSupplyPosition,
     DemandBucket,
     DemandContribution,
     InboundSupply,
+    PlanLine,
     ScenarioSnapshot,
     SupplyLedger,
     ZERO,
@@ -135,11 +137,45 @@ class RouteAvailability:
     route_id: str
     component_id: str
     material_available_date: date
+    eligible_deadlines: tuple[date, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.route_id, "route_id")
         _require_text(self.component_id, "component_id")
         _require_date(self.material_available_date, "material_available_date")
+        deadlines = tuple(sorted(set(self.eligible_deadlines)))
+        for deadline in deadlines:
+            _require_date(deadline, "eligible deadline")
+        object.__setattr__(self, "eligible_deadlines", deadlines)
+
+
+@dataclass(frozen=True, slots=True)
+class DemandSupplySegment:
+    """One FIFO assignment of existing physical supply to a demand bucket."""
+
+    due_date: date
+    quantity: Decimal
+    source_kind: str
+    material_available_date: date | None = None
+    source_id: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_date(self.due_date, "due_date")
+        _require_decimal(self.quantity, "quantity", positive=True)
+        if self.source_kind not in {"on_hand", "committed_inbound", "uncovered"}:
+            raise ValueError("source_kind is not a supported supply-segment kind")
+        if self.material_available_date is not None:
+            _require_date(self.material_available_date, "material_available_date")
+        if self.source_id is not None:
+            _require_text(self.source_id, "source_id")
+        if self.source_kind == "committed_inbound" and (
+            self.material_available_date is None or self.source_id is None
+        ):
+            raise ValueError("committed inbound segments require a date and source ID")
+        if self.source_kind != "committed_inbound" and self.source_id is not None:
+            raise ValueError("only committed inbound segments carry a source ID")
+        if self.source_kind in {"on_hand", "uncovered"} and self.material_available_date is not None:
+            raise ValueError("on-hand and uncovered segments do not carry an arrival date")
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,31 +422,134 @@ def _build_demand(
     )
 
 
-def _recoverable_gap(
-    *,
-    due_date: date,
-    on_time_gap: Decimal,
-    inbound: tuple[InboundSupply, ...],
-    earliest_new_route: date | None,
-) -> Decimal:
-    if on_time_gap == ZERO or earliest_new_route is None:
-        return ZERO
+def demand_supply_segments(
+    ledger: SupplyLedger,
+    buckets: Iterable[DemandBucket],
+) -> tuple[DemandSupplySegment, ...]:
+    """Allocate on-hand and committed inbound once, in deadline order.
 
-    remaining_gap = on_time_gap
-    recoverable = ZERO
-    # Earliest committed receipts serve the earliest unmet demand first.  A
-    # route can bridge only committed quantity it strictly improves upon;
-    # uncovered eventual demand remains baseline purchasing, not recovery.
-    for supply in inbound:
-        if supply.expected_delivery_date <= due_date:
-            continue
-        covered = min(remaining_gap, supply.quantity)
-        if earliest_new_route < supply.expected_delivery_date:
-            recoverable += covered
-        remaining_gap -= covered
-        if remaining_gap == ZERO:
-            break
-    return recoverable
+    This is the non-cumulative companion to ``DeadlineSupplyPosition``.  It
+    preserves which incremental demand bucket a late receipt actually serves,
+    so a later well-covered deadline cannot erase an earlier miss.
+    """
+
+    if not isinstance(ledger, SupplyLedger):
+        raise TypeError("ledger must be SupplyLedger")
+    ordered = tuple(sorted(buckets, key=lambda item: item.due_date))
+    if not ordered or any(not isinstance(item, DemandBucket) for item in ordered):
+        raise ValueError("buckets must contain DemandBucket values")
+    if any(item.component_id != ledger.component_id for item in ordered):
+        raise ValueError("all buckets must match the ledger component")
+
+    supplies: list[list[object]] = []
+    if ledger.on_hand > ZERO:
+        supplies.append(["on_hand", ledger.on_hand, None, None])
+    supplies.extend(
+        [
+            "committed_inbound",
+            item.quantity,
+            item.expected_delivery_date,
+            item.po_number,
+        ]
+        for item in ledger.committed_inbound
+    )
+    supply_index = 0
+    result: list[DemandSupplySegment] = []
+    for bucket in ordered:
+        remaining = bucket.bucket_quantity
+        while remaining > ZERO and supply_index < len(supplies):
+            source_kind, available, material_date, source_id = supplies[supply_index]
+            assert isinstance(available, Decimal)
+            assigned = min(remaining, available)
+            if assigned > ZERO:
+                result.append(
+                    DemandSupplySegment(
+                        bucket.due_date,
+                        assigned,
+                        str(source_kind),
+                        material_date if isinstance(material_date, date) else None,
+                        source_id if isinstance(source_id, str) else None,
+                    )
+                )
+            remaining -= assigned
+            supplies[supply_index][1] = available - assigned
+            if supplies[supply_index][1] == ZERO:
+                supply_index += 1
+        if remaining > ZERO:
+            result.append(
+                DemandSupplySegment(
+                    bucket.due_date,
+                    remaining,
+                    "uncovered",
+                )
+            )
+    return tuple(result)
+
+
+def total_recovery_demand(ledger: SupplyLedger) -> Decimal:
+    """Return the unique, incremental recovery opportunity in a final ledger."""
+
+    if not isinstance(ledger, SupplyLedger):
+        raise TypeError("ledger must be SupplyLedger")
+    return sum((item.recoverable_gap for item in ledger.deadline_positions), ZERO)
+
+
+def post_plan_deadline_lateness(
+    ledger: SupplyLedger,
+    buckets: Iterable[DemandBucket],
+    lines: Iterable[PlanLine] = (),
+) -> tuple[DeadlineLateness, ...]:
+    """Reconstruct deadline misses from existing and proposed physical supply."""
+
+    if not isinstance(ledger, SupplyLedger):
+        raise TypeError("ledger must be SupplyLedger")
+    ordered = tuple(sorted(buckets, key=lambda item: item.due_date))
+    planned = tuple(lines)
+    if any(not isinstance(item, PlanLine) for item in planned):
+        raise TypeError("lines contains an invalid item")
+    supplies: list[list[object]] = []
+    if ledger.on_hand > ZERO:
+        supplies.append([ledger.on_hand, None])
+    supplies.extend(
+        [item.quantity, item.expected_delivery_date]
+        for item in ledger.committed_inbound
+    )
+    supplies.extend([item.quantity, item.material_available_date] for item in planned)
+    supplies.sort(
+        key=lambda item: (
+            date.min if item[1] is None else item[1],
+        )
+    )
+    supply_index = 0
+    result: list[DeadlineLateness] = []
+    for bucket in ordered:
+        remaining = bucket.bucket_quantity
+        late = ZERO
+        late_days = ZERO
+        while remaining > ZERO and supply_index < len(supplies):
+            available = supplies[supply_index][0]
+            material_date = supplies[supply_index][1]
+            assert isinstance(available, Decimal)
+            assigned = min(remaining, available)
+            if isinstance(material_date, date) and material_date > bucket.due_date:
+                late += assigned
+                late_days += assigned * Decimal((material_date - bucket.due_date).days)
+            remaining -= assigned
+            supplies[supply_index][0] = available - assigned
+            if supplies[supply_index][0] == ZERO:
+                supply_index += 1
+        if remaining > ZERO:
+            late += remaining
+        if late > ZERO:
+            result.append(
+                DeadlineLateness(
+                    bucket.due_date,
+                    late,
+                    late_days,
+                    remaining,
+                )
+            )
+    return tuple(result)
 
 
 def build_ledgers(
@@ -438,7 +577,7 @@ def build_ledgers(
     }
     catalog_components = {item.component_id for item in snapshot.catalog_lines}
 
-    route_dates: dict[str, list[date]] = defaultdict(list)
+    route_dates: dict[tuple[str, date | None], list[date]] = defaultdict(list)
     for availability in tuple(route_availabilities):
         if not isinstance(availability, RouteAvailability):
             raise TypeError("route_availabilities contains an invalid item")
@@ -446,9 +585,15 @@ def build_ledgers(
             raise ValueError(
                 f"route availability references unknown component {availability.component_id!r}"
             )
-        route_dates[availability.component_id].append(
-            availability.material_available_date
-        )
+        if availability.eligible_deadlines:
+            for deadline in availability.eligible_deadlines:
+                route_dates[(availability.component_id, deadline)].append(
+                    availability.material_available_date
+                )
+        else:
+            route_dates[(availability.component_id, None)].append(
+                availability.material_available_date
+            )
 
     # Import locally to avoid making the physical-ledger module part of the
     # decisions module's initialization path.
@@ -544,7 +689,6 @@ def build_ledgers(
         )
         total_demand = buckets[-1].cumulative_quantity
         eventual_supply = on_hand + sum((item.quantity for item in inbound), ZERO)
-        earliest_new_route = min(route_dates[component_id], default=None)
         positions: list[DeadlineSupplyPosition] = []
         for bucket in buckets:
             on_time_supply = on_hand + sum(
@@ -562,25 +706,68 @@ def build_ledgers(
                     cumulative_demand=bucket.cumulative_quantity,
                     on_time_supply=on_time_supply,
                     on_time_gap=on_time_gap,
-                    recoverable_gap=_recoverable_gap(
-                        due_date=bucket.due_date,
-                        on_time_gap=on_time_gap,
-                        inbound=inbound,
-                        earliest_new_route=earliest_new_route,
-                    ),
+                    recoverable_gap=ZERO,
                 )
             )
-        ledgers.append(
-            SupplyLedger(
-                component_id=component_id,
-                total_demand=total_demand,
-                on_hand=on_hand,
-                committed_inbound=inbound,
-                eventual_supply=eventual_supply,
-                eventual_gap=max(ZERO, total_demand - eventual_supply),
-                deadline_positions=tuple(positions),
-            )
+        base_ledger = SupplyLedger(
+            component_id=component_id,
+            total_demand=total_demand,
+            on_hand=on_hand,
+            committed_inbound=inbound,
+            eventual_supply=eventual_supply,
+            eventual_gap=max(ZERO, total_demand - eventual_supply),
+            deadline_positions=tuple(positions),
         )
+        segments_by_due: dict[date, list[DemandSupplySegment]] = defaultdict(list)
+        for segment in demand_supply_segments(base_ledger, buckets):
+            segments_by_due[segment.due_date].append(segment)
+        enriched: list[DeadlineSupplyPosition] = []
+        for position in positions:
+            earliest_new_route = min(
+                (
+                    *route_dates[(component_id, position.due_date)],
+                    *route_dates[(component_id, None)],
+                ),
+                default=None,
+            )
+            late_segments = tuple(
+                item
+                for item in segments_by_due[position.due_date]
+                if item.source_kind == "committed_inbound"
+                and item.material_available_date is not None
+                and item.material_available_date > position.due_date
+            )
+            committed_late = sum((item.quantity for item in late_segments), ZERO)
+            recoverable = sum(
+                (
+                    item.quantity
+                    for item in late_segments
+                    if earliest_new_route is not None
+                    and item.material_available_date is not None
+                    and earliest_new_route < item.material_available_date
+                ),
+                ZERO,
+            )
+            committed_late_days = sum(
+                (
+                    item.quantity
+                    * Decimal(
+                        (item.material_available_date - position.due_date).days
+                    )
+                    for item in late_segments
+                    if item.material_available_date is not None
+                ),
+                ZERO,
+            )
+            enriched.append(
+                replace(
+                    position,
+                    recoverable_gap=recoverable,
+                    committed_late_quantity=committed_late,
+                    committed_unit_late_days=committed_late_days,
+                )
+            )
+        ledgers.append(replace(base_ledger, deadline_positions=tuple(enriched)))
 
     return LedgerBuildResult(
         demand_buckets=tuple(all_buckets),
@@ -591,6 +778,7 @@ def build_ledgers(
 
 __all__ = [
     "DEFAULT_UNIT_OF_MEASURE_CONTRACT",
+    "DemandSupplySegment",
     "LedgerAlert",
     "LedgerBuildResult",
     "QuantityDecision",
@@ -598,7 +786,10 @@ __all__ = [
     "UnitOfMeasureContract",
     "aggregate_round_and_apply_moq",
     "build_ledgers",
+    "demand_supply_segments",
     "existing_surplus",
     "recovery_surplus",
+    "post_plan_deadline_lateness",
+    "total_recovery_demand",
     "unit_late_days",
 ]

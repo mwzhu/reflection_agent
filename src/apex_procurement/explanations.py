@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from hashlib import sha256
 import re
@@ -204,6 +205,12 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         else "none"
     )
     rules = _evidence_rule_ids(decision, decision.selected_plan)
+    lateness = "; ".join(
+        f"{item.due_date.isoformat()} late quantity {_number(item.late_quantity)} "
+        f"unit-late-days {_number(item.unit_late_days)} unresolved "
+        f"{_number(item.unresolved_quantity)}"
+        for item in decision.deadline_lateness
+    ) or "none"
     return sanitize_control_characters(
         f"Requirement {decision.requirement_id} for component {decision.component_id}: "
         f"demand [{demand}]; on hand {_number(decision.supply_ledger.on_hand)}; "
@@ -213,6 +220,7 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         f"fulfillment {decision.requirement_state.fulfillment.value}; resolution "
         f"{decision.requirement_state.resolution.value}; evidence contract "
         f"{decision.evidence_contract.value}; rule IDs [{_list(rules)}]."
+        f" Post-plan deadline misses [{lateness}]."
     )
 
 
@@ -256,8 +264,11 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
         f"Demand {_number(decision.total_requirement)}, on hand "
         f"{_number(decision.supply_ledger.on_hand)}, counted inbound "
         f"{_number(sum((item.quantity for item in decision.supply_ledger.committed_inbound), ZERO))}, "
-        f"forced surplus {_number(plan.forced_surplus)}, recovery/discretionary surplus "
-        f"{_number(plan.discretionary_surplus)}, residual eventual quantity "
+        f"forced surplus {_number(plan.forced_surplus)}, recovery demand "
+        f"{_number(plan.recovery_demand)}, recovery quantity "
+        f"{_number(plan.recovery_quantity)}, discretionary surplus "
+        f"{_number(plan.discretionary_surplus)}, unit-late-days "
+        f"{_number(plan.unit_late_days)}, residual eventual quantity "
         f"{_number(decision.residual_gap)}. Fulfillment "
         f"{decision.requirement_state.fulfillment.value}; resolution "
         f"{decision.requirement_state.resolution.value}; disposition {plan.disposition.value}; "
@@ -391,8 +402,9 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
         quantified = f" Forced surplus is {_number(decision.selected_plan.forced_surplus)}."
     elif decision.selected_plan is not None and category is AlertCategory.RECOVERY_SURPLUS:
         quantified = (
-            " Recovery/discretionary surplus is "
-            f"{_number(decision.selected_plan.discretionary_surplus)}."
+            " Strictly improving recovery quantity is "
+            f"{_number(decision.selected_plan.recovery_quantity)} against "
+            f"{_number(decision.selected_plan.recovery_demand)} recoverable units."
         )
     elif category is AlertCategory.LATE_ARRIVAL and decision.selected_plan is not None:
         selected_dates = tuple(
@@ -474,6 +486,22 @@ def _solver_alert(decision: DecisionRecord) -> str:
     )
 
 
+def _late_alert(decision: DecisionRecord, due_date: date) -> str:
+    lateness = next(
+        item for item in decision.deadline_lateness if item.due_date == due_date
+    )
+    return (
+        f"Component {decision.component_id}, requirement {decision.requirement_id} misses "
+        f"the {lateness.due_date.isoformat()} material deadline by "
+        f"{_number(lateness.late_quantity)} units, representing "
+        f"{_number(lateness.unit_late_days)} unit-late-days; "
+        f"{_number(lateness.unresolved_quantity)} units have no eventual assigned receipt. "
+        "The agent preserved existing commitments and placed only the strictly improving, "
+        "authorized recovery plan shown in the managed decision. Human action: review the "
+        "affected production date and decide whether to expedite further or reschedule."
+    )
+
+
 def render_alerts(
     decisions: Sequence[DecisionRecord],
     *,
@@ -547,12 +575,28 @@ def render_alerts(
 
         special = {
             AlertCategory.UNMET_DEMAND,
+            AlertCategory.LATE_ARRIVAL,
             AlertCategory.ASSUMPTION,
             AlertCategory.APPROVAL_REQUIRED,
             AlertCategory.DECISION_REQUIRED,
             AlertCategory.SOLVER_UNPROVEN,
             AlertCategory.RUN_ACCOUNTING,
         }
+        if decision.deadline_lateness:
+            if AlertCategory.LATE_ARRIVAL not in decision.alert_categories:
+                raise ExplanationError(
+                    f"requirement {decision.requirement_id} has deadline misses without LATE_ARRIVAL"
+                )
+            for lateness in decision.deadline_lateness:
+                add(
+                    AlertCategory.LATE_ARRIVAL,
+                    f"{scope}:late:{lateness.due_date.isoformat()}",
+                    _late_alert(decision, lateness.due_date),
+                )
+        elif AlertCategory.LATE_ARRIVAL in decision.alert_categories:
+            raise ExplanationError(
+                f"requirement {decision.requirement_id} requests LATE_ARRIVAL without a deadline miss"
+            )
         if AlertCategory.APPROVAL_REQUIRED in decision.alert_categories and approval_count == 0:
             raise ExplanationError(
                 f"requirement {decision.requirement_id} requests an approval alert without a proposal"

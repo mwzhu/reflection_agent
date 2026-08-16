@@ -14,6 +14,7 @@ from apex_procurement.domain import (
     BucketAllocation,
     CandidatePlan,
     Component,
+    DeadlineLateness,
     DeadlineSupplyPosition,
     DecisionRecord,
     DemandBucket,
@@ -195,7 +196,7 @@ def _decision_and_results(
                 demand,
                 on_hand,
                 max(Decimal("0"), demand - on_hand),
-                max(Decimal("0"), demand - on_hand),
+                Decimal("0"),
             ),
         ),
     )
@@ -589,8 +590,9 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
             "requirement-a", component.component_id, EvidenceContract.BENCHMARK,
             (bucket,), ledger, Decimal("10"), Decimal("6"), Decimal("4"), Decimal("6"),
             RequirementState(FulfillmentStatus.PARTIALLY_FULFILLED, ResolutionStatus.INFEASIBLE),
-            None, (), (), (AlertCategory.NO_ELIGIBLE_SUPPLIER,),
+            None, (), (), (AlertCategory.LATE_ARRIVAL, AlertCategory.NO_ELIGIBLE_SUPPLIER,),
             "No route is eligible under POL-PROC-001.section_2.approved_supplier.",
+            (DeadlineLateness(DUE, Decimal("6"), Decimal("0"), Decimal("6")),),
         )
         infeasible = SolverResult(
             component.component_id,

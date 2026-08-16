@@ -48,7 +48,7 @@ from .domain import (
     DemandBucket,
     ZERO,
 )
-from .ledgers import DEFAULT_UNIT_OF_MEASURE_CONTRACT
+from .ledgers import DEFAULT_UNIT_OF_MEASURE_CONTRACT, demand_supply_segments
 
 
 def _require_decimal(value: Decimal, name: str, *, nonnegative: bool = True) -> None:
@@ -221,6 +221,7 @@ class OptimizerProblem:
     approved_order_rule_ids: tuple[str, ...] = ()
     exception_allowances: tuple[ExceptionAllowance, ...] = ()
     autonomy: EconomicAutonomy = field(default_factory=EconomicAutonomy)
+    recovery_demand: Decimal = ZERO
     authorized_recovery_surplus: Decimal = ZERO
     max_allocation_driven_surplus: Decimal | None = None
     minimum_compliant_total: Decimal | None = None
@@ -266,6 +267,7 @@ class OptimizerProblem:
             raise TypeError("solve_kind must be SolveKind")
         for name in (
             "authorized_recovery_surplus",
+            "recovery_demand",
             "max_allocation_driven_surplus",
             "minimum_compliant_total",
             "coverage_target",
@@ -274,6 +276,8 @@ class OptimizerProblem:
             value = getattr(self, name)
             if value is not None:
                 _require_decimal(value, name)
+        if self.authorized_recovery_surplus > self.recovery_demand:
+            raise ValueError("authorized recovery surplus cannot exceed recovery demand")
         if self.minimum_secondary_fraction is not None:
             _require_decimal(
                 self.minimum_secondary_fraction,
@@ -352,6 +356,22 @@ class OptimizerProblem:
         )
         object.__setattr__(self, "exception_allowances", allowances)
         object.__setattr__(self, "relaxation_rule_ids", tuple(sorted(set(self.relaxation_rule_ids))))
+
+    @property
+    def planning_requirement(self) -> Decimal:
+        """Baseline eventual need plus explicitly authorized recovery demand."""
+
+        return self.net_requirement + self.authorized_recovery_surplus
+
+    @property
+    def recovery_headroom(self) -> Decimal:
+        """Recovery quantity not already supplied by solve-Q forced surplus."""
+
+        forced = max(
+            ZERO,
+            (self.minimum_compliant_total or ZERO) - self.net_requirement,
+        )
+        return max(ZERO, self.authorized_recovery_surplus - forced)
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +492,9 @@ class _ModelContext:
     quantity_atom: Decimal
     x: tuple[int, ...]
     z: tuple[tuple[int, ...], ...]
+    baseline: tuple[tuple[int, ...], ...]
+    recovery: tuple[tuple[int, ...], ...]
+    recovery_segments: tuple[tuple[int, date, Decimal], ...]
     y: tuple[int, ...]
     unresolved: tuple[int, ...]
     eventual_gap: int
@@ -479,6 +502,7 @@ class _ModelContext:
     review_exposure: tuple[int, ...]
     named_deviation: int
     moq_excess: int
+    lateness_offset: int
     upper_atoms: tuple[int, ...]
     exception_caps: tuple[tuple[str, int], ...]
     emitted_rule_ids: tuple[str, ...]
@@ -517,6 +541,7 @@ def _quantity_atom(problem: OptimizerProblem) -> Decimal:
         problem.supply_ledger.total_demand,
         problem.supply_ledger.on_hand,
         problem.authorized_recovery_surplus,
+        problem.recovery_demand,
     ]
     values.extend(item.minimum_order_quantity for item in problem.routes)
     values.extend(item.bucket_quantity for item in problem.demand_buckets)
@@ -733,11 +758,43 @@ def _build_model(
     )
     total_upper = sum(upper_atoms)
     demand_atoms = _atoms(problem.supply_ledger.total_demand, atom)
+    source_segments = demand_supply_segments(
+        problem.supply_ledger,
+        problem.demand_buckets,
+    )
+    bucket_indexes = {
+        bucket.due_date: index for index, bucket in enumerate(buckets)
+    }
+    uncovered_by_bucket = tuple(
+        sum(
+            (
+                item.quantity
+                for item in source_segments
+                if item.due_date == bucket.due_date
+                and item.source_kind == "uncovered"
+            ),
+            ZERO,
+        )
+        for bucket in buckets
+    )
+    recovery_segments = tuple(
+        (
+            bucket_indexes[item.due_date],
+            item.material_available_date,
+            item.quantity,
+        )
+        for item in source_segments
+        if item.source_kind == "committed_inbound"
+        and item.material_available_date is not None
+        and item.material_available_date > item.due_date
+    )
 
     x: list[int] = []
     step: list[int] = []
     y: list[int] = []
     z: list[tuple[int, ...]] = []
+    baseline: list[tuple[int, ...]] = []
+    recovery: list[tuple[int, ...]] = []
     for route_index, (route, route_upper) in enumerate(zip(routes, upper_atoms, strict=True)):
         x_var = model.add_var(f"x[{route_index}]", 0, route_upper)
         step_var = model.add_var(f"step[{route_index}]", 0, route_upper // increment_atoms)
@@ -746,10 +803,33 @@ def _build_model(
             model.add_var(f"z[{route_index},{bucket_index}]", 0, route_upper)
             for bucket_index in range(len(buckets))
         )
+        baseline_vars = tuple(
+            model.add_var(
+                f"baseline[{route_index},{bucket_index}]",
+                0,
+                min(route_upper, _atoms(uncovered_by_bucket[bucket_index], atom)),
+            )
+            for bucket_index in range(len(buckets))
+        )
+        recovery_vars = tuple(
+            model.add_var(
+                f"recovery[{route_index},{segment_index}]",
+                0,
+                (
+                    min(route_upper, _atoms(quantity, atom))
+                    if route.material_available_date < committed_date
+                    else 0
+                ),
+            )
+            for segment_index, (_bucket_index, committed_date, quantity)
+            in enumerate(recovery_segments)
+        )
         x.append(x_var)
         step.append(step_var)
         y.append(y_var)
         z.append(z_vars)
+        baseline.append(baseline_vars)
+        recovery.append(recovery_vars)
         model.add_row(
             {x_var: 1, step_var: -increment_atoms},
             lower=0,
@@ -762,6 +842,21 @@ def _build_model(
             upper=0,
             name=f"route_bucket_link[{route_index}]",
         )
+        for bucket_index, z_var in enumerate(z_vars):
+            model.add_row(
+                {
+                    baseline_vars[bucket_index]: 1,
+                    **{
+                        recovery_vars[segment_index]: 1
+                        for segment_index, (segment_bucket, _date, _quantity)
+                        in enumerate(recovery_segments)
+                        if segment_bucket == bucket_index
+                    },
+                    z_var: -1,
+                },
+                upper=0,
+                name=f"classified_allocation[{route_index},{bucket_index}]",
+            )
         moq_relaxed = problem.solve_kind is SolveKind.COUNTERFACTUAL and problem.relaxed_rule_id in {
             problem.moq_rule_id,
             problem.sub_moq_approval_rule_id,
@@ -797,6 +892,36 @@ def _build_model(
                     name=f"exception_scope[{route_index},{bucket_index}]",
                 )
 
+    for bucket_index, quantity in enumerate(uncovered_by_bucket):
+        model.add_row(
+            {
+                baseline[route_index][bucket_index]: 1
+                for route_index in range(len(routes))
+            },
+            upper=_atoms(quantity, atom),
+            name=f"baseline_bucket_cap[{bucket_index}]",
+        )
+    for segment_index, (_bucket_index, _date, quantity) in enumerate(
+        recovery_segments
+    ):
+        model.add_row(
+            {
+                recovery[route_index][segment_index]: 1
+                for route_index in range(len(routes))
+            },
+            upper=_atoms(quantity, atom),
+            name=f"recovery_segment_cap[{segment_index}]",
+        )
+    model.add_row(
+        {
+            recovery[route_index][segment_index]: 1
+            for route_index in range(len(routes))
+            for segment_index in range(len(recovery_segments))
+        },
+        upper=_atoms(problem.authorized_recovery_surplus, atom),
+        name="authorized_recovery_quantity",
+    )
+
     review_routes: dict[str, list[int]] = defaultdict(list)
     for route_index, route in enumerate(routes):
         for key in _review_keys(route):
@@ -829,6 +954,21 @@ def _build_model(
     discretionary = model.add_var("discretionary_surplus", 0, total_upper)
     named_deviation = model.add_var("named_primary_deviation", 0, total_upper)
     moq_excess = model.add_var("moq_excess", 0, total_upper)
+    committed_late_atoms = _atoms(
+        sum(
+            (
+                item.committed_unit_late_days
+                for item in problem.supply_ledger.deadline_positions
+            ),
+            ZERO,
+        ),
+        atom,
+    )
+    lateness_offset = model.add_var(
+        "committed_unit_late_days",
+        committed_late_atoms,
+        committed_late_atoms,
+    )
 
     positions = {item.due_date: item for item in problem.supply_ledger.deadline_positions}
     for bucket_index, bucket in enumerate(buckets):
@@ -853,7 +993,14 @@ def _build_model(
 
     net_atoms = _atoms(problem.net_requirement, atom)
     model.add_row(
-        {eventual_gap: 1, **{item: 1 for item in x}},
+        {
+            eventual_gap: 1,
+            **{
+                baseline[route_index][bucket_index]: 1
+                for route_index in range(len(routes))
+                for bucket_index in range(len(buckets))
+            },
+        },
         lower=net_atoms,
         name="eventual_coverage",
     )
@@ -863,7 +1010,11 @@ def _build_model(
     }:
         target_atoms = _atoms(problem.coverage_target, atom)
         model.add_row(
-            {item: 1 for item in x},
+            {
+                baseline[route_index][bucket_index]: 1
+                for route_index in range(len(routes))
+                for bucket_index in range(len(buckets))
+            },
             lower=target_atoms,
             name="solve_q_coverage_target",
         )
@@ -1003,14 +1154,16 @@ def _build_model(
         exception_caps.append((exception, maximum_atoms))
 
     q_min_atoms = _atoms(problem.minimum_compliant_total or ZERO, atom)
+    recovery_headroom_atoms = _atoms(problem.recovery_headroom, atom)
     model.add_row(
         {discretionary: 1, **{item: -1 for item in x}},
-        lower=-q_min_atoms,
+        lower=-(q_min_atoms + recovery_headroom_atoms),
         name="discretionary_surplus_definition",
     )
+    planning_atoms = _atoms(problem.planning_requirement, atom)
     model.add_row(
         {moq_excess: 1, **{item: -1 for item in x}},
-        lower=-net_atoms,
+        lower=-planning_atoms,
         name="moq_excess_definition",
     )
 
@@ -1044,7 +1197,9 @@ def _build_model(
             emitted.add(problem.named_primary_rule_id or "named_primary_supplier")
 
     if problem.solve_kind in {SolveKind.EXECUTABLE, SolveKind.COUNTERFACTUAL}:
-        surplus_cap = problem.autonomy.max_surplus_fraction * problem.net_requirement
+        surplus_cap = (
+            problem.autonomy.max_surplus_fraction * problem.planning_requirement
+        )
         if problem.autonomy.max_surplus_units is not None:
             surplus_cap = min(surplus_cap, problem.autonomy.max_surplus_units)
         model.add_row(
@@ -1070,6 +1225,9 @@ def _build_model(
         quantity_atom=atom,
         x=tuple(x),
         z=tuple(z),
+        baseline=tuple(baseline),
+        recovery=tuple(recovery),
+        recovery_segments=recovery_segments,
         y=tuple(y),
         unresolved=unresolved,
         eventual_gap=eventual_gap,
@@ -1077,6 +1235,7 @@ def _build_model(
         review_exposure=tuple(review_exposure),
         named_deviation=named_deviation,
         moq_excess=moq_excess,
+        lateness_offset=lateness_offset,
         upper_atoms=upper_atoms,
         exception_caps=tuple(exception_caps),
         emitted_rule_ids=tuple(sorted(emitted)),
@@ -1223,14 +1382,22 @@ def _objectives(
         )
         for index, bucket in enumerate(context.buckets)
     )
-    late = {
-        context.z[route_index][bucket_index]: max(
-            0,
-            (route.material_available_date - bucket.due_date).days,
-        )
-        for route_index, route in enumerate(context.routes)
-        for bucket_index, bucket in enumerate(context.buckets)
-    }
+    late: dict[int, Fraction | int] = {context.lateness_offset: 1}
+    for route_index, route in enumerate(context.routes):
+        for bucket_index, bucket in enumerate(context.buckets):
+            late[context.baseline[route_index][bucket_index]] = max(
+                0,
+                (route.material_available_date - bucket.due_date).days,
+            )
+        for segment_index, (bucket_index, committed_date, _quantity) in enumerate(
+            context.recovery_segments
+        ):
+            due = context.buckets[bucket_index].due_date
+            old_late = max(0, (committed_date - due).days)
+            new_late = max(0, (route.material_available_date - due).days)
+            late[context.recovery[route_index][segment_index]] = (
+                new_late - old_late
+            )
     cost = {
         context.x[index]: _fraction(route.unit_price * context.quantity_atom)
         for index, route in enumerate(context.routes)
@@ -1277,8 +1444,16 @@ def _fixed_staged_objective_vector(
 
     exact = list(values)
     total = sum(values[index] for index in context.x)
-    net = _atoms(context.problem.net_requirement, context.quantity_atom)
-    exact[context.discretionary] = 0
+    net = _atoms(context.problem.planning_requirement, context.quantity_atom)
+    exact[context.discretionary] = max(
+        0,
+        total
+        - _atoms(
+            (context.problem.minimum_compliant_total or ZERO)
+            + context.problem.recovery_headroom,
+            context.quantity_atom,
+        ),
+    )
     exact[context.moq_excess] = max(0, total - net)
 
     positions = {
@@ -1973,9 +2148,19 @@ class IntegerScaledSolver:
         if problem.solve_kind in {SolveKind.EXECUTABLE, SolveKind.COUNTERFACTUAL}:
             total_atoms = sum(final_values[index] for index in context.x)
             q_min_atoms = _atoms(problem.minimum_compliant_total or ZERO, context.quantity_atom)
-            net_atoms = _atoms(problem.net_requirement, context.quantity_atom)
-            expected_discretionary = max(0, total_atoms - q_min_atoms)
-            expected_moq_excess = max(0, total_atoms - net_atoms)
+            recovery_headroom_atoms = _atoms(
+                problem.recovery_headroom,
+                context.quantity_atom,
+            )
+            planning_atoms = _atoms(
+                problem.planning_requirement,
+                context.quantity_atom,
+            )
+            expected_discretionary = max(
+                0,
+                total_atoms - q_min_atoms - recovery_headroom_atoms,
+            )
+            expected_moq_excess = max(0, total_atoms - planning_atoms)
             selected_review_keys = {
                 key
                 for route_index, route in enumerate(context.routes)
@@ -2123,7 +2308,20 @@ def _build_plan(
     if context.problem.solve_kind is SolveKind.QUANTITY_CALIBRATION:
         minimum = total_quantity
     forced = max(ZERO, (minimum or ZERO) - context.problem.net_requirement)
-    discretionary = max(ZERO, total_quantity - (minimum or total_quantity))
+    recovery_quantity = min(
+        context.problem.recovery_demand,
+        max(ZERO, total_quantity - context.problem.net_requirement),
+    )
+    recovery_headroom = max(
+        ZERO,
+        context.problem.authorized_recovery_surplus - forced,
+    )
+    discretionary = max(
+        ZERO,
+        total_quantity
+        - (minimum if minimum is not None else ZERO)
+        - recovery_headroom,
+    )
     evidence_by_key: dict[tuple[object, ...], EvidenceResult] = {}
     for route in selected_routes:
         for item in route.evidence:
@@ -2162,12 +2360,22 @@ def _build_plan(
             "relaxed_rule": context.problem.relaxed_rule_id,
         }
     )
-    late_days = sum(
-        allocation.quantity
-        * Decimal(max(0, (line.material_available_date - allocation.due_date).days))
-        for line in lines
-        for allocation in line.bucket_allocations
-    )
+    late_atoms = values[context.lateness_offset]
+    for route_index, route in enumerate(context.routes):
+        for bucket_index, bucket in enumerate(context.buckets):
+            late_atoms += values[context.baseline[route_index][bucket_index]] * max(
+                0,
+                (route.material_available_date - bucket.due_date).days,
+            )
+        for segment_index, (bucket_index, committed_date, _quantity) in enumerate(
+            context.recovery_segments
+        ):
+            due = context.buckets[bucket_index].due_date
+            late_atoms += values[context.recovery[route_index][segment_index]] * (
+                max(0, (route.material_available_date - due).days)
+                - max(0, (committed_date - due).days)
+            )
+    late_days = context.quantity(late_atoms)
     return CandidatePlan(
         plan_id=plan_id,
         component_id=context.problem.component_id,
@@ -2187,6 +2395,8 @@ def _build_plan(
         ),
         forced_surplus=forced,
         discretionary_surplus=discretionary,
+        recovery_demand=context.problem.recovery_demand,
+        recovery_quantity=recovery_quantity,
         unit_late_days=late_days,
         objective_vector=objective_vector,
         relaxed_rule_ids=relaxed,
@@ -2264,7 +2474,7 @@ class ProcurementOptimizer:
         }
         secondary_missing = (
             problem.minimum_secondary_fraction is not None
-            and problem.net_requirement > ZERO
+            and problem.planning_requirement > ZERO
             and len(executable_suppliers) < 2
         )
         if secondary_missing:
@@ -2561,7 +2771,7 @@ class ProcurementOptimizer:
         if problem.named_primary_rule_id:
             requested_relaxations.add(problem.named_primary_rule_id)
         if problem.sub_moq_approval_rule_id and any(
-            route.minimum_order_quantity > problem.net_requirement
+            route.minimum_order_quantity > problem.planning_requirement
             for route in problem.routes
             if route.eligibility is EvidenceStatus.PASS
         ):
@@ -2597,6 +2807,16 @@ class ProcurementOptimizer:
                     AlertCategory.FORCED_SURPLUS,
                     "FORCED_SURPLUS",
                     f"Executable policy and MOQ conditions force {selected.forced_surplus} surplus units at total cost {selected.total_cost}.",
+                    problem.component_id,
+                    selected,
+                )
+            )
+        if selected and selected.recovery_quantity > ZERO:
+            alerts.append(
+                OptimizerAlert(
+                    AlertCategory.RECOVERY_SURPLUS,
+                    "RECOVERY_SURPLUS",
+                    f"Strictly earlier supply authorizes {selected.recovery_quantity} duplicate recovery units against {selected.recovery_demand} recoverable units.",
                     problem.component_id,
                     selected,
                 )

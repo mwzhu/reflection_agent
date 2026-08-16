@@ -522,6 +522,8 @@ class DeadlineSupplyPosition:
     on_time_supply: Decimal
     on_time_gap: Decimal
     recoverable_gap: Decimal
+    committed_late_quantity: Decimal = ZERO
+    committed_unit_late_days: Decimal = ZERO
 
     def __post_init__(self) -> None:
         _require_date(self.due_date, "due_date")
@@ -530,6 +532,8 @@ class DeadlineSupplyPosition:
             "on_time_supply",
             "on_time_gap",
             "recoverable_gap",
+            "committed_late_quantity",
+            "committed_unit_late_days",
         ):
             _require_decimal(getattr(self, name), name, nonnegative=True)
         expected_gap = max(ZERO, self.cumulative_demand - self.on_time_supply)
@@ -537,6 +541,27 @@ class DeadlineSupplyPosition:
             raise ValueError("on_time_gap must equal max(0, demand - on_time supply)")
         if self.recoverable_gap > self.on_time_gap:
             raise ValueError("recoverable_gap cannot exceed on_time_gap")
+        if self.committed_late_quantity > self.on_time_gap:
+            raise ValueError("committed late quantity cannot exceed on_time_gap")
+
+
+@dataclass(frozen=True, slots=True)
+class DeadlineLateness:
+    """One post-plan deadline miss retained in the managed decision state."""
+
+    due_date: date
+    late_quantity: Decimal
+    unit_late_days: Decimal
+    unresolved_quantity: Decimal = ZERO
+
+    def __post_init__(self) -> None:
+        _require_date(self.due_date, "due_date")
+        for name in ("late_quantity", "unit_late_days", "unresolved_quantity"):
+            _require_decimal(getattr(self, name), name, nonnegative=True)
+        if self.late_quantity <= ZERO:
+            raise ValueError("deadline lateness requires a positive late quantity")
+        if self.unresolved_quantity > self.late_quantity:
+            raise ValueError("unresolved quantity cannot exceed late quantity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -810,6 +835,8 @@ class CandidatePlan:
     cheapest_covering_cost: Decimal | None = None
     forced_surplus: Decimal = ZERO
     discretionary_surplus: Decimal = ZERO
+    recovery_demand: Decimal = ZERO
+    recovery_quantity: Decimal = ZERO
     unit_late_days: Decimal = ZERO
     objective_vector: tuple[Decimal, ...] = ()
     relaxed_rule_ids: tuple[str, ...] = ()
@@ -841,6 +868,8 @@ class CandidatePlan:
             "total_cost",
             "forced_surplus",
             "discretionary_surplus",
+            "recovery_demand",
+            "recovery_quantity",
             "unit_late_days",
         ):
             _require_decimal(getattr(self, name), name, nonnegative=True)
@@ -860,6 +889,8 @@ class CandidatePlan:
             raise ValueError("eventual_covered_quantity cannot exceed net_requirement")
         if self.residual_gap != self.net_requirement - self.eventual_covered_quantity:
             raise ValueError("residual_gap must equal net requirement minus covered quantity")
+        if self.recovery_quantity > self.recovery_demand:
+            raise ValueError("recovery quantity cannot exceed recovery demand")
         if self.total_cost != sum((item.line_total for item in lines), ZERO):
             raise ValueError("total_cost must exactly equal the sum of line totals")
         objective = _tuple(self.objective_vector, "objective_vector")
@@ -887,9 +918,19 @@ class CandidatePlan:
             if total_quantity < self.minimum_compliant_total:
                 raise ValueError("executable quantity cannot be below the calibrated minimum")
             expected_forced = max(ZERO, self.minimum_compliant_total - self.net_requirement)
-            expected_discretionary = max(ZERO, total_quantity - self.minimum_compliant_total)
+            expected_recovery = min(
+                self.recovery_demand,
+                max(ZERO, total_quantity - self.net_requirement),
+            )
+            recovery_headroom = max(ZERO, self.recovery_demand - expected_forced)
+            expected_discretionary = max(
+                ZERO,
+                total_quantity - self.minimum_compliant_total - recovery_headroom,
+            )
             if self.forced_surplus != expected_forced:
                 raise ValueError("forced_surplus is inconsistent with calibration")
+            if self.recovery_quantity != expected_recovery:
+                raise ValueError("recovery_quantity is inconsistent with the selected total")
             if self.discretionary_surplus != expected_discretionary:
                 raise ValueError("discretionary_surplus is inconsistent with calibration")
             for result in evidence:
@@ -941,6 +982,7 @@ class DecisionRecord:
     evidence: tuple[EvidenceResult, ...]
     alert_categories: tuple[AlertCategory, ...]
     rationale: str
+    deadline_lateness: tuple[DeadlineLateness, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.requirement_id, "requirement_id")
@@ -1021,6 +1063,17 @@ class DecisionRecord:
             raise TypeError("alert_categories contains an invalid item")
         object.__setattr__(self, "alert_categories", tuple(sorted(set(categories), key=lambda item: item.value)))
         _require_text(self.rationale, "rationale")
+        lateness = _tuple(self.deadline_lateness, "deadline_lateness")
+        if any(not isinstance(item, DeadlineLateness) for item in lateness):
+            raise TypeError("deadline_lateness contains an invalid item")
+        lateness = tuple(sorted(lateness, key=lambda item: item.due_date))
+        _require_unique(
+            (item.due_date.isoformat() for item in lateness),
+            "deadline_lateness dates",
+        )
+        if any(item.due_date not in {bucket.due_date for bucket in buckets} for item in lateness):
+            raise ValueError("deadline lateness must reference a demand bucket")
+        object.__setattr__(self, "deadline_lateness", lateness)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1222,6 +1275,7 @@ __all__ = [
     "CommitResult",
     "ComparatorTrace",
     "Component",
+    "DeadlineLateness",
     "DeadlineSupplyPosition",
     "DecisionRecord",
     "DemandBucket",
