@@ -44,6 +44,7 @@ from apex_procurement.domain import (
 from apex_procurement.validator import (
     _EXECUTABLE_OBJECTIVE_SUFFIX,
     IndependentPlanValidator,
+    IndependentSolverLimits,
     NamedEntityOutcome,
 )
 
@@ -831,6 +832,107 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
                 self.assertEqual(result.status, SolverStatus.OPTIMAL)
                 self.assertTrue(result.certificate_complete)
                 self.assertTrue(result.objective_vector)
+
+    def test_tiny_exhaustive_oracle_agrees_with_independent_milp(self) -> None:
+        generated = (
+            (Decimal("3"), Decimal("1"), Decimal("2"), Decimal("2"), Decimal("3")),
+            (Decimal("5"), Decimal("4"), Decimal("2"), Decimal("5"), Decimal("2")),
+            (Decimal("8"), Decimal("3"), Decimal("5"), Decimal("1.25"), Decimal("1.20")),
+        )
+        for demand, first_moq, second_moq, first_price, second_price in generated:
+            with self.subTest(
+                demand=demand,
+                first_moq=first_moq,
+                second_moq=second_moq,
+            ):
+                first = _supplier(
+                    "supplier-a", name="Generated First Supply"
+                )
+                second = _supplier(
+                    "supplier-b", name="Generated Second Supply"
+                )
+                snapshot = _snapshot(
+                    demand=demand,
+                    suppliers=(first, second),
+                    catalogs=(
+                        SupplierCatalogLine(
+                            first.supplier_id,
+                            "component-a",
+                            first_price,
+                            3,
+                            first_moq,
+                        ),
+                        SupplierCatalogLine(
+                            second.supplier_id,
+                            "component-a",
+                            second_price,
+                            5,
+                            second_moq,
+                        ),
+                    ),
+                )
+                decision, _results, _validator = _decision_and_results(
+                    snapshot
+                )
+                oracle = IndependentPlanValidator(
+                    tiny_case_unit_limit=10_000
+                )
+                scalable = IndependentPlanValidator(
+                    tiny_case_unit_limit=0
+                )
+                for kind in (
+                    SolveKind.QUANTITY_CALIBRATION,
+                    SolveKind.BASELINE,
+                    SolveKind.EXECUTABLE,
+                ):
+                    with self.subTest(kind=kind):
+                        exhaustive = oracle.independently_solve(
+                            snapshot, decision, kind
+                        )
+                        milp = scalable.independently_solve(
+                            snapshot, decision, kind
+                        )
+                        self.assertEqual(milp.status, exhaustive.status)
+                        self.assertEqual(
+                            milp.certificate_complete,
+                            exhaustive.certificate_complete,
+                        )
+                        self.assertEqual(
+                            milp.objective_vector,
+                            exhaustive.objective_vector,
+                        )
+                        self.assertEqual(
+                            milp.minimum_compliant_total,
+                            exhaustive.minimum_compliant_total,
+                        )
+                        self.assertEqual(
+                            milp.cheapest_covering_cost,
+                            exhaustive.cheapest_covering_cost,
+                        )
+
+    def test_resource_exhaustion_emits_only_proof_status_diagnostics(self) -> None:
+        snapshot = _snapshot(demand=Decimal("250"))
+        decision, results, _validator = _decision_and_results(snapshot)
+        exhausted = IndependentPlanValidator(
+            tiny_case_unit_limit=0,
+            solver_limits=IndependentSolverLimits(
+                force_status=SolverStatus.RESOURCE_LIMIT
+            ),
+        )
+
+        validation = exhausted.validate(snapshot, (decision,), results)
+        codes = _codes(validation)
+
+        self.assertEqual(codes, {"INDEPENDENT_SOLVE_UNPROVEN"})
+        self.assertTrue(
+            {
+                "BASELINE_COST_MISMATCH",
+                "CALIBRATION_MISMATCH",
+                "OBJECTIVE_VECTOR_MISMATCH",
+                "SOLVER_OBJECTIVE_DISAGREEMENT",
+                "SUBOPTIMAL_INCUMBENT",
+            }.isdisjoint(codes)
+        )
 
     def test_inbound_inclusion_uses_delivery_date_not_old_order_date(self) -> None:
         snapshot = _snapshot(demand=Decimal("5"))
