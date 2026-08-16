@@ -2137,8 +2137,21 @@ class ProcurementOptimizer:
                 relaxed_rule_id=None,
             )
             diagnostic_result = self.solver.solve(diagnostic_problem)
-            if diagnostic_result.candidate_plan is not None:
-                alternatives.append(diagnostic_result.candidate_plan)
+            diagnostic_plan = diagnostic_result.candidate_plan
+            if diagnostic_plan is not None:
+                diagnostic_plan = replace(
+                    diagnostic_plan,
+                    relaxed_rule_ids=(
+                        (problem.minimum_secondary_rule_id,)
+                        if problem.minimum_secondary_rule_id
+                        else ()
+                    ),
+                    summary=(
+                        "Non-executable compliance-cost diagnostic; the "
+                        "prospective secondary-allocation rule is not waived."
+                    ),
+                )
+                alternatives.append(diagnostic_plan)
             secondary_counterfactuals: list[SolverResult] = []
             if kind is SecondaryShortageKind.RELAXABLE:
                 relaxation_candidates = tuple(
@@ -2204,7 +2217,7 @@ class ProcurementOptimizer:
                     "SECONDARY_ALLOCATION_UNSATISFIABLE",
                     f"The prospective secondary-allocation rule is {kind.value}ly unsatisfiable with fewer than two eligible suppliers.",
                     problem.component_id,
-                    diagnostic_result.candidate_plan,
+                    diagnostic_plan,
                     (problem.minimum_secondary_rule_id,) if problem.minimum_secondary_rule_id else (),
                 )
             )
@@ -2298,6 +2311,30 @@ class ProcurementOptimizer:
                     != tuple((item.supplier_id, item.quantity) for item in calibrated_plan.lines)
                 )
             ):
+                relaxed_allocation_rules = tuple(
+                    sorted(
+                        {
+                            *(
+                                (problem.minimum_secondary_rule_id,)
+                                if problem.minimum_secondary_rule_id
+                                else ()
+                            ),
+                            *(
+                                item.rule_id
+                                for item in problem.concentration_constraints
+                            ),
+                        }
+                    )
+                )
+                bare_plan = replace(
+                    bare_plan,
+                    relaxed_rule_ids=relaxed_allocation_rules,
+                    summary=(
+                        "Non-executable compliance-cost diagnostic; listed "
+                        "allocation rules are intentionally omitted only to "
+                        "quantify their cost."
+                    ),
+                )
                 alternatives.append(bare_plan)
                 alerts.append(
                     OptimizerAlert(

@@ -454,6 +454,96 @@ class IndependentValidatorMutationTests(unittest.TestCase):
 
 
 class IndependentValidatorEdgeTests(unittest.TestCase):
+    def test_explicit_sub_moq_recommendation_is_not_a_duplicate_write(self) -> None:
+        snapshot = _snapshot(demand=Decimal("1"), moq=Decimal("5"))
+        decision, results, validator = _decision_and_results(
+            snapshot, quantity=Decimal("5")
+        )
+        selected = decision.selected_plan
+        assert selected is not None
+        rule_id = validator._rules(
+            snapshot.configuration.current_date,
+            "sub_moq_written_approval",
+        )[0].rule_id
+        proposed_line = replace(
+            selected.lines[0],
+            quantity=Decimal("1"),
+            bucket_allocations=(BucketAllocation(DUE, Decimal("1")),),
+        )
+        proposal = replace(
+            selected,
+            plan_id="sub-moq-proposal",
+            disposition=PlanDisposition.RECOMMEND_APPROVAL,
+            lines=(proposed_line,),
+            total_cost=proposed_line.line_total,
+            minimum_compliant_total=None,
+            cheapest_covering_cost=None,
+            forced_surplus=Decimal("0"),
+            relaxed_rule_ids=(rule_id,),
+            unresolved_approval_ids=(rule_id,),
+        )
+        requirement = validator._source_requirements(
+            snapshot,
+            type("Sink", (), {"error": lambda *args, **kwargs: None})(),
+        )[decision.component_id]
+        proposal = replace(
+            proposal,
+            objective_vector=validator._objective(
+                snapshot,
+                requirement,
+                proposal,
+                validator._offers(
+                    snapshot, requirement, EvidenceContract.BENCHMARK
+                ),
+            ),
+        )
+        decision = replace(decision, alternatives=(proposal,))
+
+        result = validator.validate(snapshot, (decision,), results)
+
+        self.assertTrue(result.is_valid, result.issues)
+
+    def test_phased_objective_uses_only_allocations_assigned_by_deadline(self) -> None:
+        snapshot = _snapshot(demand=Decimal("5"))
+        later = DUE + timedelta(days=10)
+        snapshot = replace(
+            snapshot,
+            production_orders=(
+                ProductionOrder("order-a", "product-a", Decimal("5"), None, DUE),
+                ProductionOrder("order-b", "product-a", Decimal("5"), None, later),
+            ),
+        )
+        decision, _results, validator = _decision_and_results(
+            _snapshot(demand=Decimal("10")), quantity=Decimal("10")
+        )
+        selected = decision.selected_plan
+        assert selected is not None
+        line = replace(
+            selected.lines[0],
+            quantity=Decimal("10"),
+            bucket_allocations=(BucketAllocation(later, Decimal("10")),),
+        )
+        plan = replace(
+            selected,
+            lines=(line,),
+            net_requirement=Decimal("10"),
+            eventual_covered_quantity=Decimal("10"),
+            total_cost=line.line_total,
+        )
+        requirement = validator._source_requirements(
+            snapshot,
+            type("Sink", (), {"error": lambda *args, **kwargs: None})(),
+        )[decision.component_id]
+
+        objective = validator._objective(
+            snapshot,
+            requirement,
+            plan,
+            validator._offers(snapshot, requirement, EvidenceContract.BENCHMARK),
+        )
+
+        self.assertEqual(objective[:2], (Decimal("5"), Decimal("0")))
+
     def test_forced_surplus_is_not_ratio_gated(self) -> None:
         snapshot = _snapshot(demand=Decimal("1"), moq=Decimal("5"))
         decision, results, validator = _decision_and_results(snapshot, quantity=Decimal("5"))
