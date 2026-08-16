@@ -17,8 +17,22 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 class StaticContractTests(unittest.TestCase):
     def test_all_package_modules_import_with_only_declared_runtime_dependencies(self) -> None:
         with (PROJECT_ROOT / "pyproject.toml").open("rb") as handle:
-            project = tomllib.load(handle)["project"]
-        self.assertEqual(project["dependencies"], [])
+            document = tomllib.load(handle)
+        project = document["project"]
+        self.assertEqual(project["dependencies"], ["scipy>=1.11"])
+        self.assertEqual(
+            project["scripts"],
+            {"apex-procurement": "apex_procurement.cli:main"},
+        )
+        self.assertEqual(
+            document["tool"]["setuptools"]["package-data"],
+            {
+                "apex_procurement.policy": [
+                    "compiled_policy.json",
+                    "concepts.json",
+                ]
+            },
+        )
 
         module_names = [
             module.name

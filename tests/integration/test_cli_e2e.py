@@ -4,6 +4,7 @@ from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from decimal import Decimal
 from io import StringIO
+from importlib import metadata
 from pathlib import Path
 import shutil
 import socket
@@ -194,6 +195,86 @@ class AssembledCliTests(unittest.TestCase):
                 ("CMP-016", "SUP-102", 15.0, 18.0, "2025-09-01", "2025-09-15"),
             ),
         )
+
+    def test_installed_runtime_layout_executes_scenario_six(self) -> None:
+        install_root = Path(self.temporary_directory.name) / "site-packages"
+        shutil.copytree(
+            PROJECT_ROOT / "src" / "apex_procurement",
+            install_root / "apex_procurement",
+        )
+        for distribution_name in ("scipy", "numpy"):
+            distribution = metadata.distribution(distribution_name)
+            roots = {
+                Path(item).parts[0]
+                for item in distribution.files or ()
+                if Path(item).parts
+            }
+            for root in roots:
+                source = Path(distribution.locate_file(root))
+                target = install_root / root
+                if source.exists() and not target.exists():
+                    target.symlink_to(
+                        source, target_is_directory=source.is_dir()
+                    )
+        scenario = Path(self.temporary_directory.name) / "installed.sqlite"
+        shutil.copy2(SOURCE, scenario)
+        script = (
+            "from pathlib import Path;"
+            "import sys;"
+            f"sys.path.insert(0, {str(install_root)!r});"
+            "import apex_procurement;"
+            f"assert Path(apex_procurement.__file__).is_relative_to(Path({str(install_root)!r}));"
+            "from apex_procurement.cli import main;"
+            "raise SystemExit(main(['--scenario',sys.argv[1],'--llm=off','--dry-run']))"
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", script, str(scenario)],
+            cwd="/",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("status=dry-run", completed.stdout)
+
+    def test_large_discrete_fg_demand_is_independently_certified(self) -> None:
+        for quantity in (250, 300, 400):
+            with self.subTest(quantity=quantity):
+                scenario = (
+                    Path(self.temporary_directory.name)
+                    / f"large-{quantity}.sqlite"
+                )
+                shutil.copy2(SOURCE, scenario)
+                with closing(sqlite3.connect(scenario)) as connection:
+                    connection.execute(
+                        "UPDATE production_schedule "
+                        "SET product_id = ?, quantity = ?",
+                        ("FG-1002", quantity),
+                    )
+                    connection.commit()
+
+                completed = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--dry-run",
+                )
+
+                self.assertIn(completed.returncode, {0, 5})
+                self.assertNotIn(
+                    "INDEPENDENT_SOLVE_UNPROVEN", completed.stderr
+                )
+                if completed.returncode == 5:
+                    # R03 removes the current aggregate approval cap.  Until
+                    # then, the 400-unit case may expose that independently
+                    # proven semantic mismatch, but it must not exhaust the
+                    # validator merely because quantity is large.
+                    self.assertIn(
+                        "CALIBRATION_MISMATCH", completed.stderr
+                    )
 
     def test_scenario_two_executes_forced_allocation_surplus_only(self) -> None:
         scenario = Path(self.temporary_directory.name) / SCENARIO_02.name

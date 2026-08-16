@@ -7,7 +7,10 @@ name = "apex-procurement-agent"
 version = "0.1.0"
 description = "Deterministic procurement planning contracts and runtime scaffold"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["scipy>=1.11"]
+
+[project.scripts]
+apex-procurement = "apex_procurement.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "hypothesis>=6"]
@@ -17,6 +20,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"apex_procurement.policy" = ["compiled_policy.json", "concepts.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -20,6 +20,13 @@ from .schema import PolicyValidationError, validate_policy_documents
 
 POLICY_DIRECTORY = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_VALIDATION_ROOT = (
+    PROJECT_ROOT
+    if (PROJECT_ROOT / "pyproject.toml").is_file()
+    and (PROJECT_ROOT / "data" / "policies").is_dir()
+    and (PROJECT_ROOT / "data" / "memos").is_dir()
+    else None
+)
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -102,7 +109,7 @@ def load_policy_registry(
     *,
     pack_path: Path | None = None,
     concepts_path: Path | None = None,
-    project_root: Path | None = PROJECT_ROOT,
+    project_root: Path | None = DEFAULT_VALIDATION_ROOT,
 ) -> PolicyRegistry:
     """Load and fully validate the checked-in policy and concept artifacts."""
 

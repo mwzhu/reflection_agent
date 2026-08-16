@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
@@ -20,7 +20,7 @@ from fractions import Fraction
 import hashlib
 from itertools import combinations
 import json
-from math import gcd
+from math import gcd, lcm
 import re
 import unicodedata
 
@@ -137,6 +137,91 @@ class IndependentSolve:
     minimum_compliant_total: Decimal | None = None
     cheapest_covering_cost: Decimal | None = None
     certificate_complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class IndependentSolverLimits:
+    """Resource controls for the validator's independently built MILPs."""
+
+    time_limit_seconds: float | None = None
+    force_status: SolverStatus | None = None
+
+    def __post_init__(self) -> None:
+        if self.time_limit_seconds is not None and (
+            not isinstance(self.time_limit_seconds, (int, float))
+            or isinstance(self.time_limit_seconds, bool)
+            or self.time_limit_seconds <= 0
+        ):
+            raise ValueError("time_limit_seconds must be positive or None")
+        if self.force_status is not None and not isinstance(
+            self.force_status, SolverStatus
+        ):
+            raise TypeError("force_status must be SolverStatus or None")
+
+
+@dataclass(frozen=True, slots=True)
+class _IndependentMilpRow:
+    coefficients: Mapping[int, Fraction]
+    lower: Fraction | None = None
+    upper: Fraction | None = None
+
+
+@dataclass(slots=True)
+class _IndependentMilpModel:
+    names: list[str] = field(default_factory=list)
+    lower: list[int] = field(default_factory=list)
+    upper: list[int] = field(default_factory=list)
+    rows: list[_IndependentMilpRow] = field(default_factory=list)
+
+    def add_variable(self, name: str, lower: int, upper: int) -> int:
+        if lower > upper:
+            raise ValueError(f"invalid bounds for {name}")
+        index = len(self.names)
+        self.names.append(name)
+        self.lower.append(lower)
+        self.upper.append(upper)
+        return index
+
+    def add_row(
+        self,
+        coefficients: Mapping[int, Fraction | int],
+        *,
+        lower: Fraction | int | None = None,
+        upper: Fraction | int | None = None,
+    ) -> None:
+        exact = {
+            index: value if isinstance(value, Fraction) else Fraction(value)
+            for index, value in coefficients.items()
+            if value
+        }
+        lower_fraction = (
+            None
+            if lower is None
+            else lower
+            if isinstance(lower, Fraction)
+            else Fraction(lower)
+        )
+        upper_fraction = (
+            None
+            if upper is None
+            else upper
+            if isinstance(upper, Fraction)
+            else Fraction(upper)
+        )
+        self.rows.append(_IndependentMilpRow(exact, lower_fraction, upper_fraction))
+
+
+@dataclass(frozen=True, slots=True)
+class _IndependentMilpResult:
+    status: SolverStatus
+    values: tuple[int, ...] | None
+    certificate_complete: bool
+
+
+class _IndependentSolveInterrupted(Exception):
+    def __init__(self, status: SolverStatus) -> None:
+        super().__init__(status.value)
+        self.status = status
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +465,10 @@ def _floor_units(value: Decimal, increment: Decimal) -> int:
     return int((value / increment).to_integral_value(rounding=ROUND_FLOOR))
 
 
+def _decimal(value: Fraction) -> Decimal:
+    return Decimal(value.numerator) / Decimal(value.denominator)
+
+
 class IndependentPlanValidator:
     """Rebuild source facts and independently certify proposed decisions."""
 
@@ -394,6 +483,8 @@ class IndependentPlanValidator:
         capacity_confirmed_supplier_ids: Iterable[str] = (),
         numeric_capacity_by_supplier: Mapping[str, Decimal] | None = None,
         enumeration_node_limit: int = 2_000_000,
+        tiny_case_unit_limit: int = 64,
+        solver_limits: IndependentSolverLimits | None = None,
     ) -> None:
         self.registry = registry or load_policy_registry()
         if not isinstance(self.registry, PolicyRegistry):
@@ -404,6 +495,16 @@ class IndependentPlanValidator:
             raise ValueError("receiving_buffer_days must be a nonnegative int")
         if not isinstance(enumeration_node_limit, int) or enumeration_node_limit <= 0:
             raise ValueError("enumeration_node_limit must be positive")
+        if (
+            not isinstance(tiny_case_unit_limit, int)
+            or isinstance(tiny_case_unit_limit, bool)
+            or tiny_case_unit_limit < 0
+        ):
+            raise ValueError("tiny_case_unit_limit must be a nonnegative int")
+        if solver_limits is not None and not isinstance(
+            solver_limits, IndependentSolverLimits
+        ):
+            raise TypeError("solver_limits must be IndependentSolverLimits or None")
         self.autonomy = autonomy
         self.receiving_buffer_days = receiving_buffer_days
         self.accepted_shipment_pairs = frozenset(tuple(item) for item in accepted_shipment_pairs)
@@ -413,6 +514,8 @@ class IndependentPlanValidator:
         if any(value < ZERO or not value.is_finite() for value in self.numeric_capacity_by_supplier.values()):
             raise ValueError("numeric capacity values must be finite and nonnegative")
         self.enumeration_node_limit = enumeration_node_limit
+        self.tiny_case_unit_limit = tiny_case_unit_limit
+        self.solver_limits = solver_limits or IndependentSolverLimits()
         self._concepts = {
             str(item["concept_id"]): item for item in self.registry.concepts["concepts"]
         }
@@ -1696,7 +1799,816 @@ class IndependentPlanValidator:
 
                 yield from walk(0, total_units)
 
+    def _milp_optimize(
+        self,
+        model: _IndependentMilpModel,
+        objective: Mapping[int, Fraction],
+    ) -> _IndependentMilpResult:
+        forced = self.solver_limits.force_status
+        if forced is not None:
+            return _IndependentMilpResult(forced, None, False)
+        try:
+            import numpy as np
+            from scipy.optimize import Bounds, LinearConstraint, milp
+            from scipy.sparse import coo_array
+        except ImportError:
+            return _IndependentMilpResult(SolverStatus.ERROR, None, False)
+
+        row_indexes: list[int] = []
+        column_indexes: list[int] = []
+        data: list[float] = []
+        lower_rows: list[float] = []
+        upper_rows: list[float] = []
+        for row_index, row in enumerate(model.rows):
+            denominator = 1
+            for coefficient in row.coefficients.values():
+                denominator = lcm(denominator, coefficient.denominator)
+            if row.lower is not None:
+                denominator = lcm(denominator, row.lower.denominator)
+            if row.upper is not None:
+                denominator = lcm(denominator, row.upper.denominator)
+            for column, coefficient in row.coefficients.items():
+                row_indexes.append(row_index)
+                column_indexes.append(column)
+                data.append(float(coefficient * denominator))
+            lower_rows.append(
+                -np.inf
+                if row.lower is None
+                else float(row.lower * denominator)
+            )
+            upper_rows.append(
+                np.inf
+                if row.upper is None
+                else float(row.upper * denominator)
+            )
+        matrix = coo_array(
+            (data, (row_indexes, column_indexes)),
+            shape=(len(model.rows), len(model.names)),
+        ).tocsr()
+
+        objective_denominator = 1
+        for coefficient in objective.values():
+            objective_denominator = lcm(
+                objective_denominator, coefficient.denominator
+            )
+        integer_objective = np.zeros(len(model.names), dtype=float)
+        for index, coefficient in objective.items():
+            integer_objective[index] = float(
+                coefficient * objective_denominator
+            )
+        options: dict[str, float] = {"mip_rel_gap": 0.0}
+        if self.solver_limits.time_limit_seconds is not None:
+            options["time_limit"] = float(
+                self.solver_limits.time_limit_seconds
+            )
+        result = milp(
+            c=integer_objective,
+            integrality=np.ones(len(model.names), dtype=int),
+            bounds=Bounds(
+                np.asarray(model.lower, dtype=float),
+                np.asarray(model.upper, dtype=float),
+            ),
+            constraints=LinearConstraint(
+                matrix,
+                np.asarray(lower_rows, dtype=float),
+                np.asarray(upper_rows, dtype=float),
+            ),
+            options=options,
+        )
+        values: tuple[int, ...] | None = None
+        if result.x is not None:
+            rounded = tuple(int(round(float(value))) for value in result.x)
+            if all(
+                abs(float(value) - rounded[index]) <= 1e-6
+                for index, value in enumerate(result.x)
+            ):
+                values = rounded
+        gap_value = getattr(result, "mip_gap", None)
+        gap = None if gap_value is None else Decimal(str(gap_value))
+        if result.status == 0 and (gap is None or gap == ZERO):
+            status = SolverStatus.OPTIMAL
+            complete = True
+        elif result.status == 2:
+            status = SolverStatus.INFEASIBLE
+            complete = True
+        elif result.status == 1:
+            status = (
+                SolverStatus.FEASIBLE_INCUMBENT
+                if values is not None
+                else SolverStatus.RESOURCE_LIMIT
+            )
+            complete = False
+        elif values is not None:
+            status = SolverStatus.FEASIBLE_INCUMBENT
+            complete = False
+        else:
+            status = SolverStatus.ERROR
+            complete = False
+        if status is SolverStatus.OPTIMAL and values is None:
+            return _IndependentMilpResult(SolverStatus.ERROR, None, False)
+        if values is not None:
+            for index, value in enumerate(values):
+                if not model.lower[index] <= value <= model.upper[index]:
+                    return _IndependentMilpResult(
+                        SolverStatus.ERROR, None, False
+                    )
+            for row in model.rows:
+                activity = sum(
+                    coefficient * values[index]
+                    for index, coefficient in row.coefficients.items()
+                )
+                if (
+                    row.lower is not None
+                    and activity < row.lower
+                ) or (
+                    row.upper is not None
+                    and activity > row.upper
+                ):
+                    return _IndependentMilpResult(
+                        SolverStatus.ERROR, None, False
+                    )
+        return _IndependentMilpResult(status, values, complete)
+
+    def _milp_quantity_atom(
+        self,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+    ) -> Decimal:
+        values = [
+            self._increment(requirement.component),
+            requirement.total_demand,
+            requirement.on_hand,
+            requirement.eventual_gap,
+            *(quantity for _due, quantity in requirement.bucket_quantities),
+            *(quantity for _number, quantity, _due in requirement.inbound),
+            *(offer.catalog.minimum_order_quantity for offer in offers),
+            *(offer.upper_bound for offer in offers),
+        ]
+        places = max(
+            0,
+            max(
+                (-value.normalize().as_tuple().exponent for value in values),
+                default=0,
+            ),
+        )
+        return Decimal(1).scaleb(-places)
+
+    def _milp_minimize_and_pin(
+        self,
+        model: _IndependentMilpModel,
+        objective: Mapping[int, Fraction | int],
+    ) -> tuple[_IndependentMilpResult, Fraction | None]:
+        exact_objective = {
+            index: value if isinstance(value, Fraction) else Fraction(value)
+            for index, value in objective.items()
+            if value
+        }
+        if not exact_objective:
+            return (
+                _IndependentMilpResult(SolverStatus.OPTIMAL, None, True),
+                Fraction(),
+            )
+        result = self._milp_optimize(model, exact_objective)
+        if (
+            result.status is not SolverStatus.OPTIMAL
+            or not result.certificate_complete
+            or result.values is None
+        ):
+            return result, None
+        value = sum(
+            coefficient * result.values[index]
+            for index, coefficient in exact_objective.items()
+        )
+        model.add_row(exact_objective, lower=value, upper=value)
+        return result, value
+
+    def _independently_solve_milp(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+        solve_kind: SolveKind,
+        *,
+        named_supplier: str | None,
+        q_min: Decimal | None = None,
+        cheapest_covering_cost: Decimal | None = None,
+    ) -> IndependentSolve:
+        atom = self._milp_quantity_atom(requirement, offers)
+        increment_atoms = _ceil_units(
+            self._increment(requirement.component), atom
+        )
+        model = _IndependentMilpModel()
+        upper_atoms = tuple(
+            _floor_units(offer.upper_bound, atom) for offer in offers
+        )
+        x: list[int] = []
+        y: list[int] = []
+        z: list[tuple[int, ...]] = []
+        for offer_index, (offer, upper) in enumerate(
+            zip(offers, upper_atoms, strict=True)
+        ):
+            x_var = model.add_variable(f"x[{offer_index}]", 0, upper)
+            step_var = model.add_variable(
+                f"step[{offer_index}]", 0, upper // increment_atoms
+            )
+            y_var = model.add_variable(f"y[{offer_index}]", 0, 1)
+            z_vars = tuple(
+                model.add_variable(
+                    f"z[{offer_index},{bucket_index}]",
+                    0,
+                    upper
+                    if due in offer.allowed_buckets
+                    else 0,
+                )
+                for bucket_index, (due, _quantity) in enumerate(
+                    requirement.bucket_quantities
+                )
+            )
+            x.append(x_var)
+            y.append(y_var)
+            z.append(z_vars)
+            model.add_row(
+                {x_var: 1, step_var: -increment_atoms},
+                lower=0,
+                upper=0,
+            )
+            model.add_row(
+                {x_var: 1, **{variable: -1 for variable in z_vars}},
+                lower=0,
+                upper=0,
+            )
+            minimum = _ceil_units(
+                offer.catalog.minimum_order_quantity, atom
+            )
+            model.add_row({x_var: 1, y_var: -minimum}, lower=0)
+            model.add_row({x_var: 1, y_var: -upper}, upper=0)
+
+        by_supplier: dict[str, list[int]] = defaultdict(list)
+        for index, offer in enumerate(offers):
+            by_supplier[offer.supplier.supplier_id].append(index)
+        secondary = self._minimum_secondary(snapshot, requirement.component)
+        if secondary is not None:
+            if len(by_supplier) >= 2:
+                maximum_share = Fraction(Decimal("1") - secondary)
+                for indexes in by_supplier.values():
+                    coefficients = {
+                        variable: -maximum_share for variable in x
+                    }
+                    for index in indexes:
+                        coefficients[x[index]] = (
+                            coefficients.get(x[index], Fraction()) + 1
+                        )
+                    model.add_row(coefficients, upper=0)
+            else:
+                for indexes in by_supplier.values():
+                    model.add_row(
+                        {x[index]: 1 for index in indexes},
+                        lower=0,
+                        upper=0,
+                    )
+        if named_supplier is not None:
+            named_indexes = by_supplier.get(named_supplier, ())
+            for supplier_id, indexes in by_supplier.items():
+                if supplier_id == named_supplier:
+                    continue
+                coefficients = {x[index]: 1 for index in indexes}
+                for index in named_indexes:
+                    coefficients[x[index]] = (
+                        coefficients.get(x[index], 0) - 1
+                    )
+                model.add_row(coefficients, upper=0)
+
+        eventual_gap_atoms = _ceil_units(requirement.eventual_gap, atom)
+        eventual_gap = model.add_variable(
+            "eventual_gap", 0, eventual_gap_atoms
+        )
+        model.add_row(
+            {eventual_gap: 1, **{variable: 1 for variable in x}},
+            lower=eventual_gap_atoms,
+        )
+        unresolved: list[int] = []
+        for bucket_index, (due, _quantity) in enumerate(
+            requirement.bucket_quantities
+        ):
+            required = max(
+                ZERO,
+                requirement.cumulative_demand(due)
+                - requirement.on_time_supply(due),
+            )
+            required_atoms = _ceil_units(required, atom)
+            variable = model.add_variable(
+                f"unresolved[{bucket_index}]", 0, required_atoms
+            )
+            unresolved.append(variable)
+            coefficients: dict[int, Fraction | int] = {variable: 1}
+            for offer_index, offer in enumerate(offers):
+                if offer.material_available > due:
+                    continue
+                for allocated_index in range(bucket_index + 1):
+                    coefficients[z[offer_index][allocated_index]] = 1
+            model.add_row(coefficients, lower=required_atoms)
+
+        review_routes: dict[str, list[int]] = defaultdict(list)
+        for offer_index, offer in enumerate(offers):
+            for key in offer.review_keys:
+                review_routes[key].append(offer_index)
+        review_variables: list[int] = []
+        for review_index, (_key, indexes) in enumerate(
+            sorted(review_routes.items())
+        ):
+            variable = model.add_variable(
+                f"review[{review_index}]", 0, 1
+            )
+            review_variables.append(variable)
+            for index in indexes:
+                model.add_row({variable: 1, y[index]: -1}, lower=0)
+            model.add_row(
+                {variable: 1, **{y[index]: -1 for index in indexes}},
+                upper=0,
+            )
+
+        moq_excess = model.add_variable(
+            "moq_excess", 0, sum(upper_atoms)
+        )
+        model.add_row(
+            {moq_excess: 1, **{variable: -1 for variable in x}},
+            lower=-eventual_gap_atoms,
+        )
+
+        if solve_kind is SolveKind.EXECUTABLE:
+            if q_min is None or cheapest_covering_cost is None:
+                return IndependentSolve(
+                    SolverStatus.ERROR, (), certificate_complete=False
+                )
+            q_min_atoms = _ceil_units(q_min, atom)
+            model.add_row(
+                {variable: 1 for variable in x}, lower=q_min_atoms
+            )
+            surplus_cap = (
+                self.autonomy.max_surplus_fraction
+                * requirement.eventual_gap
+            )
+            if self.autonomy.max_surplus_units is not None:
+                surplus_cap = min(
+                    surplus_cap, self.autonomy.max_surplus_units
+                )
+            model.add_row(
+                {variable: 1 for variable in x},
+                upper=Fraction(q_min + surplus_cap) / Fraction(atom),
+            )
+            cost_coefficients = {
+                x[index]: Fraction(offer.catalog.unit_price * atom)
+                for index, offer in enumerate(offers)
+            }
+            model.add_row(
+                cost_coefficients,
+                upper=Fraction(
+                    cheapest_covering_cost
+                    + self.autonomy.max_excess_cost_usd
+                ),
+            )
+
+        last_values: tuple[int, ...] | None = None
+
+        def minimize(
+            coefficients: Mapping[int, Fraction | int],
+        ) -> Fraction | None:
+            nonlocal last_values
+            result, value = self._milp_minimize_and_pin(
+                model, coefficients
+            )
+            if result.values is not None:
+                last_values = result.values
+            if (
+                result.status is not SolverStatus.OPTIMAL
+                or not result.certificate_complete
+            ):
+                raise _IndependentSolveInterrupted(result.status)
+            return value
+
+        try:
+            if solve_kind is SolveKind.QUANTITY_CALIBRATION:
+                uncovered = minimize({eventual_gap: 1})
+                total = minimize({variable: 1 for variable in x})
+                assert uncovered is not None and total is not None
+                if last_values is None:
+                    final = self._milp_optimize(model, {})
+                    if final.values is None:
+                        return IndependentSolve(
+                            final.status, (), certificate_complete=False
+                        )
+                    last_values = final.values
+                total_quantity = _decimal(total * Fraction(atom))
+                return IndependentSolve(
+                    SolverStatus.OPTIMAL,
+                    (
+                        _decimal(uncovered * Fraction(atom)),
+                        total_quantity,
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                offers[index].supplier.supplier_id,
+                                Decimal(last_values[x[index]]) * atom,
+                            )
+                            for index in range(len(offers))
+                            if last_values[x[index]] > 0
+                        )
+                    ),
+                    minimum_compliant_total=total_quantity,
+                )
+            if solve_kind is SolveKind.BASELINE:
+                uncovered = minimize({eventual_gap: 1})
+                cost = minimize(
+                    {
+                        x[index]: Fraction(
+                            offer.catalog.unit_price * atom
+                        )
+                        for index, offer in enumerate(offers)
+                    }
+                )
+                assert uncovered is not None and cost is not None
+                if last_values is None:
+                    final = self._milp_optimize(model, {})
+                    if final.values is None:
+                        return IndependentSolve(
+                            final.status, (), certificate_complete=False
+                        )
+                    last_values = final.values
+                exact_cost = _decimal(cost)
+                return IndependentSolve(
+                    SolverStatus.OPTIMAL,
+                    (
+                        _decimal(uncovered * Fraction(atom)),
+                        exact_cost,
+                    ),
+                    tuple(
+                        sorted(
+                            (
+                                offers[index].supplier.supplier_id,
+                                Decimal(last_values[x[index]]) * atom,
+                            )
+                            for index in range(len(offers))
+                            if last_values[x[index]] > 0
+                        )
+                    ),
+                    cheapest_covering_cost=exact_cost,
+                )
+
+            assert q_min is not None and cheapest_covering_cost is not None
+            objective: list[Decimal] = []
+            for variable in unresolved:
+                value = minimize({variable: 1})
+                assert value is not None
+                objective.append(_decimal(value * Fraction(atom)))
+            late = minimize(
+                {
+                    z[offer_index][bucket_index]: max(
+                        0,
+                        (
+                            offer.material_available
+                            - requirement.bucket_quantities[bucket_index][0]
+                        ).days,
+                    )
+                    for offer_index, offer in enumerate(offers)
+                    for bucket_index in range(
+                        len(requirement.bucket_quantities)
+                    )
+                }
+            )
+            assert late is not None
+            objective.append(_decimal(late * Fraction(atom)))
+            total = minimize({variable: 1 for variable in x})
+            assert total is not None
+            objective.append(
+                _decimal(total * Fraction(atom)) - q_min
+            )
+            review = minimize({variable: 1 for variable in review_variables})
+            assert review is not None
+            objective.append(_decimal(review))
+            objective.append(ZERO)
+
+            international = minimize(
+                {
+                    z[offer_index][bucket_index]: 1
+                    for offer_index, offer in enumerate(offers)
+                    for bucket_index, (due, _quantity) in enumerate(
+                        requirement.bucket_quantities
+                    )
+                    if offer.international
+                    and offer.condition_for(due) != "b"
+                }
+            )
+            assert international is not None
+            objective.append(
+                _decimal(international * Fraction(atom))
+            )
+
+            strategic_coefficients: dict[int, Fraction | int] = {}
+            sustainability_coefficients: dict[int, Fraction | int] = {}
+            for offer_index, offer in enumerate(offers):
+                current_rating = _rating(
+                    offer.supplier.sustainability_rating
+                )
+                for bucket_index, (due, _quantity) in enumerate(
+                    requirement.bucket_quantities
+                ):
+                    if due not in offer.allowed_buckets:
+                        continue
+                    if (
+                        self._concept("strategic_supplier", offer.supplier)
+                        is EvidenceStatus.FAIL
+                    ):
+                        strategic = tuple(
+                            item
+                            for item in offers
+                            if due in item.allowed_buckets
+                            and self._concept(
+                                "strategic_supplier", item.supplier
+                            )
+                            is EvidenceStatus.PASS
+                        )
+                        if strategic:
+                            best = min(
+                                strategic,
+                                key=lambda item: item.catalog.unit_price,
+                            )
+                            savings = (
+                                ZERO
+                                if best.catalog.unit_price == ZERO
+                                else (
+                                    best.catalog.unit_price
+                                    - offer.catalog.unit_price
+                                )
+                                / best.catalog.unit_price
+                            )
+                            if savings <= Decimal("0.15"):
+                                strategic_coefficients[
+                                    z[offer_index][bucket_index]
+                                ] = 1
+                    if current_rating is None:
+                        continue
+                    comparable = tuple(
+                        item
+                        for item in offers
+                        if due in item.allowed_buckets
+                        and _rating(item.supplier.sustainability_rating)
+                        is not None
+                        and _rating(item.supplier.sustainability_rating)
+                        > current_rating
+                        and (
+                            item.catalog.unit_price
+                            == offer.catalog.unit_price
+                            if min(
+                                item.catalog.unit_price,
+                                offer.catalog.unit_price,
+                            )
+                            == ZERO
+                            else abs(
+                                item.catalog.unit_price
+                                - offer.catalog.unit_price
+                            )
+                            / min(
+                                item.catalog.unit_price,
+                                offer.catalog.unit_price,
+                            )
+                            <= Decimal("0.10")
+                        )
+                        and _business_days(
+                            item.material_available,
+                            offer.material_available,
+                        )
+                        <= 5
+                    )
+                    if comparable:
+                        best_rating = max(
+                            _rating(
+                                item.supplier.sustainability_rating
+                            )
+                            for item in comparable
+                        )
+                        assert best_rating is not None
+                        sustainability_coefficients[
+                            z[offer_index][bucket_index]
+                        ] = Fraction(best_rating - current_rating)
+            strategic = minimize(strategic_coefficients)
+            sustainable = minimize(sustainability_coefficients)
+            assert strategic is not None and sustainable is not None
+            objective.extend(
+                (
+                    _decimal(strategic * Fraction(atom)),
+                    _decimal(sustainable * Fraction(atom)),
+                )
+            )
+            cost = minimize(
+                {
+                    x[index]: Fraction(offer.catalog.unit_price * atom)
+                    for index, offer in enumerate(offers)
+                }
+            )
+            excess = minimize({moq_excess: 1})
+            lead = minimize(
+                {
+                    x[index]: offer.lead_days
+                    for index, offer in enumerate(offers)
+                }
+            )
+            line_count = minimize({variable: 1 for variable in y})
+            assert cost is not None
+            assert excess is not None
+            assert lead is not None
+            assert line_count is not None
+            objective.extend(
+                (
+                    _decimal(cost),
+                    _decimal(excess * Fraction(atom)),
+                    _decimal(lead * Fraction(atom)),
+                    _decimal(line_count),
+                )
+            )
+
+            if last_values is None:
+                final = self._milp_optimize(model, {})
+                if final.values is None:
+                    return IndependentSolve(
+                        final.status, (), certificate_complete=False
+                    )
+                last_values = final.values
+            selected_count = sum(last_values[variable] for variable in y)
+            first_unfixed = 0
+            for _position in range(selected_count):
+                membership = {
+                    y[index]: -(1 << (len(offers) - index))
+                    for index in range(first_unfixed, len(offers))
+                }
+                result = self._milp_optimize(
+                    model,
+                    {
+                        index: Fraction(value)
+                        for index, value in membership.items()
+                    },
+                )
+                if (
+                    result.status is not SolverStatus.OPTIMAL
+                    or not result.certificate_complete
+                    or result.values is None
+                ):
+                    raise _IndependentSolveInterrupted(result.status)
+                chosen = next(
+                    (
+                        index
+                        for index in range(first_unfixed, len(offers))
+                        if result.values[y[index]] == 1
+                    ),
+                    None,
+                )
+                if chosen is None:
+                    raise _IndependentSolveInterrupted(SolverStatus.ERROR)
+                for index in range(first_unfixed, chosen):
+                    model.add_row({y[index]: 1}, lower=0, upper=0)
+                model.add_row({y[chosen]: 1}, lower=1, upper=1)
+                quantity_result, _quantity = self._milp_minimize_and_pin(
+                    model, {x[chosen]: 1}
+                )
+                if (
+                    quantity_result.status is not SolverStatus.OPTIMAL
+                    or not quantity_result.certificate_complete
+                    or quantity_result.values is None
+                ):
+                    raise _IndependentSolveInterrupted(
+                        quantity_result.status
+                    )
+                last_values = quantity_result.values
+                first_unfixed = chosen + 1
+            return IndependentSolve(
+                SolverStatus.OPTIMAL,
+                tuple(objective),
+                tuple(
+                    sorted(
+                        (
+                            offers[index].supplier.supplier_id,
+                            Decimal(last_values[x[index]]) * atom,
+                        )
+                        for index in range(len(offers))
+                        if last_values[x[index]] > 0
+                    )
+                ),
+                minimum_compliant_total=q_min,
+                cheapest_covering_cost=cheapest_covering_cost,
+            )
+        except _IndependentSolveInterrupted as interrupted:
+            return IndependentSolve(
+                interrupted.status, (), certificate_complete=False
+            )
+
     def independently_solve(
+        self,
+        snapshot: ScenarioSnapshot,
+        decision: DecisionRecord,
+        solve_kind: SolveKind,
+    ) -> IndependentSolve:
+        sink = _IssueSink([])
+        requirement = self._source_requirements(snapshot, sink).get(
+            decision.component_id
+        )
+        if requirement is None:
+            return IndependentSolve(
+                SolverStatus.ERROR, (), certificate_complete=False
+            )
+        offers = self._offers(
+            snapshot, requirement, decision.evidence_contract
+        )
+        secondary = self._minimum_secondary(snapshot, requirement.component)
+        increment = self._enumeration_increment(
+            requirement, offers, secondary
+        )
+        catalogs = tuple(item.catalog for item in offers)
+        derived = self.derive_upper_bounds(
+            snapshot, requirement, catalogs
+        )
+        group_bound = (
+            max(
+                [requirement.eventual_gap]
+                + list(derived.values())
+                + [
+                    sum(
+                        (
+                            item.minimum_order_quantity
+                            for item in catalogs
+                        ),
+                        ZERO,
+                    )
+                ]
+            )
+            if offers
+            else ZERO
+        )
+        maximum_units = _floor_units(group_bound, increment)
+        use_enumeration = (
+            self.solver_limits.force_status is None
+            and maximum_units <= self.tiny_case_unit_limit
+            and len(offers) <= 3
+            and len(requirement.bucket_quantities) <= 3
+        )
+        if use_enumeration:
+            return self._independently_enumerate(
+                snapshot, decision, solve_kind
+            )
+
+        named_check = self._named_primary(
+            snapshot, requirement.component
+        )
+        named_supplier = None
+        if (
+            solve_kind
+            in {SolveKind.QUANTITY_CALIBRATION, SolveKind.EXECUTABLE}
+            and named_check is not None
+            and named_check.resolved
+            and named_check.supplier_id
+            not in self.capacity_confirmed_supplier_ids
+        ):
+            named_supplier = named_check.supplier_id
+        if solve_kind is not SolveKind.EXECUTABLE:
+            return self._independently_solve_milp(
+                snapshot,
+                requirement,
+                offers,
+                solve_kind,
+                named_supplier=named_supplier,
+            )
+        q_result = self.independently_solve(
+            snapshot, decision, SolveKind.QUANTITY_CALIBRATION
+        )
+        baseline = self.independently_solve(
+            snapshot, decision, SolveKind.BASELINE
+        )
+        if (
+            q_result.status is not SolverStatus.OPTIMAL
+            or baseline.status is not SolverStatus.OPTIMAL
+            or not q_result.certificate_complete
+            or not baseline.certificate_complete
+            or q_result.minimum_compliant_total is None
+            or baseline.cheapest_covering_cost is None
+        ):
+            status = (
+                q_result.status
+                if q_result.status is not SolverStatus.OPTIMAL
+                else baseline.status
+            )
+            return IndependentSolve(
+                status, (), certificate_complete=False
+            )
+        return self._independently_solve_milp(
+            snapshot,
+            requirement,
+            offers,
+            solve_kind,
+            named_supplier=named_supplier,
+            q_min=q_result.minimum_compliant_total,
+            cheapest_covering_cost=baseline.cheapest_covering_cost,
+        )
+
+    def _independently_enumerate(
         self,
         snapshot: ScenarioSnapshot,
         decision: DecisionRecord,
@@ -1884,7 +2796,6 @@ class IndependentPlanValidator:
             if (rating := _rating(item.supplier.sustainability_rating)) is not None
             and rating >= boundary
         )
-        increment = self._increment(requirement.component)
         secondary = self._minimum_secondary(snapshot, requirement.component)
         catalogs = tuple(item.catalog for item in offers)
         derived = self.derive_upper_bounds(snapshot, requirement, catalogs)
@@ -1902,6 +2813,35 @@ class IndependentPlanValidator:
             if offers
             else ZERO
         )
+        enumeration_increment = self._enumeration_increment(
+            requirement, offers, secondary
+        )
+        maximum_units = _floor_units(group_bound, enumeration_increment)
+        if (
+            self.solver_limits.force_status is not None
+            or maximum_units > self.tiny_case_unit_limit
+            or len(offers) > 3
+            or len(requirement.bucket_quantities) > 3
+        ):
+            result = self._independently_solve_milp(
+                snapshot,
+                requirement,
+                offers,
+                SolveKind.QUANTITY_CALIBRATION,
+                named_supplier=None,
+            )
+            if (
+                result.status is not SolverStatus.OPTIMAL
+                or not result.certificate_complete
+            ):
+                return result
+            if result.objective_vector[0] == ZERO:
+                return result
+            return IndependentSolve(
+                SolverStatus.INFEASIBLE,
+                (result.objective_vector[0],),
+            )
+        increment = self._increment(requirement.component)
         maximum_units = _floor_units(group_bound, increment)
         nodes = [0]
         for total_units in range(1, maximum_units + 1):
@@ -2275,6 +3215,17 @@ class IndependentPlanValidator:
                 sink.error("UNLICENSED_INFEASIBILITY", "Approval- or evidence-blocked requirements are UNRESOLVED, never INFEASIBLE.", component_id=decision.component_id)
                 verified = False
             own_feasibility = self.independently_solve(snapshot, decision, SolveKind.QUANTITY_CALIBRATION)
+            if (
+                own_feasibility.status
+                not in {SolverStatus.OPTIMAL, SolverStatus.INFEASIBLE}
+                or not own_feasibility.certificate_complete
+            ):
+                sink.error(
+                    "INDEPENDENT_SOLVE_UNPROVEN",
+                    "Validator could not complete the independent infeasibility solve.",
+                    component_id=decision.component_id,
+                )
+                return False
             independently_infeasible = (
                 own_feasibility.status is SolverStatus.INFEASIBLE
                 or (
@@ -2305,31 +3256,55 @@ class IndependentPlanValidator:
             q_own = self.independently_solve(snapshot, decision, SolveKind.QUANTITY_CALIBRATION)
             baseline_own = self.independently_solve(snapshot, decision, SolveKind.BASELINE)
             executable_own = self.independently_solve(snapshot, decision, SolveKind.EXECUTABLE)
+            independently_proven: dict[SolveKind, bool] = {}
             for name, claim, own in (
                 ("solve Q", q_claim, q_own),
                 ("solve 0", baseline_claim, baseline_own),
                 ("solve 1", executable_claim, executable_own),
             ):
-                if own.status is not SolverStatus.OPTIMAL or not own.certificate_complete:
-                    sink.error("INDEPENDENT_SOLVE_UNPROVEN", f"Validator could not complete independent {name} enumeration.", component_id=decision.component_id)
+                proven = (
+                    own.status is SolverStatus.OPTIMAL
+                    and own.certificate_complete
+                )
+                independently_proven[claim.solve_kind] = proven
+                if not proven:
+                    sink.error("INDEPENDENT_SOLVE_UNPROVEN", f"Validator could not complete independent {name} solve.", component_id=decision.component_id)
                     verified = False
                 elif claim.objective_vector != own.objective_vector:
                     sink.error("SOLVER_OBJECTIVE_DISAGREEMENT", f"Planner and independent {name} objective vectors disagree.", component_id=decision.component_id)
                     verified = False
-            if q_own.minimum_compliant_total != selected.minimum_compliant_total or q_claim.minimum_compliant_total != q_own.minimum_compliant_total:
+            if independently_proven.get(SolveKind.QUANTITY_CALIBRATION) and (
+                q_own.minimum_compliant_total
+                != selected.minimum_compliant_total
+                or q_claim.minimum_compliant_total
+                != q_own.minimum_compliant_total
+            ):
                 sink.error("CALIBRATION_MISMATCH", "Persisted minimum_compliant_total differs from independent solve Q.", component_id=decision.component_id, plan_id=selected.plan_id)
                 verified = False
-            if baseline_own.cheapest_covering_cost != selected.cheapest_covering_cost or baseline_claim.cheapest_covering_cost != baseline_own.cheapest_covering_cost:
+            if independently_proven.get(SolveKind.BASELINE) and (
+                baseline_own.cheapest_covering_cost
+                != selected.cheapest_covering_cost
+                or baseline_claim.cheapest_covering_cost
+                != baseline_own.cheapest_covering_cost
+            ):
                 sink.error("BASELINE_COST_MISMATCH", "Persisted cheapest_covering_cost differs from independent solve 0.", component_id=decision.component_id, plan_id=selected.plan_id)
                 verified = False
-            if selected.cheapest_covering_cost is not None and selected.total_cost - selected.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
+            if (
+                independently_proven.get(SolveKind.BASELINE)
+                and selected.cheapest_covering_cost is not None
+                and selected.total_cost - selected.cheapest_covering_cost
+                > self.autonomy.max_excess_cost_usd
+            ):
                 sink.error("AUTONOMY_COST_EXCEEDED", "Executable plan exceeds the excess-cost autonomy bound.", component_id=decision.component_id, plan_id=selected.plan_id)
                 verified = False
             exact = self._objective(snapshot, requirement, selected, self._offers(snapshot, requirement, decision.evidence_contract))
             if executable_claim.candidate_plan is None or executable_claim.candidate_plan.plan_id != selected.plan_id:
                 sink.error("EXECUTABLE_PLAN_MISMATCH", "Solve-1 selected candidate differs from the decision selected plan.", component_id=decision.component_id)
                 verified = False
-            if executable_claim.objective_vector != exact or executable_own.objective_vector != exact:
+            if independently_proven.get(SolveKind.EXECUTABLE) and (
+                executable_claim.objective_vector != exact
+                or executable_own.objective_vector != exact
+            ):
                 sink.error("SUBOPTIMAL_INCUMBENT", "Selected feasible plan is not the independently reproduced lexicographic optimum.", component_id=decision.component_id, plan_id=selected.plan_id)
                 verified = False
         else:
@@ -2486,6 +3461,7 @@ __all__ = [
     "EconomicAutonomy",
     "IndependentPlanValidator",
     "IndependentSolve",
+    "IndependentSolverLimits",
     "NamedEntityCheck",
     "NamedEntityOutcome",
     "PlanValidator",
