@@ -450,6 +450,8 @@ class _Objective:
     name: str
     coefficients: tuple[Fraction, ...]
     divisor: Fraction = Fraction(1)
+    emitted: bool = True
+    semantic_tie_break: bool = False
 
     def integer_coefficients(self) -> tuple[tuple[int, ...], int]:
         denominator = 1
@@ -472,7 +474,9 @@ class _ModelContext:
     unresolved: tuple[int, ...]
     eventual_gap: int
     discretionary: int
+    review_exposure: tuple[int, ...]
     named_deviation: int
+    moq_excess: int
     upper_atoms: tuple[int, ...]
     exception_caps: tuple[tuple[str, int], ...]
     emitted_rule_ids: tuple[str, ...]
@@ -643,13 +647,6 @@ def _existing_exception_shortage(
     return result
 
 
-def _trace(route: CandidateRoute, comparator: str) -> str | None:
-    return next(
-        (item.outcome for item in route.comparator_trace if item.comparator == comparator),
-        None,
-    )
-
-
 def _rating(value: str | None) -> Fraction | None:
     if value is None:
         return None
@@ -669,12 +666,21 @@ def _business_days(left: date, right: date) -> int:
     return sum(1 for ordinal in range(start.toordinal() + 1, end.toordinal() + 1) if date.fromordinal(ordinal).weekday() < 5)
 
 
-def _review_count(route: CandidateRoute) -> int:
-    return sum(
-        1
-        for item in route.evidence
-        if item.status is EvidenceStatus.UNKNOWN
-        and item.contract_disposition is not None
+def _review_keys(route: CandidateRoute) -> frozenset[str]:
+    """Return normalized review exposures carried by a selected route.
+
+    Assumption codes are the public, de-duplicated representation of benchmark
+    evidence and approval exposure.  Counting evidence or approval-rule rows
+    instead double-charges one normalized assumption when several policy
+    branches depend on the same unknown fact.
+    """
+
+    return frozenset(
+        tuple(
+            code
+            for item in route.evidence
+            for code in item.assumption_codes
+        )
     )
 
 
@@ -757,6 +763,26 @@ def _build_model(
                     name=f"exception_scope[{route_index},{bucket_index}]",
                 )
 
+    review_routes: dict[str, list[int]] = defaultdict(list)
+    for route_index, route in enumerate(routes):
+        for key in _review_keys(route):
+            review_routes[key].append(route_index)
+    review_exposure: list[int] = []
+    for review_index, (key, route_indexes) in enumerate(sorted(review_routes.items())):
+        review_var = model.add_var(f"review_exposure[{review_index}]", 0, 1)
+        review_exposure.append(review_var)
+        for route_index in route_indexes:
+            model.add_row(
+                {review_var: 1, y[route_index]: -1},
+                lower=0,
+                name=f"review_exposure_lower[{review_index},{route_index}]",
+            )
+        model.add_row(
+            {review_var: 1, **{y[index]: -1 for index in route_indexes}},
+            upper=0,
+            name=f"review_exposure_upper[{review_index}]",
+        )
+
     unresolved = tuple(
         model.add_var(f"unresolved[{index}]", 0, demand_atoms)
         for index in range(len(buckets))
@@ -768,6 +794,7 @@ def _build_model(
     )
     discretionary = model.add_var("discretionary_surplus", 0, total_upper)
     named_deviation = model.add_var("named_primary_deviation", 0, total_upper)
+    moq_excess = model.add_var("moq_excess", 0, total_upper)
 
     positions = {item.due_date: item for item in problem.supply_ledger.deadline_positions}
     for bucket_index, bucket in enumerate(buckets):
@@ -923,6 +950,11 @@ def _build_model(
         lower=-q_min_atoms,
         name="discretionary_surplus_definition",
     )
+    model.add_row(
+        {moq_excess: 1, **{item: -1 for item in x}},
+        lower=-net_atoms,
+        name="moq_excess_definition",
+    )
 
     named_active = (
         problem.named_primary_supplier_id is not None
@@ -984,7 +1016,9 @@ def _build_model(
         unresolved=unresolved,
         eventual_gap=eventual_gap,
         discretionary=discretionary,
+        review_exposure=tuple(review_exposure),
         named_deviation=named_deviation,
+        moq_excess=moq_excess,
         upper_atoms=upper_atoms,
         exception_caps=tuple(exception_caps),
         emitted_rule_ids=tuple(sorted(emitted)),
@@ -1034,6 +1068,68 @@ def _sustainability_coefficients(context: _ModelContext) -> dict[int, Fraction]:
     return result
 
 
+def _international_coefficients(context: _ModelContext) -> dict[int, Fraction]:
+    """Return the §3(a)/(c) route/bucket volume coefficients.
+
+    Candidate construction emits a separate exception-scoped route for each
+    domestic-gate condition.  Using ``z`` still matters: it keeps the policy
+    coefficient at the documented route/bucket level and cannot charge volume
+    assigned to a bucket outside that exception scope.
+    """
+
+    return {
+        context.z[route_index][bucket_index]: Fraction(1)
+        for route_index, route in enumerate(context.routes)
+        if any(code.endswith(("condition_a", "condition_c")) for code in route.exception_codes)
+        for bucket_index, bucket in enumerate(context.buckets)
+        if bucket.due_date in route.feasible_deadlines
+    }
+
+
+def _strategic_coefficients(context: _ModelContext) -> dict[int, Fraction]:
+    """Recompute the inclusive 15% Strategic-retention window exactly."""
+
+    suppliers = {item.supplier_id: item for item in context.problem.suppliers}
+
+    def strategic(route: CandidateRoute) -> bool:
+        tier = suppliers[route.supplier_id].relationship_tier
+        return isinstance(tier, str) and " ".join(tier.split()).casefold() == "strategic"
+
+    def can_serve(route: CandidateRoute, bucket: DemandBucket) -> bool:
+        return not route.exception_codes or bucket.due_date in route.feasible_deadlines
+
+    result: dict[int, Fraction] = {}
+    for route_index, route in enumerate(context.routes):
+        if strategic(route):
+            continue
+        for bucket_index, bucket in enumerate(context.buckets):
+            if not can_serve(route, bucket):
+                continue
+            alternatives = tuple(
+                item
+                for item in context.routes
+                if strategic(item) and can_serve(item, bucket)
+            )
+            if not alternatives:
+                continue
+            best = min(
+                alternatives,
+                key=lambda item: (
+                    item.unit_price,
+                    item.supplier_fingerprint,
+                    item.route_fingerprint,
+                ),
+            )
+            savings = (
+                ZERO
+                if best.unit_price == ZERO
+                else (best.unit_price - route.unit_price) / best.unit_price
+            )
+            if savings <= Decimal("0.15"):
+                result[context.z[route_index][bucket_index]] = Fraction(1)
+    return result
+
+
 def _objectives(context: _ModelContext) -> tuple[tuple[_Objective, ...], ...]:
     """Return stages; a stage may contain ordered sub-objectives."""
 
@@ -1070,25 +1166,6 @@ def _objectives(context: _ModelContext) -> tuple[tuple[_Objective, ...], ...]:
         for route_index, route in enumerate(context.routes)
         for bucket_index, bucket in enumerate(context.buckets)
     }
-    review = {
-        context.y[index]: _review_count(route)
-        for index, route in enumerate(context.routes)
-    }
-    international = {
-        context.x[index]: 1
-        for index, route in enumerate(context.routes)
-        if any(
-            code.endswith(("condition_a", "condition_c"))
-            for code in route.exception_codes
-        )
-    }
-    strategic: dict[int, int] = {}
-    for route_index, route in enumerate(context.routes):
-        outcome = _trace(route, "strategic_retention") or ""
-        dates = set(outcome.removeprefix("penalty:").split(",")) if outcome.startswith("penalty:") else set()
-        for bucket_index, bucket in enumerate(context.buckets):
-            if bucket.due_date.isoformat() in dates:
-                strategic[context.z[route_index][bucket_index]] = 1
     cost = {
         context.x[index]: _fraction(route.unit_price * context.quantity_atom)
         for index, route in enumerate(context.routes)
@@ -1097,38 +1174,32 @@ def _objectives(context: _ModelContext) -> tuple[tuple[_Objective, ...], ...]:
         context.x[index]: route.lead_time_days
         for index, route in enumerate(context.routes)
     }
-    fingerprint_order = {
-        route.route_id: rank
-        for rank, route in enumerate(
-            sorted(
-                context.routes,
-                key=lambda item: (item.supplier_fingerprint, item.route_fingerprint),
-            ),
-            start=1,
-        )
-    }
-    fingerprint = {
-        context.x[index]: fingerprint_order[route.route_id]
-        for index, route in enumerate(context.routes)
-    }
-    total = {item: 1 for item in context.x}
     return (
         stage1 or (_Objective("stage_01_unresolved", zero),),
         (_Objective("stage_02_unit_late_days", _coefficients(context, late), _fraction(context.quantity_atom)),),
         (_Objective("stage_03_discretionary_surplus", _coefficients(context, {context.discretionary: 1}), _fraction(context.quantity_atom)),),
-        (_Objective("stage_04_policy_review_exposure", _coefficients(context, review)),),
+        (_Objective("stage_04_policy_review_exposure", _coefficients(context, {item: 1 for item in context.review_exposure})),),
         (_Objective("stage_05_named_primary_deviation", _coefficients(context, {context.named_deviation: 1}), _fraction(context.quantity_atom)),),
-        (_Objective("stage_06_international_volume", _coefficients(context, international), _fraction(context.quantity_atom)),),
-        (_Objective("stage_07_strategic_shift", _coefficients(context, strategic), _fraction(context.quantity_atom)),),
+        (_Objective("stage_06_international_volume", _coefficients(context, _international_coefficients(context)), _fraction(context.quantity_atom)),),
+        (_Objective("stage_07_strategic_shift", _coefficients(context, _strategic_coefficients(context)), _fraction(context.quantity_atom)),),
         (_Objective("stage_08_sustainability_band", _coefficients(context, _sustainability_coefficients(context)), _fraction(context.quantity_atom)),),
         (
             _Objective("stage_09_known_landed_cost", _coefficients(context, cost)),
-            _Objective("stage_09_moq_excess", _coefficients(context, total), _fraction(context.quantity_atom)),
+            _Objective("stage_09_moq_excess", _coefficients(context, {context.moq_excess: 1}), _fraction(context.quantity_atom)),
         ),
         (
             _Objective("stage_10_total_lead_time", _coefficients(context, total_lead), _fraction(context.quantity_atom)),
             _Objective("stage_10_line_count", _coefficients(context, {item: 1 for item in context.y})),
-            _Objective("stage_10_id_free_tie", _coefficients(context, fingerprint), _fraction(context.quantity_atom)),
+            # The final key is a sorted tuple, not a rank-times-quantity
+            # surrogate.  It is solved specially by IntegerScaledSolver and
+            # intentionally is not flattened into CandidatePlan's Decimal
+            # metric vector.
+            _Objective(
+                "stage_10_id_free_tie",
+                zero,
+                emitted=False,
+                semantic_tie_break=True,
+            ),
         ),
     )
 
@@ -1144,6 +1215,43 @@ def _pin_objective(model: _IntegerModel, coefficients: Sequence[int], value: int
         upper=value,
         name=f"pin[{name}]",
     )
+
+
+def _semantic_tie_value(context: _ModelContext, values: Sequence[int]) -> int:
+    """Encode the selected ID-free tuple into an order-preserving integer.
+
+    The encoding is only a compact certificate value.  Selection itself is
+    performed tuple element by tuple element, so it does not rely on hashes or
+    database identifiers.  Line count is pinned before this key is reached;
+    consequently all compared keys have the same number of tuple elements.
+    """
+
+    pairs = tuple(
+        sorted(
+            {
+                (route.supplier_fingerprint, route.route_fingerprint)
+                for route in context.routes
+            }
+        )
+    )
+    ranks = {pair: rank for rank, pair in enumerate(pairs, start=1)}
+    base = max((*context.upper_atoms, len(pairs)), default=0) + 1
+    encoded = 0
+    selected = sorted(
+        (
+            route.supplier_fingerprint,
+            route.route_fingerprint,
+            values[context.x[route_index]],
+        )
+        for route_index, route in enumerate(context.routes)
+        if values[context.x[route_index]] > 0
+    )
+    for supplier_hash, route_hash, quantity in selected:
+        encoded = encoded * base + ranks[
+            (supplier_hash, route_hash)
+        ]
+        encoded = encoded * base + quantity
+    return encoded
 
 
 def _validate_integer_solution(model: _IntegerModel, values: Sequence[int]) -> tuple[bool, str | None]:
@@ -1459,6 +1567,127 @@ class IntegerScaledSolver:
         self.upper_bound_multiplier = upper_bound_multiplier
         self.last_context: _ModelContext | None = None
 
+    def _run_backend(
+        self,
+        model: _IntegerModel,
+        objective: Sequence[int],
+    ) -> _BackendResult:
+        result = self.backend.optimize(model, objective, self.limits)
+        if (
+            result.status is SolverStatus.ERROR
+            and result.message
+            and result.message.startswith("SciPy/HiGHS unavailable")
+        ):
+            result = self.fallback.optimize(model, objective, self.limits)
+        if result.values is not None:
+            valid, validation_message = _validate_integer_solution(model, result.values)
+            if not valid:
+                result = replace(
+                    result,
+                    status=SolverStatus.ERROR,
+                    values=None,
+                    objective_integer=None,
+                    certificate_complete=False,
+                    message=f"exact incumbent validation failed: {validation_message}",
+                )
+        return result
+
+    def _solve_semantic_tie(
+        self,
+        context: _ModelContext,
+        values: tuple[int, ...],
+    ) -> _BackendResult:
+        """Certify the sorted semantic line tuple without an ID-based proxy."""
+
+        model = context.model
+        line_count = sum(values[index] for index in context.y)
+        current = values
+        first_unfixed = 0
+        route_count = len(context.routes)
+        for position in range(line_count):
+            # With line count pinned, binary place values find the earliest
+            # semantic route that can occupy this tuple position.  Only that
+            # membership is pinned before quantity is minimized, preserving
+            # the documented (fingerprint, fingerprint, quantity) ordering.
+            membership = [0] * len(model.names)
+            for route_index in range(first_unfixed, route_count):
+                membership[context.y[route_index]] = -(1 << (route_count - route_index))
+            result = self._run_backend(model, membership)
+            if not (
+                result.status is SolverStatus.OPTIMAL
+                and result.certificate_complete
+                and not result.hit_resource_limit
+                and result.mip_gap == ZERO
+                and result.values is not None
+            ):
+                return result
+            chosen = next(
+                (
+                    route_index
+                    for route_index in range(first_unfixed, route_count)
+                    if result.values[context.y[route_index]] == 1
+                ),
+                None,
+            )
+            if chosen is None:
+                return _BackendResult(
+                    SolverStatus.ERROR,
+                    None,
+                    None,
+                    None,
+                    False,
+                    False,
+                    f"semantic tie position {position} had no selected route",
+                )
+            for route_index in range(first_unfixed, chosen):
+                _pin_objective(
+                    model,
+                    tuple(
+                        1 if index == context.y[route_index] else 0
+                        for index in range(len(model.names))
+                    ),
+                    0,
+                    f"stage_10_tie_absent_{position}_{route_index}",
+                )
+            _pin_objective(
+                model,
+                tuple(
+                    1 if index == context.y[chosen] else 0
+                    for index in range(len(model.names))
+                ),
+                1,
+                f"stage_10_tie_route_{position}",
+            )
+            quantity_objective = [0] * len(model.names)
+            quantity_objective[context.x[chosen]] = 1
+            result = self._run_backend(model, quantity_objective)
+            if not (
+                result.status is SolverStatus.OPTIMAL
+                and result.certificate_complete
+                and not result.hit_resource_limit
+                and result.mip_gap == ZERO
+                and result.values is not None
+            ):
+                return result
+            quantity = result.values[context.x[chosen]]
+            _pin_objective(
+                model,
+                tuple(quantity_objective),
+                quantity,
+                f"stage_10_tie_quantity_{position}",
+            )
+            current = result.values
+            first_unfixed = chosen + 1
+        return _BackendResult(
+            SolverStatus.OPTIMAL,
+            current,
+            _semantic_tie_value(context, current),
+            ZERO,
+            True,
+            False,
+            "ID-free semantic tuple tie-break certified",
+        )
+
     def solve(self, problem: OptimizerProblem, /) -> SolverResult:
         if not isinstance(problem, OptimizerProblem):
             raise TypeError("problem must be OptimizerProblem")
@@ -1475,22 +1704,14 @@ class IntegerScaledSolver:
 
         for stage_index, subobjectives in enumerate(objectives, start=1):
             stage_values: list[Decimal] = []
+            emitted_stage_values: list[Decimal] = []
             for objective in subobjectives:
                 integer_coefficients, coefficient_scale = objective.integer_coefficients()
-                backend_result = self.backend.optimize(model, integer_coefficients, self.limits)
-                if backend_result.status is SolverStatus.ERROR and backend_result.message and backend_result.message.startswith("SciPy/HiGHS unavailable"):
-                    backend_result = self.fallback.optimize(model, integer_coefficients, self.limits)
-                if backend_result.values is not None:
-                    valid, validation_message = _validate_integer_solution(model, backend_result.values)
-                    if not valid:
-                        backend_result = replace(
-                            backend_result,
-                            status=SolverStatus.ERROR,
-                            values=None,
-                            objective_integer=None,
-                            certificate_complete=False,
-                            message=f"exact incumbent validation failed: {validation_message}",
-                        )
+                if objective.semantic_tie_break:
+                    assert final_values is not None
+                    backend_result = self._solve_semantic_tie(context, final_values)
+                else:
+                    backend_result = self._run_backend(model, integer_coefficients)
                 if (
                     backend_result.status is not SolverStatus.OPTIMAL
                     or not backend_result.certificate_complete
@@ -1530,13 +1751,21 @@ class IntegerScaledSolver:
                     )
                 assert backend_result.values is not None
                 final_values = backend_result.values
-                exact_integer = _objective_value(integer_coefficients, final_values)
+                exact_integer = (
+                    backend_result.objective_integer
+                    if objective.semantic_tie_break
+                    else _objective_value(integer_coefficients, final_values)
+                )
+                assert exact_integer is not None
                 value = (
                     Fraction(exact_integer, coefficient_scale)
                     * objective.divisor
                 )
                 stage_values.append(_decimal(value))
-                _pin_objective(model, integer_coefficients, exact_integer, objective.name)
+                if objective.emitted:
+                    emitted_stage_values.append(_decimal(value))
+                if not objective.semantic_tie_break:
+                    _pin_objective(model, integer_coefficients, exact_integer, objective.name)
             stage_value = sum(stage_values, ZERO)
             stage_name = (
                 f"stage_{stage_index:02d}"
@@ -1553,7 +1782,7 @@ class IntegerScaledSolver:
                     hit_resource_limit=False,
                 )
             )
-            objective_vector.extend(stage_values)
+            objective_vector.extend(emitted_stage_values)
 
         assert final_values is not None
         valid, message = _validate_integer_solution(model, final_values)
@@ -1568,6 +1797,58 @@ class IntegerScaledSolver:
                 exact_post_validated=False,
                 message=f"exact final validation failed: {message}",
             )
+
+        exact_vector: list[Decimal] = []
+        for stage in objectives:
+            for objective in stage:
+                if not objective.emitted:
+                    continue
+                coefficients, scale = objective.integer_coefficients()
+                exact_vector.append(
+                    _decimal(
+                        Fraction(_objective_value(coefficients, final_values), scale)
+                        * objective.divisor
+                    )
+                )
+        if tuple(exact_vector) != tuple(objective_vector):
+            return SolverResult(
+                component_id=problem.component_id,
+                solve_kind=problem.solve_kind,
+                status=SolverStatus.UNRESOLVED,
+                stage_results=tuple(stage_results),
+                candidate_plan=None,
+                objective_vector=tuple(objective_vector),
+                exact_post_validated=False,
+                message="exact final objective-vector revalidation failed",
+            )
+        if problem.solve_kind in {SolveKind.EXECUTABLE, SolveKind.COUNTERFACTUAL}:
+            total_atoms = sum(final_values[index] for index in context.x)
+            q_min_atoms = _atoms(problem.minimum_compliant_total or ZERO, context.quantity_atom)
+            net_atoms = _atoms(problem.net_requirement, context.quantity_atom)
+            expected_discretionary = max(0, total_atoms - q_min_atoms)
+            expected_moq_excess = max(0, total_atoms - net_atoms)
+            selected_review_keys = {
+                key
+                for route_index, route in enumerate(context.routes)
+                if final_values[context.y[route_index]] == 1
+                for key in _review_keys(route)
+            }
+            if (
+                final_values[context.discretionary] != expected_discretionary
+                or final_values[context.moq_excess] != expected_moq_excess
+                or sum(final_values[index] for index in context.review_exposure)
+                != len(selected_review_keys)
+            ):
+                return SolverResult(
+                    component_id=problem.component_id,
+                    solve_kind=problem.solve_kind,
+                    status=SolverStatus.UNRESOLVED,
+                    stage_results=tuple(stage_results),
+                    candidate_plan=None,
+                    objective_vector=tuple(objective_vector),
+                    exact_post_validated=False,
+                    message="exact semantic objective revalidation failed",
+                )
 
         disposition = _disposition(problem, context, final_values)
         plan = _build_plan(
