@@ -843,17 +843,30 @@ def _build_model(
         problem.minimum_secondary_fraction is not None
         and problem.relaxed_rule_id != problem.minimum_secondary_rule_id
     )
-    if secondary_active and len(supplier_route_indexes) >= 2:
-        fraction = _fraction(problem.minimum_secondary_fraction)
-        for supplier_id, indexes in supplier_route_indexes.items():
-            coefficients = {item: -(1 - fraction) for item in x}
-            for index in indexes:
-                coefficients[x[index]] = coefficients.get(x[index], Fraction()) + 1
-            model.add_row(
-                coefficients,
-                upper=0,
-                name=f"secondary_allocation[{supplier_id}]",
-            )
+    if secondary_active:
+        if len(supplier_route_indexes) >= 2:
+            fraction = _fraction(problem.minimum_secondary_fraction)
+            for supplier_id, indexes in supplier_route_indexes.items():
+                coefficients = {item: -(1 - fraction) for item in x}
+                for index in indexes:
+                    coefficients[x[index]] = coefficients.get(x[index], Fraction()) + 1
+                model.add_row(
+                    coefficients,
+                    upper=0,
+                    name=f"secondary_allocation[{supplier_id}]",
+                )
+        else:
+            # A positive one-supplier allocation violates the per-order rule
+            # on its face.  Keep the zero-order point feasible so solve Q can
+            # certify the exact uncovered quantity instead of manufacturing
+            # infeasibility or silently dropping the rule.
+            for supplier_id, indexes in supplier_route_indexes.items():
+                model.add_row(
+                    {x[index]: 1 for index in indexes},
+                    lower=0,
+                    upper=0,
+                    name=f"secondary_allocation_unavailable[{supplier_id}]",
+                )
         emitted.add(problem.minimum_secondary_rule_id or "minimum_secondary_fraction")
 
     for constraint in problem.concentration_constraints:
@@ -2232,7 +2245,29 @@ class ProcurementOptimizer:
             )
             diagnostic_result = self.solver.solve(diagnostic_problem)
             if diagnostic_result.candidate_plan is not None:
-                alternatives.append(diagnostic_result.candidate_plan)
+                ignored_rules = tuple(
+                    sorted(
+                        {
+                            rule_id
+                            for rule_id in (
+                                problem.minimum_secondary_rule_id,
+                                problem.named_primary_rule_id,
+                                *(item.rule_id for item in problem.concentration_constraints),
+                            )
+                            if rule_id is not None
+                        }
+                    )
+                )
+                alternatives.append(
+                    replace(
+                        diagnostic_result.candidate_plan,
+                        relaxed_rule_ids=ignored_rules,
+                        summary=(
+                            "Non-executable compliance-cost diagnostic; allocation "
+                            "rules are intentionally excluded and no waiver is claimed."
+                        ),
+                    )
+                )
             secondary_counterfactuals: list[SolverResult] = []
             if kind is SecondaryShortageKind.RELAXABLE:
                 relaxation_candidates = tuple(
@@ -2392,6 +2427,27 @@ class ProcurementOptimizer:
                     != tuple((item.supplier_id, item.quantity) for item in calibrated_plan.lines)
                 )
             ):
+                ignored_rules = tuple(
+                    sorted(
+                        {
+                            rule_id
+                            for rule_id in (
+                                problem.minimum_secondary_rule_id,
+                                problem.named_primary_rule_id,
+                                *(item.rule_id for item in problem.concentration_constraints),
+                            )
+                            if rule_id is not None
+                        }
+                    )
+                )
+                bare_plan = replace(
+                    bare_plan,
+                    relaxed_rule_ids=ignored_rules,
+                    summary=(
+                        "Non-executable compliance-cost diagnostic; allocation "
+                        "rules are intentionally excluded and no waiver is claimed."
+                    ),
+                )
                 alternatives.append(bare_plan)
                 alerts.append(
                     OptimizerAlert(

@@ -20,6 +20,10 @@ from apex_procurement.domain import ValidationIssue, ValidationSeverity
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = PROJECT_ROOT / "data" / "scenarios" / "scenario_06_simple.sqlite"
+ASSIGNED_SCENARIOS = (
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_01_baseline.sqlite",
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_03_tight_timeline.sqlite",
+)
 
 
 def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -103,6 +107,38 @@ class AssembledCliTests(unittest.TestCase):
                 ("CMP-016", "SUP-102", 15.0, 18.0, "2025-09-01", "2025-09-15"),
             ),
         )
+
+    def test_assigned_integration_scenarios_validate_without_invalid_orders(self) -> None:
+        for source in ASSIGNED_SCENARIOS:
+            with self.subTest(scenario=source.name):
+                scenario = Path(self.temporary_directory.name) / source.name
+                shutil.copy2(source, scenario)
+
+                first = self.command("--scenario", str(scenario), "--llm=off")
+                self.assertEqual(first.returncode, 0, first.stderr)
+                with closing(sqlite3.connect(scenario)) as connection:
+                    below_moq = connection.execute(
+                        "SELECT COUNT(*) FROM purchase_orders AS p "
+                        "JOIN supplier_catalog AS c "
+                        "ON c.component_id = p.component_id "
+                        "AND c.supplier_id = p.supplier_id "
+                        "WHERE p.quantity < c.minimum_order_qty"
+                    ).fetchone()[0]
+                    magnet_rows = tuple(
+                        connection.execute(
+                            "SELECT p.supplier_id, p.quantity "
+                            "FROM purchase_orders AS p "
+                            "JOIN components AS c ON c.component_id = p.component_id "
+                            "WHERE lower(c.name) LIKE '%neodymium%' "
+                            "ORDER BY p.supplier_id"
+                        )
+                    )
+                self.assertEqual(below_moq, 0)
+                self.assertGreaterEqual(len({row[0] for row in magnet_rows}), 2)
+                magnet_total = sum(row[1] for row in magnet_rows)
+                self.assertTrue(
+                    all(row[1] <= 0.8 * magnet_total for row in magnet_rows)
+                )
 
     def test_strict_warning_fails_before_any_write(self) -> None:
         before = output_rows(self.path)

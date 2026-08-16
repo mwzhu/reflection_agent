@@ -15,7 +15,12 @@ from enum import IntEnum
 from pathlib import Path
 import sys
 
-from .candidates import CandidateBuildResult, build_candidate_routes
+from .candidates import (
+    CandidateBuildResult,
+    NoAlternativeProof,
+    build_candidate_routes,
+    component_fingerprint,
+)
 from .config import EvidenceContract, ModelMode, RuntimeConfig
 from .decisions import (
     CommitFailure,
@@ -40,6 +45,7 @@ from .domain import (
     ResolutionStatus,
     RuleSeverity,
     ScenarioSnapshot,
+    SolveKind,
     SolverResult,
     SolverStatus,
     ValidationResult,
@@ -49,6 +55,7 @@ from .domain import (
 from .explanations import render_decision_rationale
 from .ledgers import LedgerBuildResult, build_ledgers
 from .optimizer import (
+    IntegerScaledSolver,
     OptimizerProblem,
     OrderApprovalConstraint,
     ProcurementOptimizer,
@@ -339,6 +346,101 @@ def _solver_results(outcome: object) -> tuple[SolverResult, ...]:
     return tuple(item for item in values if isinstance(item, SolverResult))
 
 
+def _below_b_no_alternative_proofs(
+    snapshot: ScenarioSnapshot,
+    registry: PolicyRegistry,
+    contract: EvidenceContract,
+    ledgers: LedgerBuildResult,
+    candidates: CandidateBuildResult,
+    evaluations: Mapping[str, EvaluationBatch],
+) -> tuple[NoAlternativeProof, ...]:
+    """Run the planner/validator predicate pair required by the below-B gate."""
+
+    demanded_components = {
+        ledger.component_id
+        for ledger in ledgers.supply_ledgers
+        if ledger.eventual_gap > ZERO
+    }
+    pending = {
+        route.component_id
+        for route in candidates.routes
+        if route.component_id in demanded_components
+        if any(
+            requirement.endswith(":no-alternative-certificate")
+            for requirement in route.approval_requirements
+        )
+    }
+    if not pending:
+        return ()
+    components = {item.component_id: item for item in snapshot.components}
+    solver = IntegerScaledSolver()
+    validator = IndependentPlanValidator(registry)
+    proofs: list[NoAlternativeProof] = []
+    for component_id in sorted(pending):
+        problem = _optimizer_problem(
+            snapshot,
+            registry,
+            ledgers,
+            candidates,
+            evaluations,
+            component_id,
+        )
+        # Named-primary is shaping, not evidence that a B-or-better
+        # alternative is absent.  All hard gates and per-order allocation
+        # rules remain in this clean predicate solve.
+        predicate = solver.solve(
+            replace(
+                problem,
+                solve_kind=SolveKind.QUANTITY_CALIBRATION,
+                named_primary_supplier_id=None,
+                named_primary_rule_id=None,
+                minimum_compliant_total=None,
+                coverage_target=None,
+                cheapest_covering_cost=None,
+                relaxed_rule_id=None,
+            )
+        )
+        independent = validator.independently_check_b_or_better(
+            snapshot,
+            component_id,
+            contract,
+        )
+        planner_complete = (
+            predicate.is_certified_optimal
+            and predicate.exact_post_validated
+            and bool(predicate.objective_vector)
+        )
+        planner_no_alternative = (
+            planner_complete and predicate.objective_vector[0] > ZERO
+        )
+        planner_alternative_exists = (
+            planner_complete and predicate.objective_vector[0] == ZERO
+        )
+        independent_no_alternative = (
+            independent.status is SolverStatus.INFEASIBLE
+            and independent.certificate_complete
+        )
+        independent_alternative_exists = (
+            independent.status is SolverStatus.OPTIMAL
+            and independent.certificate_complete
+        )
+        if planner_no_alternative and independent_no_alternative:
+            status = SolverStatus.INFEASIBLE
+        elif planner_alternative_exists and independent_alternative_exists:
+            status = SolverStatus.OPTIMAL
+        else:
+            continue
+        proofs.append(
+            NoAlternativeProof(
+                component_fingerprint(components[component_id]),
+                status,
+                certificate_complete=True,
+                independently_validated=True,
+            )
+        )
+    return tuple(proofs)
+
+
 def _component_rule_evidence(batch: EvaluationBatch) -> tuple[object, ...]:
     return tuple(
         evaluation.evidence
@@ -606,6 +708,25 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         ),
         evaluations,
     )
+    no_alternative_proofs = _below_b_no_alternative_proofs(
+        snapshot,
+        registry,
+        config.contract,
+        ledgers,
+        candidates,
+        evaluations,
+    )
+    if no_alternative_proofs:
+        candidates = _merge_component_rule_evidence(
+            build_candidate_routes(
+                snapshot,
+                ledgers,
+                registry=registry,
+                contract=config.contract,
+                no_alternative_proofs=no_alternative_proofs,
+            ),
+            evaluations,
+        )
 
     component_ids = tuple(item.component_id for item in ledgers.supply_ledgers)
     if (

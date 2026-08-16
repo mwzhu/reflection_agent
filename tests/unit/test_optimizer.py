@@ -406,6 +406,23 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(outcome.alternatives[0].objective_vector[1], ZERO)
         self.assertEqual(outcome.alternatives[0].objective_vector[8], Decimal("20"))
         self.assertEqual(outcome.alternatives[0].objective_vector[9], ZERO)
+        self.assertTrue(
+            outcome.alternatives[0].summary.startswith(
+                "Non-executable compliance-cost diagnostic;"
+            )
+        )
+        self.assertIn(
+            "rule-secondary",
+            outcome.alternatives[0].relaxed_rule_ids,
+        )
+
+        # The underlying exact model must also retain the rule.  Solve Q keeps
+        # the zero-order point feasible and certifies the uncovered quantity;
+        # it may not silently use the sole supplier.
+        calibration = _stdlib_solver().solve(problem)
+        self.assertEqual(calibration.status, SolverStatus.OPTIMAL)
+        self.assertEqual(calibration.objective_vector, (Decimal("2"), ZERO))
+        self.assertIsNone(calibration.candidate_plan)
 
     def test_relaxable_second_supplier_produces_one_rule_counterfactual(self) -> None:
         first = _supplier("available")
