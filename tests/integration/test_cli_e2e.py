@@ -42,6 +42,9 @@ IDEMPOTENCY_SCENARIOS = (
     PROJECT_ROOT / "data" / "scenarios" / "scenario_01_baseline.sqlite",
     PROJECT_ROOT / "data" / "scenarios" / "scenario_06_simple.sqlite",
 )
+ALL_SCENARIOS = tuple(
+    sorted((PROJECT_ROOT / "data" / "scenarios").glob("scenario_*.sqlite"))
+)
 
 
 def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -206,6 +209,124 @@ class AssembledCliTests(unittest.TestCase):
                     ).fetchone()
                 self.assertEqual(accounting_count, 1)
                 self.assertEqual(order_counts[0], order_counts[1])
+
+    def test_production_contract_preserves_evidence_blocked_dispositions_on_all_scenarios(self) -> None:
+        for source in ALL_SCENARIOS:
+            with self.subTest(scenario=source.name):
+                scenario = (
+                    Path(self.temporary_directory.name)
+                    / f"production-{source.name}"
+                )
+                shutil.copy2(source, scenario)
+                initial_orders = output_rows(scenario)[0]
+                arguments = (
+                    "--scenario",
+                    str(scenario),
+                    "--contract=production",
+                    "--llm=off",
+                    "--json",
+                )
+
+                first = self.command(*arguments)
+                self.assertEqual(first.returncode, 0, first.stderr)
+                payload = json.loads(first.stdout)
+                scoped_components: set[str] = set()
+                for decision in payload["decisions"]:
+                    rolling = tuple(
+                        item
+                        for item in decision["evidence"]
+                        if item["basis"] == "rolling_window"
+                        and item["status"] == "UNKNOWN"
+                        and item["contract_disposition"]
+                        == PlanDisposition.DECISION_REQUIRED.value
+                    )
+                    if not rolling:
+                        continue
+                    scoped_components.add(decision["component_id"])
+                    self.assertIn(
+                        "DECISION_REQUIRED", decision["alert_categories"]
+                    )
+                    self.assertIn(
+                        "EVIDENCE_CONTRACT", decision["alert_categories"]
+                    )
+                    self.assertNotIn("ASSUMPTION", decision["alert_categories"])
+                    self.assertNotIn(
+                        "NO_ELIGIBLE_SUPPLIER", decision["alert_categories"]
+                    )
+                    self.assertIsNone(decision["selected_plan"])
+                    if Decimal(decision["residual_gap"]) > 0:
+                        self.assertEqual(
+                            decision["requirement_state"]["resolution"],
+                            "UNRESOLVED",
+                        )
+                        self.assertTrue(
+                            any(
+                                item["disposition"] == "DECISION_REQUIRED"
+                                and any(
+                                    evidence["contract_disposition"]
+                                    == "DECISION_REQUIRED"
+                                    for evidence in item["evidence"]
+                                )
+                                for item in decision["alternatives"]
+                            )
+                        )
+                self.assertTrue(scoped_components)
+
+                rows_after_first = output_rows(scenario)
+                self.assertEqual(rows_after_first[0], initial_orders)
+                with closing(sqlite3.connect(scenario)) as connection:
+                    descriptions = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT description FROM alerts"
+                        )
+                    )
+                    sequence_after_first = connection.execute(
+                        "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+                    ).fetchone()
+                self.assertEqual(
+                    sum("category=RUN_ACCOUNTING" in item for item in descriptions),
+                    1,
+                )
+                self.assertFalse(
+                    any("category=ASSUMPTION" in item for item in descriptions)
+                )
+                self.assertFalse(
+                    any(
+                        "category=NO_ELIGIBLE_SUPPLIER" in item
+                        for item in descriptions
+                    )
+                )
+                for component_id in scoped_components:
+                    self.assertTrue(
+                        any(
+                            "category=DECISION_REQUIRED" in item
+                            and f"component {component_id}" in item
+                            for item in descriptions
+                        )
+                    )
+                    self.assertTrue(
+                        any(
+                            "category=EVIDENCE_CONTRACT" in item
+                            and f"Component {component_id}" in item
+                            for item in descriptions
+                        )
+                    )
+                self.assertFalse(
+                    any("relied on assumption" in item for item in descriptions)
+                )
+
+                second = self.command(*arguments)
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual(output_rows(scenario), rows_after_first)
+                self.assertIn('"no_op":true', second.stdout)
+                with closing(sqlite3.connect(scenario)) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
+                        ).fetchone(),
+                        sequence_after_first,
+                    )
 
     def test_late_committed_inbound_uses_strictly_earlier_recovery_and_reruns_no_op(self) -> None:
         scenario = self.recovery_scenario("strictly-earlier-recovery.sqlite")

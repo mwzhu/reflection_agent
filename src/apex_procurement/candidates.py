@@ -424,6 +424,12 @@ class CandidateBuildResult:
             and route not in self.executable_routes
         )
 
+    @property
+    def evidence_blocked_routes(self) -> tuple[CandidateRoute, ...]:
+        """Routes blocked by missing contract evidence rather than hard failure."""
+
+        return tuple(route for route in self.routes if route.is_evidence_blocked)
+
     def routes_for(self, component_id: str) -> tuple[CandidateRoute, ...]:
         return tuple(item for item in self.routes if item.component_id == component_id)
 

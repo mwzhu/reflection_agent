@@ -769,6 +769,60 @@ class CandidateRoute:
     def may_enter_executable_model(self) -> bool:
         return self.eligibility is EvidenceStatus.PASS and not self.approval_requirements
 
+    @property
+    def blocking_hard_evidence(self) -> tuple[EvidenceResult, ...]:
+        """Hard evidence that prevents this route from entering solve 1.
+
+        A benchmark rule-level unknown licensed as ``EXECUTE_WITH_ASSUMPTION``
+        is deliberately not a blocker.  Keeping the remaining evidence intact
+        lets callers distinguish an unavailable fact from a proven supplier
+        failure instead of flattening both into ``eligibility != PASS``.
+        """
+
+        return tuple(
+            item
+            for item in self.evidence
+            if item.severity is RuleSeverity.HARD
+            and (
+                item.status is EvidenceStatus.FAIL
+                or (
+                    item.status is EvidenceStatus.UNKNOWN
+                    and not (
+                        item.scope is EvidenceScope.RULE
+                        and item.contract_disposition
+                        is PlanDisposition.EXECUTE_WITH_ASSUMPTION
+                    )
+                )
+            )
+        )
+
+    @property
+    def contract_disposition(self) -> PlanDisposition | None:
+        """The non-executable disposition required by hard unknown evidence."""
+
+        dispositions = {
+            item.contract_disposition
+            for item in self.blocking_hard_evidence
+            if item.status is EvidenceStatus.UNKNOWN
+            and item.contract_disposition is not None
+        }
+        if PlanDisposition.DECISION_REQUIRED in dispositions:
+            return PlanDisposition.DECISION_REQUIRED
+        if PlanDisposition.RECOMMEND_APPROVAL in dispositions:
+            return PlanDisposition.RECOMMEND_APPROVAL
+        return None
+
+    @property
+    def is_evidence_blocked(self) -> bool:
+        """Whether missing contract evidence, rather than failure, blocks use."""
+
+        blockers = self.blocking_hard_evidence
+        return (
+            bool(blockers)
+            and not any(item.status is EvidenceStatus.FAIL for item in blockers)
+            and self.contract_disposition is PlanDisposition.DECISION_REQUIRED
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class BucketAllocation:

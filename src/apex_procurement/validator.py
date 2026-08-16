@@ -32,6 +32,7 @@ from .domain import (
     DeadlineLateness,
     DecisionRecord,
     EvidenceBasis,
+    EvidenceResult,
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
@@ -85,6 +86,24 @@ _EXECUTABLE_OBJECTIVE_SUFFIX = (
     "stage_10_line_count",
 )
 _COMPLIANCE_DIAGNOSTIC_PREFIX = "Non-executable compliance-cost diagnostic;"
+
+
+def _evidence_contract_blockers(plan: CandidatePlan) -> tuple[EvidenceResult, ...]:
+    return tuple(
+        item
+        for item in plan.evidence
+        if item.severity is RuleSeverity.HARD
+        and item.status is EvidenceStatus.UNKNOWN
+        and item.contract_disposition is PlanDisposition.DECISION_REQUIRED
+    )
+
+
+def _is_evidence_contract_diagnostic(plan: CandidatePlan) -> bool:
+    return (
+        plan.disposition is PlanDisposition.DECISION_REQUIRED
+        and bool(_evidence_contract_blockers(plan))
+        and not plan.relaxed_rule_ids
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -918,6 +937,8 @@ class IndependentPlanValidator:
         supplier: Supplier,
         catalog: SupplierCatalogLine,
         contract: EvidenceContract,
+        *,
+        allow_contract_blocked: bool = False,
     ) -> tuple[bool, bool]:
         if supplier.on_approved_list is not True:
             return False, False
@@ -934,23 +955,27 @@ class IndependentPlanValidator:
         )
         if rolling_rules:
             if contract is EvidenceContract.PRODUCTION:
-                return False, False
-            assumption = True
+                if not allow_contract_blocked:
+                    return False, False
+            else:
+                assumption = True
         pcb_rules = self._rules(snapshot.configuration.current_date, "incumbent_supplier_only")
         if pcb_rules and self._concept("printed_circuit_board_component", requirement.component) is EvidenceStatus.PASS:
             rule = pcb_rules[0]
             pair = (requirement.component.component_id, supplier.supplier_id)
             if pair not in self.accepted_shipment_pairs:
                 if contract is EvidenceContract.PRODUCTION:
-                    return False, False
-                prior = any(
-                    item.component_id == requirement.component.component_id
-                    and item.supplier_id == supplier.supplier_id
-                    for item in snapshot.purchase_orders
-                )
-                if not prior and not self._relationship_predates(supplier, rule.effective_from):
-                    return False, False
-                assumption = True
+                    if not allow_contract_blocked:
+                        return False, False
+                else:
+                    prior = any(
+                        item.component_id == requirement.component.component_id
+                        and item.supplier_id == supplier.supplier_id
+                        for item in snapshot.purchase_orders
+                    )
+                    if not prior and not self._relationship_predates(supplier, rule.effective_from):
+                        return False, False
+                    assumption = True
         rating = _rating(supplier.sustainability_rating)
         if rating is None:
             return False, assumption
@@ -1158,13 +1183,21 @@ class IndependentPlanValidator:
         contract: EvidenceContract,
         *,
         include_unapproved: bool = False,
+        include_evidence_blocked: bool = False,
     ) -> tuple[_Offer, ...]:
         suppliers = {item.supplier_id: item for item in snapshot.suppliers}
         catalogs = tuple(item for item in snapshot.catalog_lines if item.component_id == requirement.component.component_id)
         eligible: list[tuple[Supplier, SupplierCatalogLine, bool]] = []
         for catalog in catalogs:
             supplier = suppliers[catalog.supplier_id]
-            allowed, assumption = self._hard_eligible(snapshot, requirement, supplier, catalog, contract)
+            allowed, assumption = self._hard_eligible(
+                snapshot,
+                requirement,
+                supplier,
+                catalog,
+                contract,
+                allow_contract_blocked=include_evidence_blocked,
+            )
             if allowed:
                 eligible.append((supplier, catalog, assumption))
         gate = {
@@ -3447,6 +3480,7 @@ class IndependentPlanValidator:
         plan_id = plan.plan_id
         suppliers = {item.supplier_id: item for item in snapshot.suppliers}
         catalogs = {(item.component_id, item.supplier_id): item for item in snapshot.catalog_lines}
+        evidence_contract_diagnostic = _is_evidence_contract_diagnostic(plan)
         compliance_diagnostic = (
             not plan.disposition.writes_purchase_order
             and plan.summary.startswith(_COMPLIANCE_DIAGNOSTIC_PREFIX)
@@ -3525,9 +3559,21 @@ class IndependentPlanValidator:
             buffer = self.receiving_buffer_days if requirement.component.is_hazardous or pcb else 0
             if line.material_available_date != expected + timedelta(days=buffer):
                 sink.error("MATERIAL_DATE_MISMATCH", "Feasibility material date does not match delivery plus receiving buffer.", component_id=component_id, plan_id=plan_id)
-            eligible, _assumption = self._hard_eligible(snapshot, requirement, supplier, catalog, decision.evidence_contract)
+            eligible, _assumption = self._hard_eligible(
+                snapshot,
+                requirement,
+                supplier,
+                catalog,
+                decision.evidence_contract,
+                allow_contract_blocked=evidence_contract_diagnostic,
+            )
             if not eligible:
-                sink.error("SUPPLIER_INELIGIBLE", "Plan uses a supplier failing ASL, certification, rating, or scoped incumbency gates.", component_id=component_id, plan_id=plan_id)
+                sink.error(
+                    "SUPPLIER_INELIGIBLE",
+                    "Plan uses a supplier failing proven ASL, certification, rating, or scoped incumbency gates.",
+                    component_id=component_id,
+                    plan_id=plan_id,
+                )
             if line.quantity > derived_u.get(line.supplier_id, ZERO):
                 sink.error("UPPER_BOUND_DERIVATION", "Line exceeds the independently derived sound U bound.", component_id=component_id, plan_id=plan_id)
             if offer is not None and offer.shipping_method == "air freight" and plan.disposition.writes_purchase_order:
@@ -3652,13 +3698,20 @@ class IndependentPlanValidator:
                 cap = min(cap, self.autonomy.max_surplus_units)
             if plan.discretionary_surplus > cap and plan.disposition.writes_purchase_order:
                 sink.error("AUTONOMY_SURPLUS_EXCEEDED", "Executable plan exceeds the inclusive discretionary-surplus bound.", component_id=component_id, plan_id=plan_id)
+        evidence_vector_diagnostic = (
+            evidence_contract_diagnostic and len(plan.objective_vector) == 2
+        )
         exact_objective = (
+            (plan.residual_gap, total_quantity)
+            if evidence_vector_diagnostic
+            else
             (plan.residual_gap, plan.total_cost)
             if baseline_vector_diagnostic
             else self._objective(snapshot, requirement, plan, offers)
         )
         if (
             not baseline_vector_diagnostic
+            and not evidence_vector_diagnostic
             and plan.unit_late_days
             != exact_objective[len(requirement.bucket_quantities)]
         ):
@@ -3677,7 +3730,15 @@ class IndependentPlanValidator:
             and bool(set(plan.relaxed_rule_ids) & allocation_rule_ids)
             and len(plan.objective_vector) == 2
         )
-        if compliance_cost_diagnostic:
+        if evidence_vector_diagnostic:
+            if plan.objective_vector != exact_objective:
+                sink.error(
+                    "OBJECTIVE_VECTOR_MISMATCH",
+                    "Evidence-contract diagnostic does not match its independently recomputed quantity-calibration vector.",
+                    component_id=component_id,
+                    plan_id=plan_id,
+                )
+        elif compliance_cost_diagnostic:
             diagnostic_objective = (
                 max(ZERO, requirement.eventual_gap - total_quantity),
                 plan.total_cost,
@@ -3828,6 +3889,7 @@ class IndependentPlanValidator:
 
     def _check_evidence(self, snapshot: ScenarioSnapshot, decision: DecisionRecord, plan: CandidatePlan, sink: _IssueSink) -> None:
         active = {item.rule_id: item for item in self.registry.active_rules(snapshot.configuration.current_date)}
+        evidence_contract_diagnostic = _is_evidence_contract_diagnostic(plan)
         for evidence in (*decision.evidence, *plan.evidence):
             if evidence.rule_id not in active and not evidence.rule_id.startswith(_SYNTHETIC_RULE_PREFIXES):
                 sink.error("INACTIVE_RULE_CITATION", "Evidence cites a policy rule inactive on the scenario date.", component_id=decision.component_id, plan_id=plan.plan_id, rule_ids=(evidence.rule_id,))
@@ -3837,6 +3899,19 @@ class IndependentPlanValidator:
                 permitted = evidence.scope is EvidenceScope.RULE and evidence.contract_disposition is PlanDisposition.EXECUTE_WITH_ASSUMPTION and plan.disposition is PlanDisposition.EXECUTE_WITH_ASSUMPTION
                 if not permitted:
                     sink.error("UNLICENSED_EVIDENCE", "Hard unknown evidence is not licensed for execution by the active contract.", component_id=decision.component_id, plan_id=plan.plan_id, rule_ids=(evidence.rule_id,))
+            if (
+                evidence_contract_diagnostic
+                and evidence in plan.evidence
+                and evidence.severity is RuleSeverity.HARD
+                and evidence.status is EvidenceStatus.FAIL
+            ):
+                sink.error(
+                    "EVIDENCE_DIAGNOSTIC_PROVEN_FAILURE",
+                    "An evidence-contract diagnostic may preserve UNKNOWN evidence but cannot treat a proven hard failure as a potential route.",
+                    component_id=decision.component_id,
+                    plan_id=plan.plan_id,
+                    rule_ids=(evidence.rule_id,),
+                )
         rolling_applies = any(
             rule.evidence_basis == EvidenceBasis.ROLLING_WINDOW.value
             for rule in self.registry.active_rules(snapshot.configuration.current_date)
@@ -3846,6 +3921,130 @@ class IndependentPlanValidator:
                 sink.error("ROLLING_HISTORY_UNLICENSED", "Production contract cannot execute without licensed rolling history.", component_id=decision.component_id, plan_id=plan.plan_id)
             elif plan.disposition is not PlanDisposition.EXECUTE_WITH_ASSUMPTION:
                 sink.error("EVIDENCE_CONTRACT_DISPOSITION", "Benchmark rolling-history unknown requires EXECUTE_WITH_ASSUMPTION.", component_id=decision.component_id, plan_id=plan.plan_id)
+
+    def _check_requirement_evidence_disposition(
+        self,
+        snapshot: ScenarioSnapshot,
+        decision: DecisionRecord,
+        requirement: _SourceRequirement,
+        sink: _IssueSink,
+    ) -> None:
+        applicable_rolling = {
+            rule.rule_id: rule
+            for rule in self.registry.active_rules(snapshot.configuration.current_date)
+            if rule.evidence_basis == EvidenceBasis.ROLLING_WINDOW.value
+            and self._selector_status(rule, requirement.component)
+            is not EvidenceStatus.FAIL
+        }
+        for rule in tuple(applicable_rolling.values()):
+            if (
+                self._selector_status(rule, requirement.component)
+                is not EvidenceStatus.PASS
+            ):
+                continue
+            precedence = rule.data.get("precedence")
+            if not isinstance(precedence, Mapping):
+                continue
+            for relation in ("supersedes", "outranks"):
+                for target in precedence.get(relation, ()):
+                    applicable_rolling.pop(str(target), None)
+        expected_rolling_ids = set(applicable_rolling)
+        actual_rolling = {
+            item.rule_id: item
+            for item in decision.evidence
+            if item.basis is EvidenceBasis.ROLLING_WINDOW
+        }
+        if (
+            decision.evidence_contract is EvidenceContract.PRODUCTION
+            or actual_rolling
+        ) and set(actual_rolling) != expected_rolling_ids:
+            sink.error(
+                "ROLLING_EVIDENCE_PROPAGATION",
+                "Requirement evidence does not preserve every in-scope rolling-window rule.",
+                component_id=decision.component_id,
+                rule_ids=tuple(sorted(set(actual_rolling) ^ expected_rolling_ids)),
+            )
+        expected_disposition = (
+            PlanDisposition.DECISION_REQUIRED
+            if decision.evidence_contract is EvidenceContract.PRODUCTION
+            else PlanDisposition.EXECUTE_WITH_ASSUMPTION
+        )
+        for evidence in actual_rolling.values():
+            if (
+                evidence.status is not EvidenceStatus.UNKNOWN
+                or evidence.contract_disposition is not expected_disposition
+            ):
+                sink.error(
+                    "EVIDENCE_CONTRACT_DISPOSITION",
+                    "Rolling-window UNKNOWN evidence does not carry the active contract's required disposition.",
+                    component_id=decision.component_id,
+                    rule_ids=(evidence.rule_id,),
+                )
+
+        all_evidence = tuple(decision.evidence) + tuple(
+            evidence
+            for plan in decision.alternatives
+            for evidence in plan.evidence
+        )
+        blockers = tuple(
+            item
+            for item in all_evidence
+            if item.severity is RuleSeverity.HARD
+            and item.status is EvidenceStatus.UNKNOWN
+            and item.contract_disposition is PlanDisposition.DECISION_REQUIRED
+        )
+        potential_routes = self._offers(
+            snapshot,
+            requirement,
+            decision.evidence_contract,
+            include_unapproved=True,
+            include_evidence_blocked=True,
+        )
+        evidence_blocked = bool(blockers and potential_routes)
+        if evidence_blocked:
+            if AlertCategory.DECISION_REQUIRED not in decision.alert_categories:
+                sink.error(
+                    "EVIDENCE_DECISION_ALERT_MISSING",
+                    "Evidence-blocked requirements require a component-specific DECISION_REQUIRED alert.",
+                    component_id=decision.component_id,
+                )
+            if AlertCategory.EVIDENCE_CONTRACT not in decision.alert_categories:
+                sink.error(
+                    "EVIDENCE_CONTRACT_ALERT_MISSING",
+                    "Evidence-blocked requirements require an EVIDENCE_CONTRACT remediation alert.",
+                    component_id=decision.component_id,
+                )
+            if AlertCategory.ASSUMPTION in decision.alert_categories:
+                sink.error(
+                    "PRODUCTION_EVIDENCE_AS_ASSUMPTION",
+                    "Unavailable production facts cannot be rendered as assumptions relied upon.",
+                    component_id=decision.component_id,
+                )
+            if AlertCategory.NO_ELIGIBLE_SUPPLIER in decision.alert_categories:
+                sink.error(
+                    "EVIDENCE_BLOCKED_AS_INELIGIBLE",
+                    "Missing production evidence cannot be classified as NO_ELIGIBLE_SUPPLIER.",
+                    component_id=decision.component_id,
+                )
+            if (
+                decision.residual_gap > ZERO
+                and decision.requirement_state.resolution
+                is not ResolutionStatus.UNRESOLVED
+            ):
+                sink.error(
+                    "EVIDENCE_BLOCKED_REQUIREMENT_STATE",
+                    "A positive evidence-blocked residual must remain UNRESOLVED.",
+                    component_id=decision.component_id,
+                )
+            if decision.residual_gap > ZERO and not any(
+                _is_evidence_contract_diagnostic(plan)
+                for plan in decision.alternatives
+            ):
+                sink.error(
+                    "EVIDENCE_DIAGNOSTIC_MISSING",
+                    "A positive evidence-blocked requirement lacks its non-executable solver diagnostic.",
+                    component_id=decision.component_id,
+                )
 
     def _check_capacity(self, snapshot: ScenarioSnapshot, decision: DecisionRecord, sink: _IssueSink) -> None:
         subject = self._release_subject(snapshot, next(item for item in snapshot.components if item.component_id == decision.component_id))
@@ -4071,6 +4270,12 @@ class IndependentPlanValidator:
                 sink.error("UNKNOWN_REQUIREMENT_COMPONENT", "Decision has no independently reconstructed source requirement.", component_id=decision.component_id)
                 continue
             self._check_decision_facts(snapshot, decision, requirement, sink)
+            self._check_requirement_evidence_disposition(
+                snapshot,
+                decision,
+                requirement,
+                sink,
+            )
             offers = self._offers(snapshot, requirement, decision.evidence_contract, include_unapproved=True)
             self._check_time_phased_ledger(
                 decision,
@@ -4079,7 +4284,25 @@ class IndependentPlanValidator:
                 sink,
             )
             for plan in tuple(item for item in (decision.selected_plan, *decision.alternatives) if item is not None):
-                self._check_plan(snapshot, decision, requirement, plan, offers, sink)
+                plan_offers = (
+                    self._offers(
+                        snapshot,
+                        requirement,
+                        decision.evidence_contract,
+                        include_unapproved=True,
+                        include_evidence_blocked=True,
+                    )
+                    if _is_evidence_contract_diagnostic(plan)
+                    else offers
+                )
+                self._check_plan(
+                    snapshot,
+                    decision,
+                    requirement,
+                    plan,
+                    plan_offers,
+                    sink,
+                )
                 plan_action_keys: set[tuple[object, ...]] = set()
                 for line in plan.lines:
                     key = (decision.requirement_id, line.component_id, line.supplier_id, line.route_id, line.order_date)

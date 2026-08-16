@@ -8,6 +8,7 @@ import itertools
 import unittest
 
 from apex_procurement.candidates import supplier_fingerprint
+from apex_procurement.config import EvidenceContract
 from apex_procurement.domain import (
     AlertCategory,
     CandidateRoute,
@@ -291,6 +292,46 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(selected.assumption_codes, ("ASSUMPTION_A", "ASSUMPTION_B", "ASSUMPTION_SHARED"))
         self.assertEqual(selected.objective_vector[3], Decimal("3"))
         self.assertEqual(len(selected.objective_vector), 12)
+
+    def test_production_unknown_evidence_survives_non_executable_solver_diagnostic(self) -> None:
+        supplier = _supplier("evidence-blocked")
+        rolling_unknown = EvidenceResult(
+            "rule-production-rolling-window",
+            EvidenceStatus.UNKNOWN,
+            EvidenceBasis.ROLLING_WINDOW,
+            EvidenceScope.RULE,
+            RuleSeverity.HARD,
+            "Authoritative rolling history is unavailable.",
+            assumption_codes=("ROLLING_HISTORY_UNKNOWN",),
+            contract_disposition=PlanDisposition.DECISION_REQUIRED,
+        )
+        route = _route(
+            supplier,
+            "evidence-blocked",
+            eligibility=EvidenceStatus.UNKNOWN,
+            evidence=(rolling_unknown,),
+        )
+        outcome = ProcurementOptimizer(_stdlib_solver()).optimize(
+            _problem(
+                (route,),
+                (supplier,),
+                evidence_contract=EvidenceContract.PRODUCTION,
+            )
+        )
+
+        self.assertIsNone(outcome.selected_plan)
+        self.assertEqual(outcome.requirement_state.resolution, ResolutionStatus.UNRESOLVED)
+        self.assertEqual(outcome.calibration.status, SolverStatus.OPTIMAL)
+        diagnostic = outcome.calibration.candidate_plan
+        assert diagnostic is not None
+        self.assertEqual(diagnostic.disposition, PlanDisposition.DECISION_REQUIRED)
+        self.assertEqual(diagnostic.assumption_codes, ())
+        self.assertEqual(diagnostic.evidence, (rolling_unknown,))
+        self.assertEqual(outcome.alternatives, (diagnostic,))
+        self.assertEqual(
+            {alert.category for alert in outcome.alerts},
+            {AlertCategory.DECISION_REQUIRED, AlertCategory.EVIDENCE_CONTRACT},
+        )
 
     def test_stage_six_charges_condition_a_but_not_condition_b_volume(self) -> None:
         supplier = _supplier("international")

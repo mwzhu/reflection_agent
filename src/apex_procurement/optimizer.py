@@ -25,6 +25,7 @@ import json
 from math import gcd
 from typing import Protocol
 
+from .config import EvidenceContract
 from .domain import (
     AlertCategory,
     BucketAllocation,
@@ -211,6 +212,7 @@ class OptimizerProblem:
     demand_buckets: tuple[DemandBucket, ...]
     supply_ledger: SupplyLedger
     suppliers: tuple[Supplier, ...]
+    evidence_contract: EvidenceContract = EvidenceContract.BENCHMARK
     solve_kind: SolveKind = SolveKind.QUANTITY_CALIBRATION
     minimum_secondary_fraction: Decimal | None = None
     minimum_secondary_rule_id: str | None = None
@@ -260,6 +262,8 @@ class OptimizerProblem:
             raise ValueError("all demand buckets must match component_id")
         if any(not isinstance(item, Supplier) for item in suppliers):
             raise TypeError("suppliers contains an invalid item")
+        if not isinstance(self.evidence_contract, EvidenceContract):
+            raise TypeError("evidence_contract must be EvidenceContract")
         supplier_ids = {item.supplier_id for item in suppliers}
         if any(item.supplier_id not in supplier_ids for item in routes):
             raise ValueError("every route requires its supplier row")
@@ -582,6 +586,36 @@ def _candidate_routes(problem: OptimizerProblem) -> tuple[CandidateRoute, ...]:
         } - {relaxed}
         if not remaining_approvals and not blocking_unknowns:
             result.append(route)
+    return tuple(result)
+
+
+def _evidence_diagnostic_routes(
+    problem: OptimizerProblem,
+) -> tuple[CandidateRoute, ...]:
+    """Admit evidence-blocked routes only to a non-executable diagnostic solve.
+
+    The copied routes retain every ``UNKNOWN`` evidence row and its contract
+    disposition.  Only the model-membership flag changes, so the solver can
+    quantify a possible plan without converting missing evidence into either
+    supplier ineligibility or authorization to execute.
+    """
+
+    result: list[CandidateRoute] = []
+    for route in problem.routes:
+        blockers = route.blocking_hard_evidence
+        if (
+            not blockers
+            or route.approval_requirements
+            or any(item.status is EvidenceStatus.FAIL for item in blockers)
+            or any(
+                item.status is not EvidenceStatus.UNKNOWN
+                or item.contract_disposition
+                is not PlanDisposition.DECISION_REQUIRED
+                for item in blockers
+            )
+        ):
+            continue
+        result.append(replace(route, eligibility=EvidenceStatus.PASS))
     return tuple(result)
 
 
@@ -2626,6 +2660,87 @@ class ProcurementOptimizer:
             for route in problem.routes
             if route.eligibility is EvidenceStatus.PASS and not route.approval_requirements
         }
+        evidence_routes = _evidence_diagnostic_routes(problem)
+        if (
+            problem.evidence_contract is EvidenceContract.PRODUCTION
+            and not executable_suppliers
+            and evidence_routes
+        ):
+            diagnostic_problem = replace(
+                problem,
+                solve_kind=SolveKind.QUANTITY_CALIBRATION,
+                routes=evidence_routes,
+                minimum_compliant_total=None,
+                coverage_target=None,
+                cheapest_covering_cost=None,
+                relaxed_rule_id=None,
+            )
+            evidence_result = self.solver.solve(diagnostic_problem)
+            diagnostic_plan = evidence_result.candidate_plan
+            if diagnostic_plan is not None:
+                diagnostic_plan = replace(
+                    diagnostic_plan,
+                    assumption_codes=(),
+                    summary=(
+                        "Non-executable evidence-contract diagnostic; hard "
+                        "UNKNOWN facts require customer evidence before any "
+                        "line can execute."
+                    ),
+                )
+                evidence_result = replace(
+                    evidence_result,
+                    candidate_plan=diagnostic_plan,
+                )
+                alternatives.append(diagnostic_plan)
+            blocking_rule_ids = tuple(
+                sorted(
+                    {
+                        item.rule_id
+                        for route in evidence_routes
+                        for item in route.blocking_hard_evidence
+                    }
+                )
+            )
+            alerts.extend(
+                (
+                    OptimizerAlert(
+                        AlertCategory.DECISION_REQUIRED,
+                        "EVIDENCE_CONTRACT_DECISION_REQUIRED",
+                        "Authoritative production evidence is unavailable; the requirement is evidence-blocked, not supplier-infeasible.",
+                        problem.component_id,
+                        diagnostic_plan,
+                        blocking_rule_ids,
+                    ),
+                    OptimizerAlert(
+                        AlertCategory.EVIDENCE_CONTRACT,
+                        "EVIDENCE_CONTRACT_BLOCKED",
+                        "The production evidence contract withheld every potential route until the cited hard UNKNOWN facts are supplied.",
+                        problem.component_id,
+                        diagnostic_plan,
+                        blocking_rule_ids,
+                    ),
+                )
+            )
+            state, residual = _coverage_state(
+                problem,
+                None,
+                unresolved=True,
+                approval_alternatives=True,
+            )
+            return OptimizationOutcome(
+                problem.component_id,
+                evidence_result,
+                None,
+                None,
+                (),
+                None,
+                tuple(alternatives),
+                state,
+                residual,
+                tuple(alerts),
+                bounds,
+                (),
+            )
         secondary_missing = (
             problem.minimum_secondary_fraction is not None
             and problem.planning_requirement > ZERO
