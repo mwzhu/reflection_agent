@@ -57,7 +57,13 @@ from .domain import (
     ZERO,
 )
 from .explanations import render_decision_rationale
-from .ledgers import LedgerBuildResult, build_ledgers
+from .ledgers import (
+    LedgerBuildResult,
+    RouteAvailability,
+    build_ledgers,
+    post_plan_deadline_lateness,
+    total_recovery_demand,
+)
 from .optimizer import (
     IntegerScaledSolver,
     OptimizerProblem,
@@ -224,6 +230,41 @@ def _component_evaluations(
     }
 
 
+def _route_aware_ledgers(
+    snapshot: ScenarioSnapshot,
+    candidates: CandidateBuildResult,
+) -> LedgerBuildResult:
+    """Rebuild physical ledgers with policy-eligible route availability.
+
+    Approval-gated routes remain physical recovery possibilities for solve-2,
+    but failed or unresolved eligibility never authorizes duplicate supply.
+    """
+
+    physical = build_ledgers(snapshot)
+    return build_ledgers(
+        snapshot,
+        route_availabilities=tuple(
+            RouteAvailability(
+                route.route_id,
+                route.component_id,
+                route.material_available_date,
+                (
+                    route.exception_scope_deadlines
+                    if route.exception_codes
+                    else tuple(
+                        bucket.due_date
+                        for bucket in physical.buckets_for(
+                            route.component_id
+                        )
+                    )
+                ),
+            )
+            for route in candidates.routes
+            if route.eligibility is EvidenceStatus.PASS
+        ),
+    )
+
+
 def _merge_component_rule_evidence(
     candidates: CandidateBuildResult,
     evaluations: Mapping[str, EvaluationBatch],
@@ -329,6 +370,8 @@ def _optimizer_problem(
         component_id=component_id,
         unit_of_measure=component.unit_of_measure,
         net_requirement=ledger.eventual_gap,
+        recovery_demand=total_recovery_demand(ledger),
+        authorized_recovery_surplus=total_recovery_demand(ledger),
         routes=candidates.routes_for(component_id),
         demand_buckets=ledgers.buckets_for(component_id),
         supply_ledger=ledger,
@@ -366,7 +409,7 @@ def _below_b_no_alternative_proofs(
     demanded_components = {
         ledger.component_id
         for ledger in ledgers.supply_ledgers
-        if ledger.eventual_gap > ZERO
+        if ledger.eventual_gap > ZERO or total_recovery_demand(ledger) > ZERO
     }
     pending = {
         route.component_id
@@ -493,6 +536,14 @@ def _decision_categories(
         for item in batch.alerts
         if item.entity_id in {None, component_id}
     )
+    selected = getattr(outcome, "selected_plan", None) if outcome is not None else None
+    lateness = post_plan_deadline_lateness(
+        ledgers.ledger_for(component_id),
+        ledgers.buckets_for(component_id),
+        selected.lines if selected is not None else (),
+    )
+    if lateness:
+        categories.add(AlertCategory.LATE_ARRIVAL)
     if outcome is None:
         return tuple(sorted(categories, key=lambda item: item.value))
 
@@ -573,6 +624,10 @@ def _closed_decision(
         evidence=_component_rule_evidence(batch),
         alert_categories=categories,
         rationale="Pending deterministic rendering.",
+        deadline_lateness=post_plan_deadline_lateness(
+            ledger,
+            ledgers.buckets_for(component_id),
+        ),
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -620,6 +675,11 @@ def _planned_decision(
             outcome,
         ),
         rationale="Pending deterministic rendering.",
+        deadline_lateness=post_plan_deadline_lateness(
+            ledger,
+            ledgers.buckets_for(component_id),
+            selected.lines if selected is not None else (),
+        ),
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -861,6 +921,11 @@ def _run_once(
         ),
         evaluations,
     )
+    ledgers = _route_aware_ledgers(snapshot, candidates)
+    evaluations = _component_evaluations(
+        snapshot, registry, config.contract, ledgers
+    )
+    candidates = _merge_component_rule_evidence(candidates, evaluations)
     no_alternative_proofs = _below_b_no_alternative_proofs(
         snapshot,
         registry,
@@ -880,6 +945,11 @@ def _run_once(
             ),
             evaluations,
         )
+        ledgers = _route_aware_ledgers(snapshot, candidates)
+        evaluations = _component_evaluations(
+            snapshot, registry, config.contract, ledgers
+        )
+        candidates = _merge_component_rule_evidence(candidates, evaluations)
     timings_us["candidate_build"] = (perf_counter_ns() - phase_started) // 1_000
 
     component_ids = tuple(item.component_id for item in ledgers.supply_ledgers)
@@ -899,7 +969,10 @@ def _run_once(
     for component_id in component_ids:
         ledger = ledgers.ledger_for(component_id)
         batch = evaluations[component_id]
-        if ledger.eventual_gap == ZERO:
+        if (
+            ledger.eventual_gap == ZERO
+            and total_recovery_demand(ledger) == ZERO
+        ):
             decisions.append(
                 _closed_decision(
                     snapshot,

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from hashlib import sha256
 import re
@@ -204,6 +205,103 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         else "none"
     )
     rules = _evidence_rule_ids(decision, decision.selected_plan)
+    lateness = "; ".join(
+        f"{item.due_date.isoformat()} late quantity {_number(item.late_quantity)} "
+        f"unit-late-days {_number(item.unit_late_days)} unresolved "
+        f"{_number(item.unresolved_quantity)}"
+        for item in decision.deadline_lateness
+    ) or "none"
+    return sanitize_control_characters(
+        f"Requirement {decision.requirement_id} for component {decision.component_id}: "
+        f"demand [{demand}]; on hand {_number(decision.supply_ledger.on_hand)}; "
+        f"counted inbound [{inbound}]; initial eventual gap "
+        f"{_number(decision.initial_eventual_gap)}; selected [{selection}]; covered "
+        f"{_number(decision.covered_quantity)}; residual {_number(decision.residual_gap)}; "
+        f"fulfillment {decision.requirement_state.fulfillment.value}; resolution "
+        f"{decision.requirement_state.resolution.value}; evidence contract "
+        f"{decision.evidence_contract.value}; rule IDs [{_list(rules)}]."
+        f" Post-plan deadline misses [{lateness}]."
+    )
+
+
+def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
+    """Render one selected line, including fulfillment and resolution explicitly."""
+
+    if decision.selected_plan is None or line not in decision.selected_plan.lines:
+        raise ExplanationError("line must belong to the decision's selected plan")
+    allocations = "; ".join(
+        f"{allocation.due_date.isoformat()} quantity {_number(allocation.quantity)}"
+        f" exceptions [{_list(allocation.exception_ids)}]"
+        for allocation in line.bucket_allocations
+    )
+    plan = decision.selected_plan
+    assumptions = set(plan.assumption_codes)
+    for evidence in (*decision.evidence, *plan.evidence):
+        assumptions.update(evidence.assumption_codes)
+    evidence = ", ".join(
+        f"{item.rule_id}={item.status.value}"
+        for item in sorted(
+            {*decision.evidence, *plan.evidence},
+            key=lambda item: (item.rule_id, item.status.value),
+        )
+    ) or "none"
+    alternatives = "; ".join(
+        f"{candidate.plan_id} disposition {candidate.disposition.value}, routes "
+        f"[{_list(item.route_id for item in candidate.lines)}], relaxed rules "
+        f"[{_list(candidate.relaxed_rule_ids)}]"
+        for candidate in decision.alternatives
+    ) or "none"
+    objective = ", ".join(_number(item) for item in plan.objective_vector) or "none"
+    lead_days = (line.expected_delivery_date - line.order_date).days
+    return sanitize_control_characters(
+        f"Requirement {decision.requirement_id}; component {decision.component_id}; "
+        f"supplier {line.supplier_id}; route {line.route_id}; ordered quantity "
+        f"{_number(line.quantity)} at unit price {_number(line.unit_price)} for line total "
+        f"{_number(line.line_total)}; order date {line.order_date.isoformat()}; expected "
+        f"delivery {line.expected_delivery_date.isoformat()} from approved lead time "
+        f"{lead_days} days; material available "
+        f"{line.material_available_date.isoformat()}; allocations [{allocations}]. "
+        f"Demand {_number(decision.total_requirement)}, on hand "
+        f"{_number(decision.supply_ledger.on_hand)}, counted inbound "
+        f"{_number(sum((item.quantity for item in decision.supply_ledger.committed_inbound), ZERO))}, "
+        f"forced surplus {_number(plan.forced_surplus)}, recovery demand "
+        f"{_number(plan.recovery_demand)}, recovery quantity "
+        f"{_number(plan.recovery_quantity)}, discretionary surplus "
+        f"{_number(plan.discretionary_surplus)}, unit-late-days "
+        f"{_number(plan.unit_late_days)}, residual eventual quantity "
+        f"{_number(decision.residual_gap)}. Fulfillment "
+        f"{decision.requirement_state.fulfillment.value}; resolution "
+        f"{decision.requirement_state.resolution.value}; disposition {plan.disposition.value}; "
+        f"objective [{objective}]; evidence [{evidence}]; alternatives and material rejections "
+        f"[{alternatives}]; disclosures [{_list(item.value for item in decision.alert_categories)}]; "
+        f"assumptions [{_list(assumptions)}]."
+    )
+
+
+def render_legacy_v1_decision_rationale(decision: DecisionRecord) -> str:
+    """Reproduce the canonical rationale embedded in pre-R02 v1 PO markers."""
+
+    if not isinstance(decision, DecisionRecord):
+        raise TypeError("decision must be DecisionRecord")
+    demand = "; ".join(
+        f"{item.order_id} due {bucket.due_date.isoformat()} quantity {_number(item.quantity)}"
+        for bucket in decision.demand_buckets
+        for item in bucket.contributions
+    )
+    inbound = "; ".join(
+        f"{item.po_number} quantity {_number(item.quantity)} due "
+        f"{item.expected_delivery_date.isoformat()}"
+        for item in decision.supply_ledger.committed_inbound
+    ) or "none"
+    selection = (
+        "; ".join(
+            f"route {line.route_id} supplier {line.supplier_id} quantity {_number(line.quantity)}"
+            for line in decision.selected_plan.lines
+        )
+        if decision.selected_plan is not None
+        else "none"
+    )
+    rules = _evidence_rule_ids(decision, decision.selected_plan)
     return sanitize_control_characters(
         f"Requirement {decision.requirement_id} for component {decision.component_id}: "
         f"demand [{demand}]; on hand {_number(decision.supply_ledger.on_hand)}; "
@@ -216,8 +314,11 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
     )
 
 
-def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
-    """Render one selected line, including fulfillment and resolution explicitly."""
+def render_legacy_v1_line_rationale(
+    decision: DecisionRecord,
+    line: PlanLine,
+) -> str:
+    """Reproduce the canonical line rationale embedded in pre-R02 v1 markers."""
 
     if decision.selected_plan is None or line not in decision.selected_plan.lines:
         raise ExplanationError("line must belong to the decision's selected plan")
@@ -391,8 +492,9 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
         quantified = f" Forced surplus is {_number(decision.selected_plan.forced_surplus)}."
     elif decision.selected_plan is not None and category is AlertCategory.RECOVERY_SURPLUS:
         quantified = (
-            " Recovery/discretionary surplus is "
-            f"{_number(decision.selected_plan.discretionary_surplus)}."
+            " Strictly improving recovery quantity is "
+            f"{_number(decision.selected_plan.recovery_quantity)} against "
+            f"{_number(decision.selected_plan.recovery_demand)} recoverable units."
         )
     elif category is AlertCategory.LATE_ARRIVAL and decision.selected_plan is not None:
         selected_dates = tuple(
@@ -474,6 +576,22 @@ def _solver_alert(decision: DecisionRecord) -> str:
     )
 
 
+def _late_alert(decision: DecisionRecord, due_date: date) -> str:
+    lateness = next(
+        item for item in decision.deadline_lateness if item.due_date == due_date
+    )
+    return (
+        f"Component {decision.component_id}, requirement {decision.requirement_id} misses "
+        f"the {lateness.due_date.isoformat()} material deadline by "
+        f"{_number(lateness.late_quantity)} units, representing "
+        f"{_number(lateness.unit_late_days)} unit-late-days; "
+        f"{_number(lateness.unresolved_quantity)} units have no eventual assigned receipt. "
+        "The agent preserved existing commitments and placed only the strictly improving, "
+        "authorized recovery plan shown in the managed decision. Human action: review the "
+        "affected production date and decide whether to expedite further or reschedule."
+    )
+
+
 def render_alerts(
     decisions: Sequence[DecisionRecord],
     *,
@@ -547,12 +665,28 @@ def render_alerts(
 
         special = {
             AlertCategory.UNMET_DEMAND,
+            AlertCategory.LATE_ARRIVAL,
             AlertCategory.ASSUMPTION,
             AlertCategory.APPROVAL_REQUIRED,
             AlertCategory.DECISION_REQUIRED,
             AlertCategory.SOLVER_UNPROVEN,
             AlertCategory.RUN_ACCOUNTING,
         }
+        if decision.deadline_lateness:
+            if AlertCategory.LATE_ARRIVAL not in decision.alert_categories:
+                raise ExplanationError(
+                    f"requirement {decision.requirement_id} has deadline misses without LATE_ARRIVAL"
+                )
+            for lateness in decision.deadline_lateness:
+                add(
+                    AlertCategory.LATE_ARRIVAL,
+                    f"{scope}:late:{lateness.due_date.isoformat()}",
+                    _late_alert(decision, lateness.due_date),
+                )
+        elif AlertCategory.LATE_ARRIVAL in decision.alert_categories:
+            raise ExplanationError(
+                f"requirement {decision.requirement_id} requests LATE_ARRIVAL without a deadline miss"
+            )
         if AlertCategory.APPROVAL_REQUIRED in decision.alert_categories and approval_count == 0:
             raise ExplanationError(
                 f"requirement {decision.requirement_id} requests an approval alert without a proposal"

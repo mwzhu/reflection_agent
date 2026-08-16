@@ -29,6 +29,7 @@ from .domain import (
     AlertCategory,
     CandidatePlan,
     Component,
+    DeadlineLateness,
     DecisionRecord,
     EvidenceBasis,
     EvidenceScope,
@@ -137,6 +138,7 @@ class IndependentSolve:
     minimum_compliant_total: Decimal | None = None
     cheapest_covering_cost: Decimal | None = None
     certificate_complete: bool = True
+    recovery_quantity: Decimal = ZERO
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +248,16 @@ class _SourceRequirement:
         bucket = dict(self.bucket_quantities)[due]
         gap = max(ZERO, self.cumulative_demand(due) - self.on_time_supply(due))
         return min(bucket, gap)
+
+
+@dataclass(frozen=True, slots=True)
+class _SupplySegment:
+    bucket_index: int
+    due_date: date
+    quantity: Decimal
+    material_available: date | None
+    committed: bool
+    uncovered: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,6 +670,131 @@ class IndependentPlanValidator:
             )
         return result
 
+    def _supply_segments(
+        self,
+        requirement: _SourceRequirement,
+    ) -> tuple[_SupplySegment, ...]:
+        """Independently allocate existing supply once in deadline order."""
+
+        supplies: list[list[object]] = []
+        if requirement.on_hand > ZERO:
+            supplies.append([requirement.on_hand, None, False])
+        supplies.extend(
+            [quantity, delivery, True]
+            for _number, quantity, delivery in requirement.inbound
+        )
+        supply_index = 0
+        result: list[_SupplySegment] = []
+        for bucket_index, (due, quantity) in enumerate(
+            requirement.bucket_quantities
+        ):
+            remaining = quantity
+            while remaining > ZERO and supply_index < len(supplies):
+                available, material_date, committed = supplies[supply_index]
+                assert isinstance(available, Decimal)
+                assigned = min(remaining, available)
+                result.append(
+                    _SupplySegment(
+                        bucket_index,
+                        due,
+                        assigned,
+                        material_date if isinstance(material_date, date) else None,
+                        bool(committed),
+                        False,
+                    )
+                )
+                remaining -= assigned
+                supplies[supply_index][0] = available - assigned
+                if supplies[supply_index][0] == ZERO:
+                    supply_index += 1
+            if remaining > ZERO:
+                result.append(
+                    _SupplySegment(
+                        bucket_index,
+                        due,
+                        remaining,
+                        None,
+                        False,
+                        True,
+                    )
+                )
+        return tuple(result)
+
+    def _recovery_segments(
+        self,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+    ) -> tuple[_SupplySegment, ...]:
+        return tuple(
+            segment
+            for segment in self._supply_segments(requirement)
+            if segment.committed
+            and segment.material_available is not None
+            and segment.material_available > segment.due_date
+            and any(
+                segment.due_date in offer.allowed_buckets
+                and offer.material_available < segment.material_available
+                for offer in offers
+            )
+        )
+
+    def _recovery_demand(
+        self,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+    ) -> Decimal:
+        return sum(
+            (item.quantity for item in self._recovery_segments(requirement, offers)),
+            ZERO,
+        )
+
+    def _deadline_lateness(
+        self,
+        requirement: _SourceRequirement,
+        plan: CandidatePlan | None,
+    ) -> tuple[DeadlineLateness, ...]:
+        supplies: list[list[object]] = []
+        if requirement.on_hand > ZERO:
+            supplies.append([requirement.on_hand, None])
+        supplies.extend(
+            [quantity, delivery]
+            for _number, quantity, delivery in requirement.inbound
+        )
+        if plan is not None:
+            supplies.extend(
+                [line.quantity, line.material_available_date]
+                for line in plan.lines
+            )
+        supplies.sort(
+            key=lambda item: date.min if item[1] is None else item[1]
+        )
+        supply_index = 0
+        result: list[DeadlineLateness] = []
+        for due, quantity in requirement.bucket_quantities:
+            remaining = quantity
+            late = ZERO
+            unit_late_days = ZERO
+            while remaining > ZERO and supply_index < len(supplies):
+                available, material_date = supplies[supply_index]
+                assert isinstance(available, Decimal)
+                assigned = min(remaining, available)
+                if isinstance(material_date, date) and material_date > due:
+                    late += assigned
+                    unit_late_days += assigned * Decimal(
+                        (material_date - due).days
+                    )
+                remaining -= assigned
+                supplies[supply_index][0] = available - assigned
+                if supplies[supply_index][0] == ZERO:
+                    supply_index += 1
+            if remaining > ZERO:
+                late += remaining
+            if late > ZERO:
+                result.append(
+                    DeadlineLateness(due, late, unit_late_days, remaining)
+                )
+        return tuple(result)
+
     def _required_certifications(self, component: Component, current: date) -> tuple[str, ...]:
         required = {
             part.strip()
@@ -963,11 +1100,21 @@ class IndependentPlanValidator:
 
         secondary = self._minimum_secondary(snapshot, requirement.component)
         allocation = self._allocation_surplus_bound(requirement, catalogs, secondary)
-        # The assembled default problem authorizes no discretionary recovery
-        # quantity.  Deadline shortfall is an objective, not an implicit
-        # enlargement of U; adding it here would reconstruct a different
-        # model and can make bounded exact enumeration needlessly explode.
-        base = requirement.total_demand + allocation
+        # The route-aware planner may buy a bridge against committed late
+        # supply.  Use the independently reconstructed physical late segments
+        # as the safe pre-offer bound; solve construction below applies the
+        # stricter route-specific recovery authorization.
+        physical_recovery_bound = sum(
+            (
+                item.quantity
+                for item in self._supply_segments(requirement)
+                if item.committed
+                and item.material_available is not None
+                and item.material_available > item.due_date
+            ),
+            ZERO,
+        )
+        base = requirement.total_demand + physical_recovery_bound + allocation
         return {
             item.supplier_id: max(base, item.minimum_order_quantity)
             for item in catalogs
@@ -1215,6 +1362,81 @@ class IndependentPlanValidator:
         named_quantity = quantities.get(named.supplier_id or "", ZERO)
         return max((max(ZERO, value - named_quantity) for key, value in quantities.items() if key != named.supplier_id), default=ZERO)
 
+    def _plan_recovery_capacity(
+        self,
+        requirement: _SourceRequirement,
+        plan: CandidatePlan,
+        offers: Sequence[_Offer],
+    ) -> Decimal:
+        """Bound classified recovery from the plan's actual route allocations."""
+
+        matched = {
+            line.route_id: self._match_offer(offers, line)
+            for line in plan.lines
+        }
+        source_segments = self._supply_segments(requirement)
+        total_capacity = ZERO
+        recovered = ZERO
+        for bucket_index, (due, _quantity) in enumerate(
+            requirement.bucket_quantities
+        ):
+            route_capacity: list[list[object]] = []
+            for line in plan.lines:
+                offer = matched[line.route_id]
+                if offer is None:
+                    continue
+                allocated = sum(
+                    (
+                        allocation.quantity
+                        for allocation in line.bucket_allocations
+                        if allocation.due_date == due
+                    ),
+                    ZERO,
+                )
+                if allocated > ZERO:
+                    route_capacity.append(
+                        [offer.material_available, offer.route_fingerprint, allocated]
+                    )
+            total_capacity += sum(
+                (item[2] for item in route_capacity if isinstance(item[2], Decimal)),
+                ZERO,
+            )
+            late_segments = sorted(
+                (
+                    segment
+                    for segment in source_segments
+                    if segment.bucket_index == bucket_index
+                    and segment.committed
+                    and segment.material_available is not None
+                    and segment.material_available > due
+                ),
+                key=lambda item: item.material_available or date.max,
+            )
+            for segment in late_segments:
+                remaining = segment.quantity
+                assert segment.material_available is not None
+                for route in sorted(
+                    route_capacity,
+                    key=lambda item: (item[0], item[1]),
+                    reverse=True,
+                ):
+                    material_available, _fingerprint, available = route
+                    assert isinstance(material_available, date)
+                    assert isinstance(available, Decimal)
+                    if material_available >= segment.material_available:
+                        continue
+                    assigned = min(remaining, available)
+                    remaining -= assigned
+                    route[2] = available - assigned
+                    recovered += assigned
+                    if remaining == ZERO:
+                        break
+        recovery_budget = max(
+            ZERO,
+            total_capacity - plan.eventual_covered_quantity,
+        )
+        return min(recovered, recovery_budget)
+
     def _objective(
         self,
         snapshot: ScenarioSnapshot,
@@ -1239,9 +1461,8 @@ class IndependentPlanValidator:
             physical_gaps.append(max(ZERO, requirement.cumulative_demand(due) - requirement.on_time_supply(due) - planned))
         unit_late = sum(
             (
-                allocation.quantity * Decimal(max(0, (line.material_available_date - allocation.due_date).days))
-                for line in plan.lines
-                for allocation in line.bucket_allocations
+                item.unit_late_days
+                for item in self._deadline_lateness(requirement, plan)
             ),
             ZERO,
         )
@@ -1320,7 +1541,12 @@ class IndependentPlanValidator:
             strategic_penalty,
             sustainability_penalty,
             plan.total_cost,
-            max(ZERO, total_quantity - requirement.eventual_gap),
+            max(
+                ZERO,
+                total_quantity
+                - requirement.eventual_gap
+                - plan.recovery_quantity,
+            ),
             weighted_lead,
             Decimal(len(plan.lines)),
         )
@@ -1352,7 +1578,20 @@ class IndependentPlanValidator:
             )
             for due, _bucket in requirement.bucket_quantities
         )
-        unit_late = ZERO
+        # Synthetic phased search is retained as the tiny differential oracle.
+        # It receives the same existing-commitment lateness offset as the
+        # independently built MILP; recovery deltas are handled in that MILP.
+        unit_late = sum(
+            (
+                segment.quantity
+                * Decimal((segment.material_available - segment.due_date).days)
+                for segment in self._supply_segments(requirement)
+                if segment.committed
+                and segment.material_available is not None
+                and segment.material_available > segment.due_date
+            ),
+            ZERO,
+        )
         international = ZERO
         strategic = ZERO
         sustainable = ZERO
@@ -1448,7 +1687,12 @@ class IndependentPlanValidator:
             strategic,
             sustainable,
             cost,
-            max(ZERO, total - requirement.eventual_gap),
+            max(
+                ZERO,
+                total
+                - requirement.eventual_gap
+                - self._recovery_demand(requirement, offers),
+            ),
             lead,
             Decimal(sum(1 for value in allocation.values() if value > ZERO)),
         )
@@ -1998,12 +2242,32 @@ class IndependentPlanValidator:
             self._increment(requirement.component), atom
         )
         model = _IndependentMilpModel()
+        source_segments = self._supply_segments(requirement)
+        uncovered_by_bucket = tuple(
+            sum(
+                (
+                    segment.quantity
+                    for segment in source_segments
+                    if segment.bucket_index == bucket_index
+                    and segment.uncovered
+                ),
+                ZERO,
+            )
+            for bucket_index in range(len(requirement.bucket_quantities))
+        )
+        recovery_segments = self._recovery_segments(requirement, offers)
+        recovery_demand = sum(
+            (segment.quantity for segment in recovery_segments),
+            ZERO,
+        )
         upper_atoms = tuple(
             _floor_units(offer.upper_bound, atom) for offer in offers
         )
         x: list[int] = []
         y: list[int] = []
         z: list[tuple[int, ...]] = []
+        baseline_allocations: list[tuple[int, ...]] = []
+        recovery_allocations: list[tuple[int, ...]] = []
         for offer_index, (offer, upper) in enumerate(
             zip(offers, upper_atoms, strict=True)
         ):
@@ -2024,9 +2288,36 @@ class IndependentPlanValidator:
                     requirement.bucket_quantities
                 )
             )
+            baseline_vars = tuple(
+                model.add_variable(
+                    f"baseline[{offer_index},{bucket_index}]",
+                    0,
+                    min(
+                        upper,
+                        _ceil_units(uncovered_by_bucket[bucket_index], atom),
+                    ),
+                )
+                for bucket_index in range(len(requirement.bucket_quantities))
+            )
+            recovery_vars = tuple(
+                model.add_variable(
+                    f"recovery[{offer_index},{segment_index}]",
+                    0,
+                    (
+                        min(upper, _ceil_units(segment.quantity, atom))
+                        if segment.due_date in offer.allowed_buckets
+                        and segment.material_available is not None
+                        and offer.material_available < segment.material_available
+                        else 0
+                    ),
+                )
+                for segment_index, segment in enumerate(recovery_segments)
+            )
             x.append(x_var)
             y.append(y_var)
             z.append(z_vars)
+            baseline_allocations.append(baseline_vars)
+            recovery_allocations.append(recovery_vars)
             model.add_row(
                 {x_var: 1, step_var: -increment_atoms},
                 lower=0,
@@ -2037,11 +2328,51 @@ class IndependentPlanValidator:
                 lower=0,
                 upper=0,
             )
+            for bucket_index, z_variable in enumerate(z_vars):
+                model.add_row(
+                    {
+                        baseline_vars[bucket_index]: 1,
+                        **{
+                            recovery_vars[segment_index]: 1
+                            for segment_index, segment in enumerate(
+                                recovery_segments
+                            )
+                            if segment.bucket_index == bucket_index
+                        },
+                        z_variable: -1,
+                    },
+                    upper=0,
+                )
             minimum = _ceil_units(
                 offer.catalog.minimum_order_quantity, atom
             )
             model.add_row({x_var: 1, y_var: -minimum}, lower=0)
             model.add_row({x_var: 1, y_var: -upper}, upper=0)
+
+        for bucket_index, quantity in enumerate(uncovered_by_bucket):
+            model.add_row(
+                {
+                    baseline_allocations[offer_index][bucket_index]: 1
+                    for offer_index in range(len(offers))
+                },
+                upper=_ceil_units(quantity, atom),
+            )
+        for segment_index, segment in enumerate(recovery_segments):
+            model.add_row(
+                {
+                    recovery_allocations[offer_index][segment_index]: 1
+                    for offer_index in range(len(offers))
+                },
+                upper=_ceil_units(segment.quantity, atom),
+            )
+        model.add_row(
+            {
+                recovery_allocations[offer_index][segment_index]: 1
+                for offer_index in range(len(offers))
+                for segment_index in range(len(recovery_segments))
+            },
+            upper=_ceil_units(recovery_demand, atom),
+        )
 
         by_supplier: dict[str, list[int]] = defaultdict(list)
         for index, offer in enumerate(offers):
@@ -2083,7 +2414,16 @@ class IndependentPlanValidator:
             "eventual_gap", 0, eventual_gap_atoms
         )
         model.add_row(
-            {eventual_gap: 1, **{variable: 1 for variable in x}},
+            {
+                eventual_gap: 1,
+                **{
+                    baseline_allocations[offer_index][bucket_index]: 1
+                    for offer_index in range(len(offers))
+                    for bucket_index in range(
+                        len(requirement.bucket_quantities)
+                    )
+                },
+            },
             lower=eventual_gap_atoms,
         )
         unresolved: list[int] = []
@@ -2127,34 +2467,114 @@ class IndependentPlanValidator:
                 upper=0,
             )
 
+        planning_requirement = requirement.eventual_gap + recovery_demand
+        total_upper = sum(upper_atoms)
+        q_min_atoms = _ceil_units(q_min or ZERO, atom)
+        forced_atoms = max(0, q_min_atoms - eventual_gap_atoms)
+        recovery_coefficients = {
+            recovery_allocations[offer_index][segment_index]: -1
+            for offer_index in range(len(offers))
+            for segment_index in range(len(recovery_segments))
+        }
         moq_excess = model.add_variable(
-            "moq_excess", 0, sum(upper_atoms)
+            "moq_excess", 0, total_upper
         )
         model.add_row(
-            {moq_excess: 1, **{variable: -1 for variable in x}},
+            {
+                moq_excess: 1,
+                **{variable: -1 for variable in x},
+                **{
+                    recovery_allocations[offer_index][segment_index]: 1
+                    for offer_index in range(len(offers))
+                    for segment_index in range(len(recovery_segments))
+                },
+            },
             lower=-eventual_gap_atoms,
         )
+
+        discretionary = model.add_variable(
+            "discretionary_surplus", 0, total_upper
+        )
+        discretionary_coefficients = {
+            discretionary: 1,
+            **{variable: -1 for variable in x},
+        }
+        if not recovery_segments:
+            model.add_row(
+                discretionary_coefficients,
+                lower=-q_min_atoms,
+            )
+        elif forced_atoms == 0:
+            model.add_row(
+                {
+                    **discretionary_coefficients,
+                    **{
+                        variable: -coefficient
+                        for variable, coefficient in recovery_coefficients.items()
+                    },
+                },
+                lower=-q_min_atoms,
+            )
+        else:
+            recovery_credit = model.add_variable(
+                "recovery_credit", 0, total_upper
+            )
+            recovery_credit_active = model.add_variable(
+                "recovery_credit_active", 0, 1
+            )
+            model.add_row(
+                {recovery_credit: 1, **recovery_coefficients},
+                upper=0,
+            )
+            model.add_row(
+                {
+                    recovery_credit: 1,
+                    recovery_credit_active: -total_upper,
+                },
+                upper=0,
+            )
+            model.add_row(
+                {
+                    recovery_credit: 1,
+                    **recovery_coefficients,
+                    recovery_credit_active: total_upper,
+                },
+                upper=total_upper - forced_atoms,
+            )
+            model.add_row(
+                {
+                    **discretionary_coefficients,
+                    recovery_credit: 1,
+                },
+                lower=-q_min_atoms,
+            )
 
         if solve_kind is SolveKind.EXECUTABLE:
             if q_min is None or cheapest_covering_cost is None:
                 return IndependentSolve(
                     SolverStatus.ERROR, (), certificate_complete=False
                 )
-            q_min_atoms = _ceil_units(q_min, atom)
             model.add_row(
-                {variable: 1 for variable in x}, lower=q_min_atoms
+                {
+                    baseline_allocations[offer_index][bucket_index]: 1
+                    for offer_index in range(len(offers))
+                    for bucket_index in range(
+                        len(requirement.bucket_quantities)
+                    )
+                },
+                lower=_ceil_units(min(q_min, requirement.eventual_gap), atom),
             )
             surplus_cap = (
                 self.autonomy.max_surplus_fraction
-                * requirement.eventual_gap
+                * planning_requirement
             )
             if self.autonomy.max_surplus_units is not None:
                 surplus_cap = min(
                     surplus_cap, self.autonomy.max_surplus_units
                 )
             model.add_row(
-                {variable: 1 for variable in x},
-                upper=Fraction(q_min + surplus_cap) / Fraction(atom),
+                {discretionary: 1},
+                upper=Fraction(surplus_cap) / Fraction(atom),
             )
             cost_coefficients = {
                 x[index]: Fraction(offer.catalog.unit_price * atom)
@@ -2261,27 +2681,51 @@ class IndependentPlanValidator:
                 value = minimize({variable: 1})
                 assert value is not None
                 objective.append(_decimal(value * Fraction(atom)))
-            late = minimize(
-                {
-                    z[offer_index][bucket_index]: max(
-                        0,
-                        (
-                            offer.material_available
-                            - requirement.bucket_quantities[bucket_index][0]
-                        ).days,
+            late_coefficients: dict[int, Fraction | int] = {}
+            committed_late = sum(
+                (
+                    segment.quantity
+                    * Decimal(
+                        (segment.material_available - segment.due_date).days
                     )
-                    for offer_index, offer in enumerate(offers)
-                    for bucket_index in range(
-                        len(requirement.bucket_quantities)
-                    )
-                }
+                    for segment in source_segments
+                    if segment.committed
+                    and segment.material_available is not None
+                    and segment.material_available > segment.due_date
+                ),
+                ZERO,
             )
+            late_offset = model.add_variable(
+                "committed_lateness_offset",
+                _ceil_units(committed_late, atom),
+                _ceil_units(committed_late, atom),
+            )
+            late_coefficients[late_offset] = 1
+            for offer_index, offer in enumerate(offers):
+                for bucket_index, (due, _quantity) in enumerate(
+                    requirement.bucket_quantities
+                ):
+                    late_coefficients[
+                        baseline_allocations[offer_index][bucket_index]
+                    ] = max(0, (offer.material_available - due).days)
+                for segment_index, segment in enumerate(recovery_segments):
+                    assert segment.material_available is not None
+                    late_coefficients[
+                        recovery_allocations[offer_index][segment_index]
+                    ] = (
+                        max(
+                            0,
+                            (offer.material_available - segment.due_date).days,
+                        )
+                        - (segment.material_available - segment.due_date).days
+                    )
+            late = minimize(late_coefficients)
             assert late is not None
             objective.append(_decimal(late * Fraction(atom)))
-            total = minimize({variable: 1 for variable in x})
-            assert total is not None
+            discretionary_value = minimize({discretionary: 1})
+            assert discretionary_value is not None
             objective.append(
-                _decimal(total * Fraction(atom)) - q_min
+                _decimal(discretionary_value * Fraction(atom))
             )
             review = minimize({variable: 1 for variable in review_variables})
             assert review is not None
@@ -2495,6 +2939,16 @@ class IndependentPlanValidator:
                 ),
                 minimum_compliant_total=q_min,
                 cheapest_covering_cost=cheapest_covering_cost,
+                recovery_quantity=Decimal(
+                    sum(
+                        last_values[
+                            recovery_allocations[offer_index][segment_index]
+                        ]
+                        for offer_index in range(len(offers))
+                        for segment_index in range(len(recovery_segments))
+                    )
+                )
+                * atom,
             )
         except _IndependentSolveInterrupted as interrupted:
             return IndependentSolve(
@@ -2544,11 +2998,24 @@ class IndependentPlanValidator:
             else ZERO
         )
         maximum_units = _floor_units(group_bound, increment)
+        source_segments = self._supply_segments(requirement)
+        uncovered_bucket_indexes = {
+            segment.bucket_index
+            for segment in source_segments
+            if segment.uncovered and segment.quantity > ZERO
+        }
         use_enumeration = (
             self.solver_limits.force_status is None
             and maximum_units <= self.tiny_case_unit_limit
             and len(offers) <= 3
             and len(requirement.bucket_quantities) <= 3
+            and not self._recovery_segments(requirement, offers)
+            and all(
+                offer.material_available
+                <= requirement.bucket_quantities[bucket_index][0]
+                for offer in offers
+                for bucket_index in uncovered_bucket_indexes
+            )
         )
         if use_enumeration:
             return self._independently_enumerate(
@@ -3036,16 +3503,53 @@ class IndependentPlanValidator:
                 sink.error("EXCEPTION_AGGREGATE_CAP", "Exception quantity exceeds the aggregate net shortage of qualifying buckets.", component_id=component_id, plan_id=plan_id)
         total_quantity = sum((line.quantity for line in plan.lines), ZERO)
         independently_covered = min(requirement.eventual_gap, total_quantity)
+        independent_recovery_demand = self._recovery_demand(
+            requirement,
+            offers,
+        )
         if plan.net_requirement != requirement.eventual_gap or plan.eventual_covered_quantity != independently_covered or plan.residual_gap != requirement.eventual_gap - independently_covered:
             sink.error("PLAN_COVERAGE_MISMATCH", "Plan requirement, eventual coverage, or residual does not match exact source arithmetic.", component_id=component_id, plan_id=plan_id)
+        if plan.recovery_demand != independent_recovery_demand:
+            sink.error(
+                "RECOVERY_DEMAND_MISMATCH",
+                "Recovery demand was not independently reconstructed from strictly earlier eligible routes.",
+                component_id=component_id,
+                plan_id=plan_id,
+            )
+        recovery_capacity = self._plan_recovery_capacity(
+            requirement,
+            plan,
+            offers,
+        )
+        if plan.recovery_quantity > recovery_capacity:
+            sink.error(
+                "RECOVERY_QUANTITY_MISMATCH",
+                "Recovery quantity exceeds strictly improving quantity supported by the plan's actual route allocations.",
+                component_id=component_id,
+                plan_id=plan_id,
+            )
         if plan.total_cost != sum((line.quantity * catalogs[(line.component_id, line.supplier_id)].unit_price for line in plan.lines if (line.component_id, line.supplier_id) in catalogs), ZERO):
             sink.error("PLAN_COST_MISMATCH", "Plan total cost does not equal source catalog price times quantity.", component_id=component_id, plan_id=plan_id)
         if plan.minimum_compliant_total is not None:
             forced = max(ZERO, plan.minimum_compliant_total - plan.net_requirement)
-            discretionary = max(ZERO, total_quantity - plan.minimum_compliant_total)
-            if plan.forced_surplus != forced or plan.discretionary_surplus != discretionary:
+            recovery_headroom = max(
+                ZERO,
+                plan.recovery_quantity - forced,
+            )
+            discretionary = max(
+                ZERO,
+                total_quantity
+                - plan.minimum_compliant_total
+                - recovery_headroom,
+            )
+            if (
+                plan.forced_surplus != forced
+                or plan.discretionary_surplus != discretionary
+            ):
                 sink.error("SURPLUS_SPLIT_MISMATCH", "Forced and discretionary surplus were not independently split at solve-Q minimum.", component_id=component_id, plan_id=plan_id)
-            cap = self.autonomy.max_surplus_fraction * plan.net_requirement
+            cap = self.autonomy.max_surplus_fraction * (
+                plan.net_requirement + independent_recovery_demand
+            )
             if self.autonomy.max_surplus_units is not None:
                 cap = min(cap, self.autonomy.max_surplus_units)
             if plan.discretionary_surplus > cap and plan.disposition.writes_purchase_order:
@@ -3150,6 +3654,79 @@ class IndependentPlanValidator:
                     plan_id=plan_id,
                 )
         self._check_evidence(snapshot, decision, plan, sink)
+
+    def _check_time_phased_ledger(
+        self,
+        decision: DecisionRecord,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+        sink: _IssueSink,
+    ) -> None:
+        positions = {
+            item.due_date: item
+            for item in decision.supply_ledger.deadline_positions
+        }
+        segments = self._supply_segments(requirement)
+        for bucket_index, (due, _quantity) in enumerate(
+            requirement.bucket_quantities
+        ):
+            position = positions.get(due)
+            if position is None:
+                sink.error(
+                    "DEADLINE_POSITION_MISSING",
+                    "Supply ledger omits a source demand deadline.",
+                    component_id=decision.component_id,
+                )
+                continue
+            on_time = requirement.on_time_supply(due)
+            gap = max(ZERO, requirement.cumulative_demand(due) - on_time)
+            late_segments = tuple(
+                item
+                for item in segments
+                if item.bucket_index == bucket_index
+                and item.committed
+                and item.material_available is not None
+                and item.material_available > due
+            )
+            committed_late = sum(
+                (item.quantity for item in late_segments), ZERO
+            )
+            committed_late_days = sum(
+                (
+                    item.quantity
+                    * Decimal((item.material_available - due).days)
+                    for item in late_segments
+                    if item.material_available is not None
+                ),
+                ZERO,
+            )
+            recoverable = sum(
+                (
+                    item.quantity
+                    for item in late_segments
+                    if item.material_available is not None
+                    and any(
+                        due in offer.allowed_buckets
+                        and offer.material_available < item.material_available
+                        for offer in offers
+                    )
+                ),
+                ZERO,
+            )
+            if (
+                position.cumulative_demand
+                != requirement.cumulative_demand(due)
+                or position.on_time_supply != on_time
+                or position.on_time_gap != gap
+                or position.committed_late_quantity != committed_late
+                or position.committed_unit_late_days != committed_late_days
+                or position.recoverable_gap != recoverable
+            ):
+                sink.error(
+                    "TIME_PHASED_LEDGER_MISMATCH",
+                    "On-time gap, committed lateness, or strict-improvement recovery differs from independent reconstruction.",
+                    component_id=decision.component_id,
+                )
 
     def _check_evidence(self, snapshot: ScenarioSnapshot, decision: DecisionRecord, plan: CandidatePlan, sink: _IssueSink) -> None:
         active = {item.rule_id: item for item in self.registry.active_rules(snapshot.configuration.current_date)}
@@ -3290,6 +3867,18 @@ class IndependentPlanValidator:
                 sink.error("BASELINE_COST_MISMATCH", "Persisted cheapest_covering_cost differs from independent solve 0.", component_id=decision.component_id, plan_id=selected.plan_id)
                 verified = False
             if (
+                independently_proven.get(SolveKind.EXECUTABLE)
+                and executable_own.recovery_quantity
+                != selected.recovery_quantity
+            ):
+                sink.error(
+                    "RECOVERY_QUANTITY_MISMATCH",
+                    "Persisted recovery quantity differs from the independent executable solve's classified recovery allocation.",
+                    component_id=decision.component_id,
+                    plan_id=selected.plan_id,
+                )
+                verified = False
+            if (
                 independently_proven.get(SolveKind.BASELINE)
                 and selected.cheapest_covering_cost is not None
                 and selected.total_cost - selected.cheapest_covering_cost
@@ -3362,6 +3951,12 @@ class IndependentPlanValidator:
                 continue
             self._check_decision_facts(snapshot, decision, requirement, sink)
             offers = self._offers(snapshot, requirement, decision.evidence_contract, include_unapproved=True)
+            self._check_time_phased_ledger(
+                decision,
+                requirement,
+                offers,
+                sink,
+            )
             for plan in tuple(item for item in (decision.selected_plan, *decision.alternatives) if item is not None):
                 self._check_plan(snapshot, decision, requirement, plan, offers, sink)
                 plan_action_keys: set[tuple[object, ...]] = set()
@@ -3376,6 +3971,28 @@ class IndependentPlanValidator:
                     if plan.disposition.writes_purchase_order:
                         executable_action_keys.add(key)
             self._check_capacity(snapshot, decision, sink)
+            expected_lateness = self._deadline_lateness(
+                requirement,
+                decision.selected_plan,
+            )
+            if decision.deadline_lateness != expected_lateness:
+                sink.error(
+                    "DEADLINE_LATENESS_MISMATCH",
+                    "Post-plan missed deadlines, quantities, or unit-late-days differ from independent FIFO reconstruction.",
+                    component_id=decision.component_id,
+                )
+            if expected_lateness and AlertCategory.LATE_ARRIVAL not in decision.alert_categories:
+                sink.error(
+                    "LATE_ARRIVAL_ALERT_MISSING",
+                    "Every positive post-plan deadline miss requires LATE_ARRIVAL.",
+                    component_id=decision.component_id,
+                )
+            if not expected_lateness and AlertCategory.LATE_ARRIVAL in decision.alert_categories:
+                sink.error(
+                    "LATE_ARRIVAL_ALERT_UNSCOPED",
+                    "LATE_ARRIVAL is present without an independently reconstructed deadline miss.",
+                    component_id=decision.component_id,
+                )
             existing_coverage = min(requirement.total_demand, requirement.eventual_supply)
             planned = decision.selected_plan.eventual_covered_quantity if decision.selected_plan is not None else ZERO
             expected_covered = min(requirement.total_demand, existing_coverage + planned)
@@ -3403,12 +4020,10 @@ class IndependentPlanValidator:
             if not decision.rationale.strip() or not citations:
                 sink.error("RATIONALE_CITATION_MISSING", "Decision rationale must cite at least one active policy source.", component_id=decision.component_id)
         for component_id, requirement in source.items():
-            if requirement.eventual_gap <= ZERO:
-                continue
             records = by_component.get(component_id, ())
-            if len(records) != 1:
+            if requirement.eventual_gap > ZERO and len(records) != 1:
                 sink.error("INITIAL_GAP_DECISION_CARDINALITY", "Every positive initial gap requires exactly one DecisionRecord.", component_id=component_id)
-            elif records[0].selected_plan is None and not (set(records[0].alert_categories) & _TERMINAL_ALERTS):
+            elif requirement.eventual_gap > ZERO and records[0].selected_plan is None and not (set(records[0].alert_categories) & _TERMINAL_ALERTS):
                 sink.error("SILENT_INITIAL_GAP", "An initial gap without executable PO requires a terminal component-specific alert.", component_id=component_id)
         for component_id, records in by_component.items():
             if len(records) > 1:
@@ -3438,6 +4053,7 @@ class IndependentPlanValidator:
                 "no-silent-gap-and-requirement-state",
                 "policy-window-comparators-6-8",
                 "rationale-citations-and-capacity-disclosure",
+                "time-phased-recovery-lateness-and-alerts",
                 "u-derivation",
             ),
             issues=tuple(sink.values),
