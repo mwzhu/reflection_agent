@@ -24,6 +24,10 @@ ASSIGNED_SCENARIOS = (
     PROJECT_ROOT / "data" / "scenarios" / "scenario_01_baseline.sqlite",
     PROJECT_ROOT / "data" / "scenarios" / "scenario_03_tight_timeline.sqlite",
 )
+IDEMPOTENCY_SCENARIOS = (
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_01_baseline.sqlite",
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_06_simple.sqlite",
+)
 
 
 def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -83,6 +87,77 @@ class AssembledCliTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(output_rows(self.path), rows_after_first)
         self.assertIn('"no_op":true', second.stdout)
+
+    def test_first_rerun_after_managed_orders_is_an_exact_no_op(self) -> None:
+        for source in IDEMPOTENCY_SCENARIOS:
+            with self.subTest(scenario=source.name):
+                scenario = Path(self.temporary_directory.name) / f"rerun-{source.name}"
+                shutil.copy2(source, scenario)
+
+                first = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+                rows_after_first = output_rows(scenario)
+                second = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+
+                self.assertEqual(first.returncode, 0, first.stderr)
+                self.assertGreater(len(rows_after_first[0]), 0)
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual(output_rows(scenario), rows_after_first)
+                self.assertIn('"inserted_alert_count":0', second.stdout)
+                self.assertIn('"deleted_alert_count":0', second.stdout)
+                self.assertIn('"no_op":true', second.stdout)
+
+                with closing(sqlite3.connect(scenario)) as connection:
+                    accounting_count = connection.execute(
+                        "SELECT COUNT(*) FROM alerts "
+                        "WHERE description LIKE '%category=RUN_ACCOUNTING%'"
+                    ).fetchone()[0]
+                    order_counts = connection.execute(
+                        "SELECT COUNT(*), COUNT(DISTINCT po_number) FROM purchase_orders"
+                    ).fetchone()
+                self.assertEqual(accounting_count, 1)
+                self.assertEqual(order_counts[0], order_counts[1])
+
+    def test_changed_inventory_creates_a_new_action_without_replacing_commitments(self) -> None:
+        scenario = Path(self.temporary_directory.name) / "changed-inventory.sqlite"
+        shutil.copy2(SOURCE, scenario)
+        arguments = (
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        first = self.command(*arguments)
+        orders_after_first = set(output_rows(scenario)[0])
+        self.assertEqual(first.returncode, 0, first.stderr)
+        managed_component = sorted(orders_after_first)[0][1]
+        with closing(sqlite3.connect(scenario)) as connection:
+            connection.execute(
+                "UPDATE inventory SET quantity_on_hand = quantity_on_hand - 1 "
+                "WHERE component_id = ?",
+                (managed_component,),
+            )
+            connection.commit()
+
+        changed = self.command(*arguments)
+        orders_after_change = set(output_rows(scenario)[0])
+
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        self.assertIn('"no_op":false', changed.stdout)
+        self.assertTrue(orders_after_first < orders_after_change)
 
     def test_default_contract_reconciles_optimizer_and_validator_objectives(self) -> None:
         scenario = Path(self.temporary_directory.name) / "scenario_objective.sqlite"

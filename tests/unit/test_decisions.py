@@ -38,6 +38,7 @@ from apex_procurement.domain import (
     ValidationResult,
 )
 from apex_procurement.explanations import make_owned_alert, render_alerts
+from apex_procurement.ledgers import build_ledgers
 from apex_procurement.repository import SQLiteRepository
 
 
@@ -330,18 +331,15 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
         stored_order = after_first.purchase_orders[0]
         parsed = parse_owned_purchase_order(stored_order)
         assert parsed is not None
-        owned_inbound = InboundSupply(
-            po_number=stored_order.po_number,
-            component_id=stored_order.component_id,
-            supplier_id=stored_order.supplier_id,
-            quantity=stored_order.quantity,
-            expected_delivery_date=stored_order.expected_delivery_date,  # type: ignore[arg-type]
-            order_date=stored_order.order_date,
-            unit_price=stored_order.unit_price,
-            agent_owned=True,
-            action_key=parsed.action_key,
-            demand_fingerprint=parsed.demand_fingerprint,
+        managed_ledger = build_ledgers(after_first).ledger_for(stored_order.component_id)
+        owned_inbound = next(
+            item
+            for item in managed_ledger.committed_inbound
+            if item.po_number == stored_order.po_number
         )
+        self.assertTrue(owned_inbound.agent_owned)
+        self.assertEqual(owned_inbound.action_key, parsed.action_key)
+        self.assertEqual(owned_inbound.demand_fingerprint, parsed.demand_fingerprint)
         closed_by_owned_inbound = make_decision(
             selected_plan=None,
             inbound=(owned_inbound,),
