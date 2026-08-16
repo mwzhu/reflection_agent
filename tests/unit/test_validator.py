@@ -427,6 +427,18 @@ class IndependentValidatorMutationTests(unittest.TestCase):
                     self.validate_mutation(decision),
                 )
 
+    def test_total_quantity_cannot_replace_stage_9_moq_excess(self) -> None:
+        plan = self.decision.selected_plan
+        assert plan is not None
+        index = 1 + _EXECUTABLE_OBJECTIVE_SUFFIX.index("stage_09_moq_excess")
+        total_quantity = sum((line.quantity for line in plan.lines), Decimal("0"))
+        self.assertNotEqual(plan.objective_vector[index], total_quantity)
+        values = list(plan.objective_vector)
+        values[index] = total_quantity
+        mutated = replace(plan, objective_vector=tuple(values))
+        decision = replace(self.decision, selected_plan=mutated)
+        self.assertIn("OBJECTIVE_VECTOR_MISMATCH", self.validate_mutation(decision))
+
     def test_feasible_but_suboptimal_incumbent_is_rejected(self) -> None:
         second = _supplier("supplier-b", name="Generated Cheap Supply")
         snapshot = _snapshot(
@@ -566,14 +578,13 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
                 Decimal("0"),   # stage 7 strategic shift
                 Decimal("0"),   # stage 8 sustainability band
                 Decimal("10"),  # stage 9 known landed cost
-                Decimal("5"),   # stage 9 total, affine to MOQ excess
+                Decimal("0"),   # stage 9 MOQ-driven excess
                 Decimal("15"),  # stage 10 total lead time
                 Decimal("1"),   # stage 10 line count
-                Decimal("5"),   # stage 10 ID-free fingerprint rank
             ),
         )
 
-    def test_stage_4_counts_reviewed_rules_not_assumption_codes(self) -> None:
+    def test_stage_4_counts_normalized_assumption_codes_not_reviewed_rules(self) -> None:
         component = Component(
             "component-review",
             "Pressure Transducer",
@@ -586,15 +597,14 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
         decision, _results, _validator = _decision_and_results(snapshot)
         plan = decision.selected_plan
         assert plan is not None
-        self.assertEqual(plan.assumption_codes, ("ROLLING_HISTORY_UNKNOWN",))
-        self.assertEqual(plan.objective_vector[3], Decimal("2"))
+        self.assertEqual(plan.objective_vector[3], Decimal("3"))
 
-    def test_stage_10_fingerprint_rank_excludes_surrogate_supplier_ids(self) -> None:
+    def test_stage_10_semantic_tie_excludes_surrogate_supplier_ids(self) -> None:
         first = _supplier("supplier-first", name="Generated Alpha Supply")
         second = _supplier("supplier-second", name="Generated Beta Supply")
         catalogs = (
             SupplierCatalogLine(first.supplier_id, "component-a", Decimal("2"), 3, Decimal("1")),
-            SupplierCatalogLine(second.supplier_id, "component-a", Decimal("3"), 3, Decimal("1")),
+            SupplierCatalogLine(second.supplier_id, "component-a", Decimal("2"), 3, Decimal("1")),
         )
         snapshot = _snapshot(suppliers=(first, second), catalogs=catalogs)
         decision, _results, validator = _decision_and_results(snapshot)
@@ -604,12 +614,13 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
             snapshot, type("Sink", (), {"error": lambda *args, **kwargs: None})()
         )["component-a"]
         offers = validator._offers(snapshot, requirement, EvidenceContract.BENCHMARK)
-        selected_offer = validator._match_offer(offers, plan.lines[0])
-        assert selected_offer is not None
-        expected = plan.lines[0].quantity * Decimal(
-            validator._fingerprint_ranks(offers)[selected_offer]
+        original_solve = validator.independently_solve(
+            snapshot, decision, SolveKind.EXECUTABLE
         )
-        self.assertEqual(plan.objective_vector[-1], expected)
+        self.assertEqual(
+            original_solve.allocation,
+            ((offers[0].supplier.supplier_id, Decimal("5")),),
+        )
 
         renamed_first = replace(first, supplier_id="renamed-first")
         renamed_second = replace(second, supplier_id="renamed-second")
@@ -622,9 +633,30 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
         )
         renamed_decision, _renamed_results, _renamed_validator = _decision_and_results(renamed)
         assert renamed_decision.selected_plan is not None
+        renamed_solve = _renamed_validator.independently_solve(
+            renamed, renamed_decision, SolveKind.EXECUTABLE
+        )
+        renamed_requirement = _renamed_validator._source_requirements(
+            renamed, type("Sink", (), {"error": lambda *args, **kwargs: None})()
+        )["component-a"]
+        renamed_offers = _renamed_validator._offers(
+            renamed, renamed_requirement, EvidenceContract.BENCHMARK
+        )
         self.assertEqual(
-            renamed_decision.selected_plan.objective_vector[-1],
-            plan.objective_vector[-1],
+            renamed_decision.selected_plan.objective_vector,
+            plan.objective_vector,
+        )
+        self.assertEqual(
+            renamed_solve.allocation,
+            ((renamed_offers[0].supplier.supplier_id, Decimal("5")),),
+        )
+        names = {supplier.supplier_id: supplier.name for supplier in snapshot.suppliers}
+        renamed_names = {
+            supplier.supplier_id: supplier.name for supplier in renamed.suppliers
+        }
+        self.assertEqual(
+            names[original_solve.allocation[0][0]],
+            renamed_names[renamed_solve.allocation[0][0]],
         )
 
     def test_larger_quantity_case_completes_all_three_independent_solves(self) -> None:

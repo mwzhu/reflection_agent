@@ -80,7 +80,6 @@ _EXECUTABLE_OBJECTIVE_SUFFIX = (
     "stage_09_moq_excess",
     "stage_10_total_lead_time",
     "stage_10_line_count",
-    "stage_10_id_free_tie",
 )
 
 
@@ -171,7 +170,7 @@ class _Offer:
     lead_days: int
     shipping_method: str
     international: bool
-    review_exposure: int
+    review_keys: frozenset[str]
     allowed_buckets: tuple[date, ...]
     gate_conditions: tuple[tuple[date, str], ...]
     upper_bound: Decimal
@@ -586,14 +585,14 @@ class IndependentPlanValidator:
             return EvidenceStatus.FAIL
         return EvidenceStatus.UNKNOWN if EvidenceStatus.UNKNOWN in statuses else EvidenceStatus.PASS
 
-    def _rolling_review_exposure(
+    def _rolling_review_keys(
         self,
         snapshot: ScenarioSnapshot,
         component: Component,
         contract: EvidenceContract,
-    ) -> int:
+    ) -> frozenset[str]:
         if contract is not EvidenceContract.BENCHMARK:
-            return 0
+            return frozenset()
         applicable = {
             rule.rule_id: rule
             for rule in self.registry.active_rules(snapshot.configuration.current_date)
@@ -611,18 +610,26 @@ class IndependentPlanValidator:
             for relation in ("supersedes", "outranks"):
                 for target in precedence.get(relation, ()):
                     applicable.pop(str(target), None)
-        return len(applicable)
+        keys = {"ROLLING_HISTORY_UNKNOWN"} if applicable else set()
+        if any(
+            self._selector_status(rule, component) is EvidenceStatus.UNKNOWN
+            for rule in applicable.values()
+        ):
+            keys.update(("INFERRED_CONCEPT_MEMBERSHIP", "ROBUST_BOTH_WAYS"))
+        return frozenset(keys)
 
-    def _review_exposure(
+    def _review_keys(
         self,
         snapshot: ScenarioSnapshot,
         requirement: _SourceRequirement,
         supplier: Supplier,
         contract: EvidenceContract,
-    ) -> int:
-        """Reconstruct route-level stage-4 review coefficients from source facts."""
+    ) -> frozenset[str]:
+        """Reconstruct normalized stage-4 assumption keys from source facts."""
 
-        count = self._rolling_review_exposure(snapshot, requirement.component, contract)
+        keys = set(
+            self._rolling_review_keys(snapshot, requirement.component, contract)
+        )
         pcb_rules = self._rules(snapshot.configuration.current_date, "incumbent_supplier_only")
         if (
             contract is EvidenceContract.BENCHMARK
@@ -638,13 +645,13 @@ class IndependentPlanValidator:
                 for item in snapshot.purchase_orders
             )
             if prior or self._relationship_predates(supplier, pcb_rules[0].effective_from):
-                count += 1
+                keys.add("PCB_INCUMBENCY_INFERRED")
         rating = _rating(supplier.sustainability_rating)
         if rating is not None and rating < _rating("B"):
             named = self._named_primary(snapshot, requirement.component)
             if named is not None and named.resolved and named.supplier_id == supplier.supplier_id:
-                count += 1
-        return count
+                keys.add("BELOW_B_REVIEW_DISCHARGED_BY_MEMO")
+        return frozenset(keys)
 
     def _hard_eligible(
         self,
@@ -824,7 +831,7 @@ class IndependentPlanValidator:
                 bound = min(bound, allowance)
             if bound < catalog.minimum_order_quantity:
                 continue
-            review_exposure = self._review_exposure(
+            review_keys = self._review_keys(
                 snapshot, requirement, supplier, contract
             )
             supplier_hash = _supplier_fingerprint(supplier)
@@ -841,7 +848,7 @@ class IndependentPlanValidator:
                     catalog.lead_time_days,
                     "standard",
                     international,
-                    review_exposure,
+                    review_keys,
                     allowed_buckets,
                     tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
                     bound,
@@ -893,7 +900,7 @@ class IndependentPlanValidator:
                     air_lead,
                     "air freight",
                     international,
-                    review_exposure,
+                    review_keys,
                     air_allowed,
                     tuple((due, gate[due] or "shut") for due, _quantity in requirement.bucket_quantities),
                     air_bound,
@@ -924,20 +931,21 @@ class IndependentPlanValidator:
         )
         return matches[0] if len(matches) == 1 else None
 
-    def _fingerprint_ranks(self, offers: Sequence[_Offer]) -> dict[_Offer, int]:
-        return {
-            offer: rank
-            for rank, offer in enumerate(
-                sorted(
-                    offers,
-                    key=lambda item: (
-                        item.supplier_fingerprint,
-                        item.route_fingerprint,
-                    ),
-                ),
-                start=1,
+    @staticmethod
+    def _semantic_tie_key(
+        offers: Sequence[_Offer], allocation: Mapping[int, Decimal]
+    ) -> tuple[tuple[str, str, Decimal], ...]:
+        return tuple(
+            sorted(
+                (
+                    offers[index].supplier_fingerprint,
+                    offers[index].route_fingerprint,
+                    quantity,
+                )
+                for index, quantity in allocation.items()
+                if quantity > ZERO
             )
-        }
+        )
 
     def _named_deviation(
         self, snapshot: ScenarioSnapshot, component: Component, quantities: Mapping[str, Decimal]
@@ -971,16 +979,18 @@ class IndependentPlanValidator:
             ),
             ZERO,
         )
-        # Stage 4 is route review exposure, not the number of normalized
-        # assumption codes.  One UNKNOWN rule can disclose several codes, and
-        # robust both-ways evaluation can expose two rules with shared codes.
-        review = sum(
-            (
-                Decimal(offer.review_exposure)
-                for offer in matched.values()
-                if offer is not None
-            ),
-            ZERO,
+        # Stage 4 counts the normalized union of assumption codes.  Multiple
+        # policy branches can depend on the same unknown fact, so counting
+        # evidence rows or per-route totals would double-charge it.
+        review = Decimal(
+            len(
+                {
+                    key
+                    for offer in matched.values()
+                    if offer is not None
+                    for key in offer.review_keys
+                }
+            )
         )
         quantities: dict[str, Decimal] = defaultdict(Decimal)
         for line in plan.lines:
@@ -1035,15 +1045,6 @@ class IndependentPlanValidator:
         weighted_lead = sum(
             (line.quantity * Decimal((line.expected_delivery_date - line.order_date).days) for line in plan.lines), ZERO
         )
-        fingerprint_ranks = self._fingerprint_ranks(offers)
-        fingerprint_tie = sum(
-            (
-                line.quantity * Decimal(fingerprint_ranks[offer])
-                for line in plan.lines
-                if (offer := matched[line.route_id]) is not None
-            ),
-            ZERO,
-        )
         return tuple(physical_gaps) + (
             unit_late,
             plan.discretionary_surplus,
@@ -1053,13 +1054,9 @@ class IndependentPlanValidator:
             strategic_penalty,
             sustainability_penalty,
             plan.total_cost,
-            # The integer certificate records total ordered quantity.  Since
-            # net requirement is fixed inside a solve, this is exactly the
-            # affine MOQ-excess subobjective documented by §8.
-            total_quantity,
+            max(ZERO, total_quantity - requirement.eventual_gap),
             weighted_lead,
             Decimal(len(plan.lines)),
-            fingerprint_tie,
         )
 
     def _synthetic_objective(
@@ -1085,10 +1082,8 @@ class IndependentPlanValidator:
         sustainable = ZERO
         cost = ZERO
         lead = ZERO
-        review = ZERO
+        review_keys: set[str] = set()
         quantities: dict[str, Decimal] = defaultdict(Decimal)
-        fingerprint_ranks = self._fingerprint_ranks(offers)
-        fingerprint_tie = ZERO
         for index, quantity in allocation.items():
             if quantity == ZERO:
                 continue
@@ -1096,8 +1091,7 @@ class IndependentPlanValidator:
             quantities[offer.supplier.supplier_id] += quantity
             cost += quantity * offer.catalog.unit_price
             lead += quantity * Decimal(offer.lead_days)
-            review += Decimal(offer.review_exposure)
-            fingerprint_tie += quantity * Decimal(fingerprint_ranks[offer])
+            review_keys.update(offer.review_keys)
             due = min(
                 offer.allowed_buckets,
                 key=lambda item: (
@@ -1138,16 +1132,15 @@ class IndependentPlanValidator:
         return physical_gaps + (
             unit_late,
             max(ZERO, total - q_min),
-            review,
+            Decimal(len(review_keys)),
             named,
             international,
             strategic,
             sustainable,
             cost,
-            total,
+            max(ZERO, total - requirement.eventual_gap),
             lead,
             Decimal(sum(1 for value in allocation.values() if value > ZERO)),
-            fingerprint_tie,
         )
 
     # ---- separate integer enumeration --------------------------------
@@ -1298,7 +1291,11 @@ class IndependentPlanValidator:
         if self.autonomy.max_surplus_units is not None:
             surplus_limit = min(surplus_limit, self.autonomy.max_surplus_units)
         upper_units = min(maximum_units, _floor_units(q_min + surplus_limit, increment))
-        best: tuple[tuple[Decimal, ...], dict[int, Decimal]] | None = None
+        best: tuple[
+            tuple[Decimal, ...],
+            tuple[tuple[str, str, Decimal], ...],
+            dict[int, Decimal],
+        ] | None = None
         nodes = [0]
         for total_units in range(lower_units, upper_units + 1):
             for vector in self._vectors_for_total(total_units, offers, increment, secondary, named_supplier, nodes):
@@ -1308,8 +1305,9 @@ class IndependentPlanValidator:
                 )
                 if objective[cost_index] - baseline.cheapest_covering_cost > self.autonomy.max_excess_cost_usd:
                     continue
-                if best is None or objective < best[0]:
-                    best = (objective, vector)
+                semantic_tie = self._semantic_tie_key(offers, vector)
+                if best is None or (objective, semantic_tie) < best[:2]:
+                    best = (objective, semantic_tie, vector)
             if nodes[0] > self.enumeration_node_limit:
                 return IndependentSolve(SolverStatus.RESOURCE_LIMIT, (), certificate_complete=False)
         if best is None:
@@ -1317,7 +1315,7 @@ class IndependentPlanValidator:
         return IndependentSolve(
             SolverStatus.OPTIMAL,
             best[0],
-            tuple(sorted((offers[index].supplier.supplier_id, quantity) for index, quantity in best[1].items())),
+            tuple(sorted((offers[index].supplier.supplier_id, quantity) for index, quantity in best[2].items())),
             minimum_compliant_total=q_min,
             cheapest_covering_cost=baseline.cheapest_covering_cost,
         )
