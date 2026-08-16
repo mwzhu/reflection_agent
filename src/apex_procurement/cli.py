@@ -8,12 +8,16 @@ remain owned by their respective public subsystem boundaries.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import IntEnum
 from pathlib import Path
 import sys
+from time import perf_counter_ns
+
+from .audit import audit_json_line, deterministic_run_id, file_sha256
 
 from .candidates import (
     CandidateBuildResult,
@@ -59,6 +63,7 @@ from .optimizer import (
     OptimizerProblem,
     OrderApprovalConstraint,
     ProcurementOptimizer,
+    SolverLimits,
 )
 from .policy.entity_resolution import EntityResolver
 from .policy.evaluator import EvaluationBatch, EvaluationContext, PolicyEvaluator
@@ -70,8 +75,9 @@ from .repository import (
     ScenarioLoadError,
     ScenarioPathError,
     ScenarioSchemaError,
+    resolve_scenario_path,
 )
-from .serialization import canonical_dumps
+from .serialization import canonical_dumps, sanitize_control_characters
 from .validator import IndependentPlanValidator
 
 
@@ -108,6 +114,7 @@ class RunArtifacts:
     validation: ValidationResult
     outputs: DecisionOutputs
     commit: CommitResult
+    audit_json_lines: tuple[str, ...] = ()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -681,21 +688,168 @@ def _has_unproven_primary_solve(results: Sequence[SolverResult]) -> bool:
     )
 
 
-def run(config: RuntimeConfig) -> RunArtifacts:
-    """Execute one deterministic, validate-before-write planning run."""
+def _successful_audit_line(
+    *,
+    config: RuntimeConfig,
+    attempt: int,
+    input_hash: str,
+    snapshot: ScenarioSnapshot,
+    registry: PolicyRegistry,
+    ledgers: LedgerBuildResult,
+    candidates: CandidateBuildResult,
+    solver_results: tuple[SolverResult, ...],
+    validation: ValidationResult,
+    commit: CommitResult,
+    active_directives: tuple[str, ...],
+    inactive_directives: tuple[str, ...],
+    timings_us: Mapping[str, int],
+) -> str:
+    active_rules = registry.active_rules(snapshot.configuration.current_date)
+    active_rule_ids = {item.rule_id for item in active_rules}
+    compiler = registry.pack.get("compiler", {})
+    limits = SolverLimits()
+    rejection_counts = Counter(item.code for item in candidates.rejections)
+    fields: dict[str, object] = {
+        "run_id": deterministic_run_id(
+            input_hash=input_hash,
+            snapshot_digest=snapshot.state_digest,
+            contract=config.contract.value,
+            attempt=attempt,
+        ),
+        "replan_count": attempt,
+        "contract": config.contract.value,
+        "model_mode": config.model_mode.value,
+        "hashes": {
+            "scenario_file": input_hash,
+            "snapshot": f"sha256:{snapshot.state_digest}",
+            "policy_pack": registry.content_hash,
+            "concepts": registry.concepts_hash,
+        },
+        "rule_versions": {
+            "pack_id": registry.pack_id,
+            "schema_version": str(registry.pack.get("schema_version", "unknown")),
+            "compiler_version": str(
+                compiler.get("version", "unknown")
+                if isinstance(compiler, Mapping)
+                else "unknown"
+            ),
+            "rules": tuple(
+                {
+                    "rule_id": item.rule_id,
+                    "effective_from": item.effective_from,
+                    "effective_through": item.effective_through,
+                }
+                for item in registry.rules
+            ),
+        },
+        "active_rule_ids": tuple(sorted(active_rule_ids)),
+        "inactive_rule_ids": tuple(
+            item.rule_id for item in registry.rules if item.rule_id not in active_rule_ids
+        ),
+        "active_directive_ids": active_directives,
+        "inactive_directive_ids": inactive_directives,
+        "active_evidence_document_ids": tuple(
+            sorted({item.source_document for item in active_rules})
+        ),
+        "inactive_evidence_document_ids": tuple(
+            sorted(
+                {
+                    item.source_document
+                    for item in registry.rules
+                    if item.rule_id not in active_rule_ids
+                }
+            )
+        ),
+        "component_ledgers": tuple(
+            {
+                "component_id": ledger.component_id,
+                "total_demand": ledger.total_demand,
+                "eventual_supply": ledger.eventual_supply,
+                "eventual_gap": ledger.eventual_gap,
+                "deadlines": tuple(
+                    {
+                        "due_date": item.due_date,
+                        "cumulative_demand": item.cumulative_demand,
+                        "on_time_supply": item.on_time_supply,
+                        "on_time_gap": item.on_time_gap,
+                        "recoverable_gap": item.recoverable_gap,
+                    }
+                    for item in ledger.deadline_positions
+                ),
+            }
+            for ledger in ledgers.supply_ledgers
+        ),
+        "candidate_rejection_counts": dict(sorted(rejection_counts.items())),
+        "solver_limits": {
+            "time_limit_seconds": (
+                str(limits.time_limit_seconds)
+                if limits.time_limit_seconds is not None
+                else None
+            ),
+            "node_limit": limits.node_limit,
+        },
+        "solver_outcomes": tuple(
+            {
+                "component_id": item.component_id,
+                "solve_kind": item.solve_kind.value,
+                "status": item.status.value,
+                "exact_post_validated": item.exact_post_validated,
+                "stages": tuple(
+                    {
+                        "stage_name": stage.stage_name,
+                        "status": stage.status.value,
+                        "certificate_complete": stage.certificate_complete,
+                        "hit_resource_limit": stage.hit_resource_limit,
+                        "mip_gap": stage.mip_gap,
+                    }
+                    for stage in item.stage_results
+                ),
+            }
+            for item in solver_results
+        ),
+        "validation": {
+            "is_valid": validation.is_valid,
+            "completed": validation.completed,
+            "exact_decimal_checks_completed": validation.exact_decimal_checks_completed,
+            "solver_results_verified": validation.solver_results_verified,
+            "issue_codes": tuple(item.code for item in validation.issues),
+        },
+        "commit": {
+            "dry_run": config.dry_run,
+            "committed_po_numbers": commit.committed_po_numbers,
+            "inserted_alert_count": commit.inserted_alert_count,
+            "deleted_alert_count": commit.deleted_alert_count,
+            "no_op": commit.no_op,
+        },
+        "timings_us": dict(timings_us),
+    }
+    return audit_json_line("run_completed", fields)
 
-    if config.recompile_policy:
-        raise OptionalModelUnavailable(
-            "live policy recompilation is unavailable; use the reviewed compiled policy pack"
-        )
-    if config.model_mode is ModelMode.REQUIRED:
-        raise OptionalModelUnavailable(
-            "--llm=required is unavailable because no optional model adapter is installed"
-        )
 
-    snapshot = SQLiteRepository().load_snapshot(config.scenario_path)
+def _run_once(
+    config: RuntimeConfig,
+    scenario_path: Path,
+    *,
+    attempt: int,
+) -> RunArtifacts:
+    """Plan, validate, and commit one optimistic-concurrency attempt."""
+
+    timings_us: dict[str, int] = {}
+    run_started = perf_counter_ns()
+    input_hash = file_sha256(scenario_path)
+
+    phase_started = perf_counter_ns()
+    snapshot = SQLiteRepository().load_snapshot(scenario_path)
+    timings_us["snapshot_load"] = (perf_counter_ns() - phase_started) // 1_000
+
+    phase_started = perf_counter_ns()
     registry = load_policy_registry()
+    timings_us["policy_load"] = (perf_counter_ns() - phase_started) // 1_000
+
+    phase_started = perf_counter_ns()
     ledgers = build_ledgers(snapshot)
+    timings_us["ledger_build"] = (perf_counter_ns() - phase_started) // 1_000
+    phase_started = perf_counter_ns()
     evaluations = _component_evaluations(
         snapshot, registry, config.contract, ledgers
     )
@@ -727,6 +881,7 @@ def run(config: RuntimeConfig) -> RunArtifacts:
             ),
             evaluations,
         )
+    timings_us["candidate_build"] = (perf_counter_ns() - phase_started) // 1_000
 
     component_ids = tuple(item.component_id for item in ledgers.supply_ledgers)
     if (
@@ -741,6 +896,7 @@ def run(config: RuntimeConfig) -> RunArtifacts:
     decisions: list[DecisionRecord] = []
     solver_results: list[SolverResult] = []
     optimizer = ProcurementOptimizer()
+    phase_started = perf_counter_ns()
     for component_id in component_ids:
         ledger = ledgers.ledger_for(component_id)
         batch = evaluations[component_id]
@@ -780,11 +936,14 @@ def run(config: RuntimeConfig) -> RunArtifacts:
                 component_id,
             )
         )
+    timings_us["optimization"] = (perf_counter_ns() - phase_started) // 1_000
 
     planned = tuple(sorted(decisions, key=lambda item: item.component_id))
     result_tuple = tuple(solver_results)
+    phase_started = perf_counter_ns()
     validator = IndependentPlanValidator(registry)
     validation = validator.validate(snapshot, planned, result_tuple)
+    timings_us["validation"] = (perf_counter_ns() - phase_started) // 1_000
     if not validation.is_valid:
         details = "; ".join(
             f"{item.code}: {item.message}" for item in validation.issues
@@ -822,8 +981,9 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         inactive_directives=inactive,
         visible_alert_prefixes=config.alert_prefixes,
     )
+    phase_started = perf_counter_ns()
     commit = commit_decisions(
-        config.scenario_path,
+        scenario_path,
         snapshot,
         reconciled,
         validation,
@@ -833,6 +993,24 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         active_directives=active,
         inactive_directives=inactive,
         visible_alert_prefixes=config.alert_prefixes,
+    )
+    timings_us["commit"] = (perf_counter_ns() - phase_started) // 1_000
+    timings_us["total"] = (perf_counter_ns() - run_started) // 1_000
+
+    audit_line = _successful_audit_line(
+        config=config,
+        attempt=attempt,
+        input_hash=input_hash,
+        snapshot=snapshot,
+        registry=registry,
+        ledgers=ledgers,
+        candidates=candidates,
+        solver_results=result_tuple,
+        validation=validation,
+        commit=commit,
+        active_directives=active,
+        inactive_directives=inactive,
+        timings_us=timings_us,
     )
     return RunArtifacts(
         snapshot,
@@ -844,7 +1022,33 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         validation,
         outputs,
         commit,
+        (audit_line,),
     )
+
+
+def run(config: RuntimeConfig) -> RunArtifacts:
+    """Execute one deterministic run, replanning once on a stale snapshot."""
+
+    if config.recompile_policy:
+        raise OptionalModelUnavailable(
+            "live policy recompilation is unavailable; use the reviewed compiled policy pack"
+        )
+    if config.model_mode is ModelMode.REQUIRED:
+        raise OptionalModelUnavailable(
+            "--llm=required is unavailable because no optional model adapter is installed"
+        )
+
+    scenario_path = resolve_scenario_path(config.scenario_path)
+    for attempt in range(2):
+        try:
+            return _run_once(config, scenario_path, attempt=attempt)
+        except ConcurrentModificationError as error:
+            if attempt == 1:
+                raise ConcurrentModificationError(
+                    "scenario changed again after one full replan; no duplicate decision "
+                    "writes were made"
+                ) from error
+    raise AssertionError("unreachable concurrency retry state")
 
 
 def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str, object]:
@@ -898,33 +1102,53 @@ def render_result(config: RuntimeConfig, artifacts: RunArtifacts) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI boundary with the operations exit-code contract from section 14."""
 
+    error_type = "UnknownError"
     try:
         config = parse_config(argv)
         artifacts = run(config)
+        for line in artifacts.audit_json_lines:
+            print(line, file=sys.stderr)
         print(render_result(config, artifacts))
         return ExitCode.SUCCESS
     except (CliUsageError, ScenarioPathError) as error:
         code = ExitCode.CLI_OR_PATH
         message = str(error)
+        error_type = type(error).__name__
     except (ScenarioDataError, ScenarioSchemaError, ScenarioLoadError) as error:
         code = ExitCode.INVALID_SCENARIO
         message = str(error)
+        error_type = type(error).__name__
     except (PolicyValidationError, OptionalModelUnavailable) as error:
         code = ExitCode.INVALID_POLICY
         message = str(error)
+        error_type = type(error).__name__
     except PlanningFailure as error:
         code = ExitCode.SOLVER_OR_VALIDATOR
         message = str(error)
+        error_type = type(error).__name__
     except ConcurrentModificationError as error:
         code = ExitCode.CONCURRENT_MODIFICATION
         message = str(error)
+        error_type = type(error).__name__
     except (CommitFailure, DecisionError) as error:
         code = ExitCode.COMMIT_FAILURE
         message = str(error)
+        error_type = type(error).__name__
     except (TypeError, ValueError, ArithmeticError) as error:
         code = ExitCode.SOLVER_OR_VALIDATOR
         message = str(error)
-    print(f"error: {message}", file=sys.stderr)
+        error_type = type(error).__name__
+    print(
+        audit_json_line(
+            "run_failed",
+            {
+                "exit_code": int(code),
+                "error_type": error_type,
+            },
+        ),
+        file=sys.stderr,
+    )
+    print(f"error: {sanitize_control_characters(message)}", file=sys.stderr)
     return code
 
 

@@ -25,7 +25,7 @@ from .domain import (
     ZERO,
 )
 from .policy.registry import PolicyRegistry, load_policy_registry
-from .serialization import canonical_dumps
+from .serialization import canonical_dumps, sanitize_control_characters
 
 
 ALERT_MARKER_VERSION = 1
@@ -204,7 +204,7 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         else "none"
     )
     rules = _evidence_rule_ids(decision, decision.selected_plan)
-    return (
+    return sanitize_control_characters(
         f"Requirement {decision.requirement_id} for component {decision.component_id}: "
         f"demand [{demand}]; on hand {_number(decision.supply_ledger.on_hand)}; "
         f"counted inbound [{inbound}]; initial eventual gap "
@@ -245,7 +245,7 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
     ) or "none"
     objective = ", ".join(_number(item) for item in plan.objective_vector) or "none"
     lead_days = (line.expected_delivery_date - line.order_date).days
-    return (
+    return sanitize_control_characters(
         f"Requirement {decision.requirement_id}; component {decision.component_id}; "
         f"supplier {line.supplier_id}; route {line.route_id}; ordered quantity "
         f"{_number(line.quantity)} at unit price {_number(line.unit_price)} for line total "
@@ -316,6 +316,8 @@ def make_owned_alert(
 
     if not isinstance(category, AlertCategory):
         raise TypeError("category must be AlertCategory")
+    scope = sanitize_control_characters(scope)
+    body = sanitize_control_characters(body)
     _require_safe_text(scope, "scope")
     _require_safe_text(body, "body")
     visible = f"[{category.value}] {body}" if visible_prefix else body

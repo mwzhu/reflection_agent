@@ -382,7 +382,9 @@ class OptimizationOutcome:
 
 @dataclass(frozen=True, slots=True)
 class SolverLimits:
-    time_limit_seconds: float | None = None
+    # Every live solve is bounded.  Tests may still provide a smaller explicit
+    # limit, but the production default must never depend on an unbounded MILP.
+    time_limit_seconds: float | None = 30.0
     node_limit: int = 250_000
     force_status: SolverStatus | None = None
     force_mip_gap: Decimal | None = None

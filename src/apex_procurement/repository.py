@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import sqlite3
 from typing import Callable, TypeVar
+import unicodedata
 
 from .domain import (
     BomLine,
@@ -46,6 +47,12 @@ class ScenarioSchemaError(ScenarioLoadError):
 
 class ScenarioDataError(ScenarioLoadError):
     """A known scenario field or semantic reference is invalid."""
+
+
+MAX_SCENARIO_BYTES = 256 * 1024 * 1024
+MAX_TABLE_ROWS = 100_000
+MAX_TOTAL_ROWS = 500_000
+MAX_TEXT_BYTES = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +156,52 @@ _DECIMAL_PATTERN = re.compile(
 _IDENTIFIER_PATTERN = re.compile(r"[a-z_]+\Z")
 _SQLITE_INTEGER_MIN = Decimal("-9223372036854775808")
 _SQLITE_INTEGER_MAX = Decimal("9223372036854775807")
+_DANGEROUS_FORMAT_CONTROLS = frozenset(
+    {
+        0x061C,
+        0x200E,
+        0x200F,
+        0xFEFF,
+        *range(0x202A, 0x202F),
+        *range(0x2066, 0x206A),
+    }
+)
 _ItemT = TypeVar("_ItemT")
+
+
+def resolve_scenario_path(scenario_path: Path, /) -> Path:
+    """Return one canonical regular-file path without following a final symlink.
+
+    The final-component symlink check makes the path presented to the loader and
+    writer unambiguous.  Parent directories are canonicalised so relative paths
+    and platform aliases (for example macOS' ``/var``) remain usable.
+    """
+
+    if not isinstance(scenario_path, Path):
+        raise TypeError("scenario_path must be pathlib.Path")
+    try:
+        if scenario_path.is_symlink():
+            raise ScenarioPathError(
+                f"scenario path must not be a symbolic link: {scenario_path}"
+            )
+        resolved_path = scenario_path.resolve(strict=True)
+        status = resolved_path.stat(follow_symlinks=False)
+    except ScenarioPathError:
+        raise
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise ScenarioPathError(
+            f"scenario path is not a readable file: {scenario_path}"
+        ) from error
+    if not resolved_path.is_file():
+        raise ScenarioPathError(
+            f"scenario path is not a readable file: {scenario_path}"
+        )
+    if status.st_size > MAX_SCENARIO_BYTES:
+        raise ScenarioPathError(
+            "scenario path exceeds the maximum supported database size "
+            f"of {MAX_SCENARIO_BYTES} bytes"
+        )
+    return resolved_path
 
 
 def _quoted(identifier: str) -> str:
@@ -161,6 +213,41 @@ def _quoted(identifier: str) -> str:
 def _display(value: object) -> str:
     rendered = ascii(value)
     return rendered if len(rendered) <= 120 else f"{rendered[:117]}..."
+
+
+def _unsafe_unicode(value: str) -> bool:
+    """Reject terminal controls, bidi controls, and malformed surrogate text."""
+
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return True
+    return any(
+        unicodedata.category(character) in {"Cc", "Cs"}
+        or ord(character) in _DANGEROUS_FORMAT_CONTROLS
+        for character in value
+    )
+
+
+def _validate_text_size_and_unicode(
+    value: str,
+    table: str,
+    key: tuple[tuple[str, object], ...],
+    column: str,
+) -> None:
+    try:
+        byte_length = len(value.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError as error:
+        raise _data_error(table, key, column, "contains malformed Unicode") from error
+    if byte_length > MAX_TEXT_BYTES:
+        raise _data_error(
+            table,
+            key,
+            column,
+            f"exceeds the maximum supported text size of {MAX_TEXT_BYTES} bytes",
+        )
+    if _unsafe_unicode(value):
+        raise _data_error(table, key, column, "must not contain control characters")
 
 
 def _row_location(table: str, key: tuple[tuple[str, object], ...]) -> str:
@@ -193,8 +280,7 @@ def _required_text(
         raise _data_error(table, key, column, "must be text")
     if not value.strip():
         raise _data_error(table, key, column, "must be non-empty text")
-    if any(ord(character) < 32 for character in value):
-        raise _data_error(table, key, column, "must not contain control characters")
+    _validate_text_size_and_unicode(value, table, key, column)
     return value
 
 
@@ -208,8 +294,7 @@ def _optional_text(
         return None
     if not isinstance(value, str):
         raise _data_error(table, key, column, "must be text or NULL")
-    if any(ord(character) < 32 for character in value):
-        raise _data_error(table, key, column, "must not contain control characters")
+    _validate_text_size_and_unicode(value, table, key, column)
     return value
 
 
@@ -388,24 +473,16 @@ class SQLiteRepository:
     """Load a validated immutable snapshot from a SQLite database, read-only."""
 
     def load_snapshot(self, scenario_path: Path, /) -> ScenarioSnapshot:
-        if not isinstance(scenario_path, Path):
-            raise TypeError("scenario_path must be pathlib.Path")
-        try:
-            resolved_path = scenario_path.resolve(strict=True)
-        except (FileNotFoundError, OSError) as error:
-            raise ScenarioPathError(
-                f"scenario path is not a readable file: {scenario_path}"
-            ) from error
-        if not resolved_path.is_file():
-            raise ScenarioPathError(
-                f"scenario path is not a readable file: {scenario_path}"
-            )
+        resolved_path = resolve_scenario_path(scenario_path)
 
         uri = f"{resolved_path.as_uri()}?mode=ro"
         try:
             with closing(sqlite3.connect(uri, uri=True)) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.enable_load_extension(False)
+                if hasattr(connection, "setlimit"):
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 100_000)
                 connection.execute("PRAGMA query_only = ON")
                 connection.execute("PRAGMA trusted_schema = OFF")
                 connection.execute("BEGIN")
@@ -486,11 +563,60 @@ class SQLiteRepository:
         )
         return tuple(sorted(rows, key=_raw_sort_key))
 
+    @staticmethod
+    def _validate_input_limits(
+        connection: sqlite3.Connection,
+        available: dict[str, frozenset[str]],
+    ) -> None:
+        total_rows = 0
+        for table in sorted(_TABLE_COLUMNS):
+            count = connection.execute(
+                f"SELECT count(*) AS {_quoted('row_count')} FROM {_quoted(table)}"
+            ).fetchone()["row_count"]
+            if not isinstance(count, int) or count < 0:
+                raise ScenarioLoadError("scenario database returned an invalid row count")
+            if count > MAX_TABLE_ROWS:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{table}' exceeds the row limit "
+                    f"of {MAX_TABLE_ROWS}"
+                )
+            total_rows += count
+            if total_rows > MAX_TOTAL_ROWS:
+                raise ScenarioDataError(
+                    "scenario data error: database exceeds the total row limit "
+                    f"of {MAX_TOTAL_ROWS}"
+                )
+
+            present = tuple(
+                column
+                for column in _TABLE_COLUMNS[table]
+                if column.source.casefold() in available[table]
+            )
+            if not present or count == 0:
+                continue
+            expressions = ", ".join(
+                f"max(length(CAST({_quoted(column.source)} AS BLOB))) "
+                f"AS {_quoted(column.alias)}"
+                for column in present
+            )
+            maxima = connection.execute(
+                f"SELECT {expressions} FROM {_quoted(table)}"
+            ).fetchone()
+            for column in present:
+                maximum = maxima[column.alias]
+                if isinstance(maximum, int) and maximum > MAX_TEXT_BYTES:
+                    raise ScenarioDataError(
+                        f"scenario data error: table '{table}' column "
+                        f"'{column.source}' exceeds the maximum supported value size "
+                        f"of {MAX_TEXT_BYTES} bytes"
+                    )
+
     def _load(
         self,
         connection: sqlite3.Connection,
         available: dict[str, frozenset[str]],
     ) -> ScenarioSnapshot:
+        self._validate_input_limits(connection, available)
         rows_by_table = {
             table: self._read_rows(connection, table, available[table])
             for table in sorted(_TABLE_COLUMNS)
@@ -1015,10 +1141,15 @@ def load_snapshot(scenario_path: Path, /) -> ScenarioSnapshot:
 
 
 __all__ = [
+    "MAX_SCENARIO_BYTES",
+    "MAX_TABLE_ROWS",
+    "MAX_TEXT_BYTES",
+    "MAX_TOTAL_ROWS",
     "SQLiteRepository",
     "ScenarioDataError",
     "ScenarioLoadError",
     "ScenarioPathError",
     "ScenarioSchemaError",
     "load_snapshot",
+    "resolve_scenario_path",
 ]

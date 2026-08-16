@@ -33,7 +33,12 @@ from .explanations import (
     validate_stored_alert,
 )
 from .policy.registry import PolicyRegistry
-from .repository import SQLiteRepository, ScenarioLoadError
+from .repository import (
+    SQLiteRepository,
+    ScenarioLoadError,
+    ScenarioPathError,
+    resolve_scenario_path,
+)
 from .serialization import canonical_dumps, canonical_loads
 
 
@@ -606,6 +611,11 @@ def _source_state(snapshot: ScenarioSnapshot) -> tuple[object, ...]:
     )
 
 
+def _file_identity(path: Path) -> tuple[int, int]:
+    status = path.stat(follow_symlinks=False)
+    return status.st_dev, status.st_ino
+
+
 class AtomicDecisionWriter:
     """Write validated decision rows with digest recheck and full rollback."""
 
@@ -664,28 +674,46 @@ class AtomicDecisionWriter:
             visible_alert_prefixes=self._visible_alert_prefixes,
         )
         try:
-            resolved = self._scenario_path.resolve(strict=True)
-        except (OSError, FileNotFoundError) as error:
-            raise CommitFailure(f"scenario path is not a writable file: {self._scenario_path}") from error
-        if not resolved.is_file():
-            raise CommitFailure(f"scenario path is not a writable file: {self._scenario_path}")
+            resolved = resolve_scenario_path(self._scenario_path)
+            expected_identity = _file_identity(resolved)
+        except (ScenarioPathError, OSError) as error:
+            raise CommitFailure(
+                f"scenario path is not a writable file: {self._scenario_path}"
+            ) from error
 
         try:
             with closing(
                 sqlite3.connect(
-                    resolved,
+                    f"{resolved.as_uri()}?mode=rw",
+                    uri=True,
                     isolation_level=None,
                     timeout=self._timeout_seconds,
                 )
             ) as connection:
                 connection.row_factory = sqlite3.Row
                 connection.enable_load_extension(False)
+                if hasattr(connection, "setlimit"):
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+                    connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 100_000)
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute("PRAGMA trusted_schema = OFF")
-                return self._commit_locked(connection, snapshot, outputs, dry_run=dry_run)
+                return self._commit_locked(
+                    connection,
+                    snapshot,
+                    outputs,
+                    dry_run=dry_run,
+                    resolved_path=resolved,
+                    expected_identity=expected_identity,
+                )
         except DecisionError:
             raise
-        except (sqlite3.Error, UnicodeError, ScenarioLoadError, ExplanationError) as error:
+        except (
+            OSError,
+            sqlite3.Error,
+            UnicodeError,
+            ScenarioLoadError,
+            ExplanationError,
+        ) as error:
             raise CommitFailure("atomic decision commit failed and was rolled back") from error
 
     def _commit_locked(
@@ -695,6 +723,8 @@ class AtomicDecisionWriter:
         outputs: DecisionOutputs,
         *,
         dry_run: bool,
+        resolved_path: Path,
+        expected_identity: tuple[int, int],
     ) -> CommitResult:
         inserted_numbers: list[str] = []
         inserted_alerts = 0
@@ -703,6 +733,10 @@ class AtomicDecisionWriter:
         try:
             connection.execute("BEGIN IMMEDIATE")
             began = True
+            if _file_identity(resolved_path) != expected_identity:
+                raise ConcurrentModificationError(
+                    "scenario file identity changed after planning; no decision rows were written"
+                )
             columns = SQLiteRepository._validate_schema(connection)
             current = SQLiteRepository()._load(connection, columns)
             if current.state_digest != snapshot.state_digest or current != snapshot:
@@ -812,6 +846,10 @@ class AtomicDecisionWriter:
                 stored_owned,
             )
             self._step(CommitStep.POSTCONDITIONS_CHECKED)
+            if _file_identity(resolved_path) != expected_identity:
+                raise ConcurrentModificationError(
+                    "scenario file identity changed during commit; all decision writes were rolled back"
+                )
             if dry_run:
                 connection.rollback()
                 return CommitResult((), 0, 0, True)

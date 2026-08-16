@@ -15,7 +15,12 @@ from apex_procurement.domain import (
     ScenarioConfiguration,
     SupplyLedger,
 )
-from apex_procurement.serialization import canonical_dumps, canonical_loads
+from apex_procurement.serialization import (
+    MAX_CANONICAL_JSON_BYTES,
+    canonical_dumps,
+    canonical_loads,
+    sanitize_control_characters,
+)
 
 
 def make_record() -> DecisionRecord:
@@ -113,6 +118,18 @@ class SerializationTests(unittest.TestCase):
     def test_python_float_is_rejected_before_serialization(self) -> None:
         with self.assertRaises(TypeError):
             canonical_dumps({"quantity": 1.5})
+
+    def test_control_sanitation_preserves_ordinary_unicode(self) -> None:
+        self.assertEqual(
+            sanitize_control_characters("café 東京 👨‍👩\x1b\u202e"),
+            "café 東京 👨‍👩\ufffd\ufffd",
+        )
+
+    def test_untrusted_json_rejects_duplicates_and_oversized_payloads(self) -> None:
+        with self.assertRaisesRegex(ValueError, "duplicate JSON property"):
+            canonical_loads('{"order_id":"a","order_id":"b"}', dict)
+        with self.assertRaisesRegex(ValueError, "maximum supported size"):
+            canonical_loads(" " * (MAX_CANONICAL_JSON_BYTES + 1), dict)
 
 
 if __name__ == "__main__":
