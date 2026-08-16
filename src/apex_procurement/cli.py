@@ -825,7 +825,6 @@ def _successful_audit_line(
     }
     return audit_json_line("run_completed", fields)
 
-
 def _run_once(
     config: RuntimeConfig,
     scenario_path: Path,
@@ -1035,7 +1034,8 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         )
     if config.model_mode is ModelMode.REQUIRED:
         raise OptionalModelUnavailable(
-            "--llm=required is unavailable because no optional model adapter is installed"
+            "--llm=required is unavailable because no optional model adapter is configured "
+            "for live planning"
         )
 
     scenario_path = resolve_scenario_path(config.scenario_path)
