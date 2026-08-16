@@ -16,13 +16,16 @@ from hashlib import sha256
 import re
 from typing import Iterable, Mapping, Sequence
 
+from .config import EvidenceContract
 from .domain import (
     AlertCategory,
     CandidatePlan,
     DecisionRecord,
     EvidenceResult,
+    EvidenceStatus,
     PlanDisposition,
     PlanLine,
+    RuleSeverity,
     ZERO,
 )
 from .policy.registry import PolicyRegistry, load_policy_registry
@@ -181,6 +184,30 @@ def _evidence_rule_ids(decision: DecisionRecord, plan: CandidatePlan | None = No
     return tuple(sorted({item.rule_id for item in evidence}))
 
 
+def _contract_blocking_evidence(
+    decision: DecisionRecord,
+    plan: CandidatePlan | None = None,
+) -> tuple[EvidenceResult, ...]:
+    evidence = list(decision.evidence)
+    if plan is not None:
+        evidence.extend(plan.evidence)
+    unique = {
+        (
+            item.rule_id,
+            item.status,
+            item.contract_disposition,
+            item.summary,
+        ): item
+        for item in evidence
+        if item.severity is RuleSeverity.HARD
+        and item.status is EvidenceStatus.UNKNOWN
+        and item.contract_disposition is PlanDisposition.DECISION_REQUIRED
+    }
+    return tuple(
+        sorted(unique.values(), key=lambda item: (item.rule_id, item.summary))
+    )
+
+
 def render_decision_rationale(decision: DecisionRecord) -> str:
     """Render a canonical requirement rationale without upstream free text."""
 
@@ -205,6 +232,18 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         else "none"
     )
     rules = _evidence_rule_ids(decision, decision.selected_plan)
+    blocking = _contract_blocking_evidence(decision, decision.selected_plan)
+    contract_dispositions = (
+        " Contract dispositions ["
+        + _list(
+            f"{item.rule_id}={item.contract_disposition.value}"
+            for item in blocking
+            if item.contract_disposition is not None
+        )
+        + "]."
+        if blocking
+        else ""
+    )
     lateness = "; ".join(
         f"{item.due_date.isoformat()} late quantity {_number(item.late_quantity)} "
         f"unit-late-days {_number(item.unit_late_days)} unresolved "
@@ -220,7 +259,7 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         f"fulfillment {decision.requirement_state.fulfillment.value}; resolution "
         f"{decision.requirement_state.resolution.value}; evidence contract "
         f"{decision.evidence_contract.value}; rule IDs [{_list(rules)}]."
-        f" Post-plan deadline misses [{lateness}]."
+        f"{contract_dispositions} Post-plan deadline misses [{lateness}]."
     )
 
 
@@ -566,6 +605,23 @@ def _decision_alert(decision: DecisionRecord, plan: CandidatePlan) -> str:
         f"{line.expected_delivery_date.isoformat()}"
         for line in plan.lines
     )
+    blocking = _contract_blocking_evidence(decision, plan)
+    if blocking and decision.evidence_contract is EvidenceContract.PRODUCTION:
+        missing = "; ".join(
+            f"{item.rule_id}: {item.summary} "
+            f"(contract disposition {item.contract_disposition.value})"
+            for item in blocking
+            if item.contract_disposition is not None
+        )
+        return (
+            f"Decision required for component {decision.component_id}, requirement "
+            f"{decision.requirement_id}: authoritative production evidence is unavailable "
+            f"[{missing}]. A non-executable diagnostic proposes [{proposals}], but the agent "
+            f"placed no line and did not classify any supplier as ineligible from the absent "
+            f"facts. Residual quantity is {_number(decision.residual_gap)}. Human action: "
+            "supply the cited rolling-window or other authoritative contract evidence and "
+            "rerun from a fresh snapshot."
+        )
     return (
         f"Decision required for component {decision.component_id}, requirement "
         f"{decision.requirement_id}: alternative {plan.plan_id} proposes [{proposals}] under "
@@ -573,6 +629,23 @@ def _decision_alert(decision: DecisionRecord, plan: CandidatePlan) -> str:
         f"The agent did not place the alternative and left residual quantity "
         f"{_number(decision.residual_gap)}. Human action: select an outcome and rerun from a "
         f"fresh snapshot."
+    )
+
+
+def _evidence_contract_alert(decision: DecisionRecord) -> str:
+    blocking = _contract_blocking_evidence(decision)
+    missing = "; ".join(
+        f"{item.rule_id}: {item.summary} "
+        f"(contract disposition {item.contract_disposition.value})"
+        for item in blocking
+        if item.contract_disposition is not None
+    ) or "the cited authoritative evidence is unavailable"
+    return (
+        f"Component {decision.component_id}, requirement {decision.requirement_id} is governed "
+        f"by the {decision.evidence_contract.value} evidence contract; {missing}. The agent "
+        "preserved the hard UNKNOWN result, withheld every affected action, and did not infer "
+        "zero history or supplier ineligibility. Human action: provide the missing authoritative "
+        "evidence and rerun from a fresh snapshot."
     )
 
 
@@ -656,12 +729,13 @@ def render_alerts(
             for item in (decision.selected_plan, *decision.alternatives)
             if item is not None
         )
-        for plan in plans:
-            assumptions.update(plan.assumption_codes)
-            for evidence in plan.evidence:
+        if decision.evidence_contract is EvidenceContract.BENCHMARK:
+            for plan in plans:
+                assumptions.update(plan.assumption_codes)
+                for evidence in plan.evidence:
+                    assumptions.update(evidence.assumption_codes)
+            for evidence in decision.evidence:
                 assumptions.update(evidence.assumption_codes)
-        for evidence in decision.evidence:
-            assumptions.update(evidence.assumption_codes)
         for code in sorted(assumptions):
             add(AlertCategory.ASSUMPTION, f"{scope}:assumption:{code}", _assumption_alert(decision, code))
 
@@ -733,6 +807,14 @@ def render_alerts(
                 f"requirement {decision.requirement_id} requests an approval alert without a proposal"
             )
         if AlertCategory.DECISION_REQUIRED in decision.alert_categories and decision_count == 0:
+            blocking = _contract_blocking_evidence(decision)
+            remediation = (
+                "supply authoritative evidence for rule IDs "
+                f"[{_list(item.rule_id for item in blocking)}]"
+                if blocking
+                else "resolve rule IDs "
+                f"[{_list(_evidence_rule_ids(decision))}]"
+            )
             add(
                 AlertCategory.DECISION_REQUIRED,
                 f"{scope}:decision:terminal",
@@ -740,9 +822,18 @@ def render_alerts(
                     f"Decision required for component {decision.component_id}, requirement "
                     f"{decision.requirement_id}: no autonomous alternative is authorized and "
                     f"residual quantity is {_number(decision.residual_gap)}. The agent placed no "
-                    f"unsupported order. Human action: resolve rule IDs "
-                    f"[{_list(_evidence_rule_ids(decision))}] and rerun from a fresh snapshot."
+                    f"unsupported order. Human action: {remediation} and rerun from a fresh snapshot."
                 ),
+            )
+        if (
+            decision.evidence_contract is EvidenceContract.PRODUCTION
+            and AlertCategory.EVIDENCE_CONTRACT in decision.alert_categories
+        ):
+            special.add(AlertCategory.EVIDENCE_CONTRACT)
+            add(
+                AlertCategory.EVIDENCE_CONTRACT,
+                f"{scope}:evidence-contract",
+                _evidence_contract_alert(decision),
             )
         if AlertCategory.SOLVER_UNPROVEN in decision.alert_categories:
             add(AlertCategory.SOLVER_UNPROVEN, f"{scope}:solver", _solver_alert(decision))

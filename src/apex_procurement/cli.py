@@ -21,6 +21,7 @@ from .audit import audit_json_line, deterministic_run_id, file_sha256
 
 from .candidates import (
     CandidateBuildResult,
+    CandidateRejection,
     NoAlternativeProof,
     build_candidate_routes,
     component_fingerprint,
@@ -41,6 +42,7 @@ from .domain import (
     CandidateRoute,
     CommitResult,
     DecisionRecord,
+    EvidenceResult,
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
@@ -277,6 +279,7 @@ def _merge_component_rule_evidence(
     """
 
     routes: list[CandidateRoute] = []
+    contract_rejections: list[CandidateRejection] = []
     for route in candidates.routes:
         batch = evaluations.get(route.component_id)
         if batch is None:
@@ -305,9 +308,26 @@ def _merge_component_rule_evidence(
         routes.append(
             replace(route, evidence=tuple(merged.values()), eligibility=eligibility)
         )
+        for item in component_evidence:
+            if (
+                item.severity is RuleSeverity.HARD
+                and item.status is EvidenceStatus.UNKNOWN
+                and item.contract_disposition is PlanDisposition.DECISION_REQUIRED
+            ):
+                contract_rejections.append(
+                    CandidateRejection(
+                        route.route_id,
+                        route.component_id,
+                        route.supplier_id,
+                        EvidenceStatus.UNKNOWN,
+                        "EVIDENCE_CONTRACT_BLOCKED",
+                        item.summary,
+                        (item.rule_id,),
+                    )
+                )
     return CandidateBuildResult(
         routes=tuple(routes),
-        rejections=candidates.rejections,
+        rejections=tuple(set((*candidates.rejections, *contract_rejections))),
         alerts=candidates.alerts,
     )
 
@@ -376,6 +396,7 @@ def _optimizer_problem(
         demand_buckets=ledgers.buckets_for(component_id),
         supply_ledger=ledger,
         suppliers=snapshot.suppliers,
+        evidence_contract=evaluations[component_id].contract,
         minimum_secondary_fraction=minimum_secondary_fraction,
         minimum_secondary_rule_id=minimum_secondary_rule_id,
         named_primary_supplier_id=named_primary_supplier_id,
@@ -491,13 +512,25 @@ def _below_b_no_alternative_proofs(
     return tuple(proofs)
 
 
-def _component_rule_evidence(batch: EvaluationBatch) -> tuple[object, ...]:
+def _component_rule_evidence(batch: EvaluationBatch) -> tuple[EvidenceResult, ...]:
     return tuple(
         evaluation.evidence
         for evaluation in batch.active
         if evaluation.applicable is not False
         and evaluation.evidence is not None
         and evaluation.evidence.scope is EvidenceScope.RULE
+    )
+
+
+def _contract_blocking_evidence(batch: EvaluationBatch) -> tuple[EvidenceResult, ...]:
+    """Return hard rule evidence whose active contract requires a decision."""
+
+    return tuple(
+        item
+        for item in _component_rule_evidence(batch)
+        if item.severity is RuleSeverity.HARD
+        and item.status is EvidenceStatus.UNKNOWN
+        and item.contract_disposition is PlanDisposition.DECISION_REQUIRED
     )
 
 
@@ -536,6 +569,17 @@ def _decision_categories(
         for item in batch.alerts
         if item.entity_id in {None, component_id}
     )
+    contract_blockers = _contract_blocking_evidence(batch)
+    evidence_blocked = bool(contract_blockers) and any(
+        route.is_evidence_blocked
+        for route in candidates.routes_for(component_id)
+    )
+    if evidence_blocked:
+        categories.update(
+            {AlertCategory.DECISION_REQUIRED, AlertCategory.EVIDENCE_CONTRACT}
+        )
+        categories.discard(AlertCategory.ASSUMPTION)
+        categories.discard(AlertCategory.NO_ELIGIBLE_SUPPLIER)
     selected = getattr(outcome, "selected_plan", None) if outcome is not None else None
     lateness = post_plan_deadline_lateness(
         ledgers.ledger_for(component_id),
@@ -553,7 +597,7 @@ def _decision_categories(
     residual = getattr(outcome, "residual_gap")
     if residual > ZERO:
         categories.add(AlertCategory.UNMET_DEMAND)
-    if selected is None and not any(
+    if not evidence_blocked and selected is None and not any(
         route.may_enter_executable_model and route.feasible_deadlines
         for route in candidates.routes_for(component_id)
     ):
