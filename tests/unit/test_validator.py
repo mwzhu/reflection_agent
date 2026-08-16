@@ -984,6 +984,64 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
         objective_a = validator_a._objective(snapshot_a, requirement_a, decision_a.selected_plan, validator_a._offers(snapshot_a, requirement_a, EvidenceContract.BENCHMARK))
         self.assertEqual(objective_a[5], Decimal("5"))
 
+    def test_baseline_reconstructs_late_condition_b_policy_scope(self) -> None:
+        domestic = replace(
+            _supplier("supplier-domestic", name="Generated Domestic"),
+            relationship_tier="Standard",
+        )
+        international = replace(
+            _supplier("supplier-international", name="Generated International"),
+            country="China",
+            is_domestic=False,
+            relationship_tier="Standard",
+        )
+        snapshot = _snapshot(
+            suppliers=(domestic, international),
+            catalogs=(
+                SupplierCatalogLine(
+                    domestic.supplier_id,
+                    "component-a",
+                    Decimal("7.25"),
+                    10,
+                    Decimal("1"),
+                ),
+                SupplierCatalogLine(
+                    international.supplier_id,
+                    "component-a",
+                    Decimal("4.5"),
+                    28,
+                    Decimal("1"),
+                ),
+            ),
+        )
+        decision, _results, validator = _decision_and_results(snapshot)
+        requirement = validator._source_requirements(
+            snapshot,
+            type("Sink", (), {"error": lambda *args, **kwargs: None})(),
+        )["component-a"]
+        offers = validator._offers(
+            snapshot,
+            requirement,
+            EvidenceContract.BENCHMARK,
+        )
+        late = next(
+            item
+            for item in offers
+            if item.supplier.supplier_id == international.supplier_id
+        )
+
+        self.assertGreater(late.material_available, DUE)
+        self.assertEqual(late.allowed_buckets, (DUE,))
+        baseline = validator.independently_solve(
+            snapshot,
+            decision,
+            SolveKind.BASELINE,
+        )
+        self.assertEqual(
+            baseline.objective_vector,
+            (Decimal("0"), Decimal("22.5")),
+        )
+
     def test_stage_7_and_8_policy_windows_are_inclusive_and_conditional(self) -> None:
         standard_b = replace(
             _supplier("supplier-standard", name="Generated Standard", price_rating="B"),

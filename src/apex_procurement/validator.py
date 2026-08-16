@@ -927,7 +927,7 @@ class IndependentPlanValidator:
                 standard_groups: dict[str, list[date]] = defaultdict(list)
                 for due, _quantity in requirement.bucket_quantities:
                     condition = gate[due]
-                    if condition is not None and material <= due:
+                    if condition is not None:
                         standard_groups[condition].append(due)
             else:
                 # Ordinary domestic routes may be allocated late and priced
@@ -1952,6 +1952,9 @@ class IndependentPlanValidator:
             not plan.disposition.writes_purchase_order
             and plan.summary.startswith(_COMPLIANCE_DIAGNOSTIC_PREFIX)
         )
+        baseline_vector_diagnostic = (
+            compliance_diagnostic and len(plan.objective_vector) == 2
+        )
         sub_moq_rule_ids = {
             rule.rule_id
             for rule in self._rules(
@@ -2031,7 +2034,7 @@ class IndependentPlanValidator:
                     sink.error("AIR_EXCEPTION_SCOPE", "Air-freight allocation lacks its active memo authorization and bucket predicate.", component_id=component_id, plan_id=plan_id)
                 for exception_id in allocation.exception_ids:
                     exception_totals[exception_id] += allocation.quantity
-                    exception_dates[exception_id].add(allocation.due_date)
+                    exception_dates[exception_id].update(offer.allowed_buckets)
                     if "condition_" in exception_id and not exception_id.endswith(f"condition_{condition}"):
                         sink.error("EXCEPTION_PREDICATE_MISMATCH", "Allocation exception label disagrees with the recomputed bucket predicate.", component_id=component_id, plan_id=plan_id)
             if plan.disposition.writes_purchase_order:
@@ -2061,11 +2064,11 @@ class IndependentPlanValidator:
                 sink.error("AUTONOMY_SURPLUS_EXCEEDED", "Executable plan exceeds the inclusive discretionary-surplus bound.", component_id=component_id, plan_id=plan_id)
         exact_objective = (
             (plan.residual_gap, plan.total_cost)
-            if compliance_diagnostic
+            if baseline_vector_diagnostic
             else self._objective(snapshot, requirement, plan, offers)
         )
         if (
-            not compliance_diagnostic
+            not baseline_vector_diagnostic
             and plan.unit_late_days
             != exact_objective[len(requirement.bucket_quantities)]
         ):

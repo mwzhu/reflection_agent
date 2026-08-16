@@ -79,6 +79,7 @@ def _route(
     available: date = DUE,
     feasible: tuple[date, ...] = (DUE,),
     exceptions: tuple[str, ...] = (),
+    exception_scope: tuple[date, ...] | None = None,
     strategic_penalty: tuple[date, ...] = (),
     eligibility: EvidenceStatus = EvidenceStatus.PASS,
     approvals: tuple[str, ...] = (),
@@ -110,6 +111,9 @@ def _route(
         material_available_date=available,
         eligibility=eligibility,
         feasible_deadlines=feasible,
+        exception_scope_deadlines=(
+            feasible if exception_scope is None and exceptions else exception_scope or ()
+        ),
         evidence=evidence,
         exception_codes=exceptions,
         approval_requirements=approvals,
@@ -486,6 +490,41 @@ class OptimizerContractTests(unittest.TestCase):
                     scoped = solver.last_context.model.rows
                     self.assertTrue(any(item.name == f"exception_scope[{route_index},1]" for item in scoped))
         self.assertEqual(caps, [5, 4])
+
+    def test_late_exception_route_remains_available_to_eventual_baseline(self) -> None:
+        supplier = _supplier("late-condition-b")
+        exception = "rule-international:condition_b"
+        route = _route(
+            supplier,
+            "late-condition-b",
+            price="4.5",
+            available=DUE + timedelta(days=10),
+            feasible=(),
+            exceptions=(exception,),
+            exception_scope=(DUE,),
+        )
+        baseline = replace(
+            _problem(
+                (route,),
+                (supplier,),
+                quantities=("2",),
+                exception_allowances=(
+                    ExceptionAllowance(exception, (DUE,), Decimal("2")),
+                ),
+            ),
+            solve_kind=SolveKind.BASELINE,
+        )
+
+        result = _stdlib_solver().solve(baseline)
+
+        self.assertTrue(result.is_certified_optimal)
+        self.assertEqual(result.objective_vector, (ZERO, Decimal("9.0")))
+        assert result.candidate_plan is not None
+        self.assertEqual(result.candidate_plan.unit_late_days, Decimal("20"))
+        self.assertEqual(
+            result.candidate_plan.lines[0].bucket_allocations[0].due_date,
+            DUE,
+        )
 
     def test_timeout_is_diagnostic_only_and_unresolved(self) -> None:
         supplier = _supplier("timeout")

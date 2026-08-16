@@ -647,6 +647,13 @@ class ComparatorTrace:
 
 @dataclass(frozen=True, slots=True)
 class CandidateRoute:
+    """One immutable supplier route with separate physical and policy dates.
+
+    ``feasible_deadlines`` records on-time physical arrival, while
+    ``exception_scope_deadlines`` records buckets whose predicates permit an
+    exception allocation even when material arrives late.
+    """
+
     route_id: str
     component_id: str
     supplier_id: str
@@ -661,6 +668,7 @@ class CandidateRoute:
     material_available_date: date
     eligibility: EvidenceStatus
     feasible_deadlines: tuple[date, ...]
+    exception_scope_deadlines: tuple[date, ...]
     evidence: tuple[EvidenceResult, ...]
     exception_codes: tuple[str, ...] = ()
     approval_requirements: tuple[str, ...] = ()
@@ -698,6 +706,17 @@ class CandidateRoute:
         for deadline in deadlines:
             _require_date(deadline, "feasible deadline")
         object.__setattr__(self, "feasible_deadlines", tuple(sorted(set(deadlines))))
+        exception_deadlines = _tuple(
+            self.exception_scope_deadlines,
+            "exception_scope_deadlines",
+        )
+        for deadline in exception_deadlines:
+            _require_date(deadline, "exception scope deadline")
+        object.__setattr__(
+            self,
+            "exception_scope_deadlines",
+            tuple(sorted(set(exception_deadlines))),
+        )
         evidence = _tuple(self.evidence, "evidence")
         if any(not isinstance(item, EvidenceResult) for item in evidence):
             raise TypeError("evidence contains an invalid item")

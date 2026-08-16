@@ -754,8 +754,11 @@ def _build_model(
             # Ordinary routes may be late and are priced by unit-late-days.
             # Exception routes may allocate only to the exact buckets whose
             # predicate opened the exception; CandidateBuilder stores those
-            # dates in feasible_deadlines.
-            if route.exception_codes and bucket.due_date not in route.feasible_deadlines:
+            # dates separately from physical on-time feasibility.
+            if (
+                route.exception_codes
+                and bucket.due_date not in route.exception_scope_deadlines
+            ):
                 model.add_row(
                     {z_vars[bucket_index]: 1},
                     lower=0,
@@ -918,7 +921,7 @@ def _build_model(
         route_deadlines = frozenset(
             due
             for index in indexes
-            for due in routes[index].feasible_deadlines
+            for due in routes[index].exception_scope_deadlines
         )
         qualifying = frozenset(
             override.qualifying_deadlines
@@ -1072,7 +1075,7 @@ def _sustainability_coefficients(context: _ModelContext) -> dict[int, Fraction]:
                 ) <= 5
                 alternative_can_serve = (
                     not alternative.exception_codes
-                    or bucket.due_date in alternative.feasible_deadlines
+                    or bucket.due_date in alternative.exception_scope_deadlines
                 )
                 if comparable_price and comparable_date and alternative_can_serve:
                     best = other
@@ -1095,7 +1098,7 @@ def _international_coefficients(context: _ModelContext) -> dict[int, Fraction]:
         for route_index, route in enumerate(context.routes)
         if any(code.endswith(("condition_a", "condition_c")) for code in route.exception_codes)
         for bucket_index, bucket in enumerate(context.buckets)
-        if bucket.due_date in route.feasible_deadlines
+        if bucket.due_date in route.exception_scope_deadlines
     }
 
 
@@ -1109,7 +1112,10 @@ def _strategic_coefficients(context: _ModelContext) -> dict[int, Fraction]:
         return isinstance(tier, str) and " ".join(tier.split()).casefold() == "strategic"
 
     def can_serve(route: CandidateRoute, bucket: DemandBucket) -> bool:
-        return not route.exception_codes or bucket.due_date in route.feasible_deadlines
+        return (
+            not route.exception_codes
+            or bucket.due_date in route.exception_scope_deadlines
+        )
 
     result: dict[int, Fraction] = {}
     for route_index, route in enumerate(context.routes):

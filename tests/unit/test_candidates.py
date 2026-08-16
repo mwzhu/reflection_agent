@@ -148,6 +148,7 @@ def _route(
         material_available_date=delivery,
         eligibility=EvidenceStatus.PASS,
         feasible_deadlines=(date(2025, 10, 1),),
+        exception_scope_deadlines=(),
         evidence=(),
     )
 
@@ -339,10 +340,45 @@ class SuppliedScenarioCandidateTests(unittest.TestCase):
         )
         self.assertEqual(condition_a.feasible_deadlines, ())
         self.assertEqual(condition_b.feasible_deadlines, (date(2025, 10, 10),))
+        self.assertEqual(
+            condition_a.exception_scope_deadlines,
+            (date(2025, 9, 12),),
+        )
+        self.assertEqual(
+            condition_b.exception_scope_deadlines,
+            (date(2025, 10, 10),),
+        )
         trace_a = next(item for item in condition_a.comparator_trace if item.stage == 2)
         trace_b = next(item for item in condition_b.comparator_trace if item.stage == 2)
         self.assertEqual(trace_a.outcome, "moot")
         self.assertEqual(trace_b.outcome, "skipped")
+
+    def test_late_condition_b_route_keeps_policy_scope_separate_from_arrival(self) -> None:
+        snapshot = load_snapshot(SCENARIOS / "scenario_04_low_inventory.sqlite")
+        candidates = build_candidate_routes(snapshot, build_ledgers(snapshot))
+        component = next(
+            item for item in snapshot.components if item.name == "Temperature Sensor IC"
+        )
+        supplier = next(
+            item for item in snapshot.suppliers if item.name == "Shenzhen MicroTech"
+        )
+        route = next(
+            item
+            for item in candidates.routes_for(component.component_id)
+            if item.supplier_id == supplier.supplier_id
+            and item.shipping_method == "standard"
+            and any(code.endswith("condition_b") for code in item.exception_codes)
+        )
+
+        self.assertEqual(route.feasible_deadlines, ())
+        self.assertEqual(
+            route.exception_scope_deadlines,
+            (date(2025, 9, 15),),
+        )
+        self.assertGreater(
+            route.material_available_date,
+            route.exception_scope_deadlines[0],
+        )
 
 
 class DomesticGateBoundaryTests(unittest.TestCase):
