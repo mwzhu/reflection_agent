@@ -807,8 +807,10 @@ class IndependentPlanValidator:
             return base
         return base * Decimal(boundary_gcd // denominator)
 
-    def _allocation_surplus_bound(
-        self, requirement: _SourceRequirement, catalogs: Sequence[SupplierCatalogLine], secondary: Decimal | None
+    def _allocation_floor(
+        self,
+        catalogs: Sequence[SupplierCatalogLine],
+        secondary: Decimal | None,
     ) -> Decimal:
         if secondary is None or not catalogs:
             return ZERO
@@ -827,7 +829,26 @@ class IndependentPlanValidator:
                     rounding=ROUND_CEILING
                 ),
             )
-        return max(ZERO, allocation_floor - requirement.total_demand)
+        return allocation_floor
+
+    def _allocation_surplus_bound(
+        self, requirement: _SourceRequirement, catalogs: Sequence[SupplierCatalogLine], secondary: Decimal | None
+    ) -> Decimal:
+        return max(
+            ZERO,
+            self._allocation_floor(catalogs, secondary) - requirement.total_demand,
+        )
+
+    def _forced_allocation_surplus(
+        self,
+        requirement: _SourceRequirement,
+        catalogs: Sequence[SupplierCatalogLine],
+        secondary: Decimal | None,
+    ) -> Decimal:
+        return max(
+            ZERO,
+            self._allocation_floor(catalogs, secondary) - requirement.eventual_gap,
+        )
 
     def derive_upper_bounds(
         self,
@@ -905,6 +926,11 @@ class IndependentPlanValidator:
             requirement,
             tuple(catalog for _supplier, catalog, _assumption in eligible),
         )
+        forced_allocation_surplus = self._forced_allocation_surplus(
+            requirement,
+            tuple(catalog for _supplier, catalog, _assumption in eligible),
+            self._minimum_secondary(snapshot, requirement.component),
+        )
         result: list[_Offer] = []
         for supplier, catalog, _assumption in eligible:
             international = self._concept("international_supplier", supplier) is EvidenceStatus.PASS
@@ -949,6 +975,8 @@ class IndependentPlanValidator:
                         ),
                         ZERO,
                     )
+                    if _condition == "b":
+                        allowance += forced_allocation_surplus
                     bound = min(bound, allowance)
                 if bound < catalog.minimum_order_quantity:
                     continue
@@ -1979,6 +2007,21 @@ class IndependentPlanValidator:
             requirement,
             tuple(item.catalog for item in offers),
         )
+        offer_catalogs = tuple(
+            {
+                (item.catalog.component_id, item.catalog.supplier_id): item.catalog
+                for item in offers
+            }.values()
+        )
+        secondary_rule_id = self._minimum_secondary_rule_id(
+            snapshot,
+            requirement.component,
+        )
+        forced_exception_surplus = self._forced_allocation_surplus(
+            requirement,
+            offer_catalogs,
+            self._minimum_secondary(snapshot, requirement.component),
+        )
         exception_totals: dict[str, Decimal] = defaultdict(Decimal)
         exception_dates: dict[str, set[date]] = defaultdict(set)
         for line in plan.lines:
@@ -2044,6 +2087,11 @@ class IndependentPlanValidator:
                         sink.error("UNAPPROVED_ORDER_VALUE", "Executable line exceeds an approval threshold without runtime approval evidence.", component_id=component_id, plan_id=plan_id, rule_ids=(rule.rule_id,))
         for exception_id, quantity in exception_totals.items():
             allowance = sum((requirement.bucket_shortage(due) for due in exception_dates[exception_id]), ZERO)
+            if (
+                exception_id.endswith("condition_b")
+                and secondary_rule_id not in plan.relaxed_rule_ids
+            ):
+                allowance += forced_exception_surplus
             if quantity > allowance:
                 sink.error("EXCEPTION_AGGREGATE_CAP", "Exception quantity exceeds the aggregate net shortage of qualifying buckets.", component_id=component_id, plan_id=plan_id)
         total_quantity = sum((line.quantity for line in plan.lines), ZERO)
@@ -2097,10 +2145,6 @@ class IndependentPlanValidator:
         elif plan.objective_vector != exact_objective:
             sink.error("OBJECTIVE_VECTOR_MISMATCH", "Plan objective vector differs from the validator's exact Decimal vector.", component_id=component_id, plan_id=plan_id)
         secondary = self._minimum_secondary(snapshot, requirement.component)
-        secondary_rule_id = self._minimum_secondary_rule_id(
-            snapshot,
-            requirement.component,
-        )
         secondary_relaxed = (
             not plan.disposition.writes_purchase_order
             and secondary_rule_id is not None

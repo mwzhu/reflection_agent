@@ -16,11 +16,19 @@ from unittest.mock import patch
 
 from apex_procurement.cli import PlanningFailure, main, run
 from apex_procurement.config import RuntimeConfig
-from apex_procurement.domain import SolveKind, ValidationIssue, ValidationSeverity
+from apex_procurement.domain import (
+    PlanDisposition,
+    SolveKind,
+    ValidationIssue,
+    ValidationSeverity,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = PROJECT_ROOT / "data" / "scenarios" / "scenario_06_simple.sqlite"
+SCENARIO_02 = (
+    PROJECT_ROOT / "data" / "scenarios" / "scenario_02_partial_procurement.sqlite"
+)
 SCENARIO_04 = (
     PROJECT_ROOT / "data" / "scenarios" / "scenario_04_low_inventory.sqlite"
 )
@@ -186,6 +194,45 @@ class AssembledCliTests(unittest.TestCase):
                 ("CMP-016", "SUP-102", 15.0, 18.0, "2025-09-01", "2025-09-15"),
             ),
         )
+
+    def test_scenario_two_executes_forced_allocation_surplus_only(self) -> None:
+        scenario = Path(self.temporary_directory.name) / SCENARIO_02.name
+        shutil.copy2(SCENARIO_02, scenario)
+
+        artifacts = run(RuntimeConfig(scenario))
+        magnet = next(
+            item for item in artifacts.decisions if item.component_id == "CMP-003"
+        )
+        assert magnet.selected_plan is not None
+        selected = magnet.selected_plan
+        diagnostic = next(
+            item
+            for item in magnet.alternatives
+            if item.summary.startswith("Non-executable compliance-cost diagnostic")
+        )
+
+        self.assertEqual(
+            {(item.supplier_id, item.quantity) for item in selected.lines},
+            {("SUP-107", Decimal("100")), ("SUP-108", Decimal("50"))},
+        )
+        self.assertEqual(selected.minimum_compliant_total, Decimal("150"))
+        self.assertEqual(selected.forced_surplus, Decimal("92"))
+        self.assertEqual(diagnostic.disposition, PlanDisposition.DECISION_REQUIRED)
+        self.assertEqual(
+            sum((item.quantity for item in diagnostic.lines), Decimal()),
+            Decimal("58"),
+        )
+        with closing(sqlite3.connect(scenario)) as connection:
+            written = tuple(
+                connection.execute(
+                    "SELECT supplier_id, quantity FROM purchase_orders "
+                    "WHERE component_id = 'CMP-003' "
+                    "AND rationale LIKE '[APEX_AGENT:%' "
+                    "ORDER BY supplier_id"
+                )
+            )
+        self.assertEqual(written, (("SUP-107", 100.0), ("SUP-108", 50.0)))
+        self.assertTrue(artifacts.validation.is_valid)
 
     def test_assigned_integration_scenarios_validate_without_invalid_orders(self) -> None:
         for source in ASSIGNED_SCENARIOS:
