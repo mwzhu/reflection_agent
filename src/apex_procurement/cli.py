@@ -690,7 +690,8 @@ def run(config: RuntimeConfig) -> RunArtifacts:
         )
     if config.model_mode is ModelMode.REQUIRED:
         raise OptionalModelUnavailable(
-            "--llm=required is unavailable because no optional model adapter is installed"
+            "--llm=required is unavailable because no optional model adapter is configured "
+            "for live planning"
         )
 
     snapshot = SQLiteRepository().load_snapshot(config.scenario_path)
