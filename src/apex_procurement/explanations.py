@@ -34,6 +34,11 @@ from .domain import (
     ZERO,
 )
 from .policy.registry import PolicyRegistry, load_policy_registry
+from .policy.rendering import (
+    ContractDisposition,
+    TerminalRenderingPath,
+    terminal_rendering_path,
+)
 from .serialization import canonical_dumps, sanitize_control_characters
 
 
@@ -90,11 +95,13 @@ class ApprovalRule:
     rule_id: str
     authority: str
     threshold: str
+    required_action: str
 
     def __post_init__(self) -> None:
         _require_safe_text(self.rule_id, "rule_id")
         _require_safe_text(self.authority, "authority")
         _require_safe_text(self.threshold, "threshold")
+        _require_safe_text(self.required_action, "required_action")
 
 
 _GENERIC_ACTIONS: Mapping[AlertCategory, tuple[str, str]] = {
@@ -147,6 +154,19 @@ _GENERIC_ACTIONS: Mapping[AlertCategory, tuple[str, str]] = {
         "review storage and consumption plans for the quantified forced surplus",
     ),
 }
+
+# This rendering assertion is intentionally independent of the validator's
+# SILENT_INITIAL_GAP and SILENT_RESIDUAL_GAP category backstops.
+_TERMINAL_RENDERING_CATEGORIES = frozenset(
+    {
+        AlertCategory.NO_ELIGIBLE_SUPPLIER,
+        AlertCategory.POLICY_CONFLICT,
+        AlertCategory.DOCUMENTATION_REQUIRED,
+        AlertCategory.SOLE_SOURCE,
+        AlertCategory.PRE_EXISTING_VIOLATION,
+        AlertCategory.DATA_QUALITY,
+    }
+)
 
 
 def _require_safe_text(value: str, name: str) -> None:
@@ -503,24 +523,69 @@ def approval_rule(registry: PolicyRegistry, rule_id: str, supplier_id: str) -> A
     if not isinstance(constraint, Mapping):
         raise ExplanationError(f"approval rule has no structured constraint: {rule_id}")
     kind = constraint.get("kind")
+    try:
+        path = terminal_rendering_path(
+            str(kind), ContractDisposition.RECOMMEND_APPROVAL
+        )
+    except (KeyError, ValueError) as error:
+        raise ExplanationError(
+            f"internal approval-rendering contract defect for {rule_id}: {kind!r}"
+        ) from error
+    if path is not TerminalRenderingPath.COMPLETE_APPROVAL_PROPOSAL:
+        raise ExplanationError(
+            f"no reviewed approval renderer for {rule_id}: {kind!r}"
+        )
     if kind == "order_value_approval":
         authority = constraint.get("authority")
         amount = constraint.get("amount_exceeds")
         threshold = f"line total exceeds {_number(Decimal(str(amount)))}"
+        required_action = "approve the complete proposal"
     elif kind == "sub_moq_written_approval":
         authority = f"supplier {supplier_id}"
         threshold = "quantity is below the supplier catalog minimum order quantity"
+        required_action = "provide written approval for the complete sub-MOQ proposal"
+    elif kind == "hazardous_procurement_review":
+        authority = "hazardous-material procurement reviewer"
+        threshold = "the component requires hazardous-material procurement review"
+        required_action = "complete the hazardous-material procurement review"
+    elif kind == "emergency_approval_bypass":
+        authority = "procurement engineering and the authorized emergency approver"
+        threshold = "an emergency approval-bypass claim requires a supported qualifying predicate"
+        required_action = (
+            "supply a supported qualifying record and complete the required approval workflow"
+        )
+    elif kind == "below_rating_review":
+        authority = "procurement reviewer"
+        threshold = "a below-B supplier requires additional review after no alternative is proven"
+        required_action = "complete the additional supplier review"
     elif kind == "strategic_volume_shift_approval":
         authority = constraint.get("authority")
         threshold = "a significant strategic-supplier volume shift is proposed"
+        required_action = "approve the complete strategic-volume-shift proposal"
+    elif kind == "air_freight_period_spend_cap":
+        authority = "procurement operations"
+        maximum = constraint.get("maximum_amount")
+        threshold = (
+            "authorization-period air-freight spend must be proven at or below "
+            f"{_number(Decimal(str(maximum)))} including the proposal"
+        )
+        required_action = (
+            "supply authoritative period-spend evidence; approval cannot waive the cap"
+        )
     elif kind == "air_freight_individual_approval":
         authority = constraint.get("authority")
         threshold = "an individual air-freight request is proposed"
+        required_action = "approve the complete individual air-freight request"
     else:
         raise ExplanationError(f"unsupported approval constraint for {rule_id}: {kind!r}")
     if not isinstance(authority, str):
         raise ExplanationError(f"approval rule has no named authority: {rule_id}")
-    return ApprovalRule(rule_id=rule_id, authority=authority, threshold=threshold)
+    return ApprovalRule(
+        rule_id=rule_id,
+        authority=authority,
+        threshold=threshold,
+        required_action=required_action,
+    )
 
 
 def _alert_key(category: AlertCategory, scope: str, body: str) -> str:
@@ -647,7 +712,7 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
     return (
         f"Component {decision.component_id}, requirement {decision.requirement_id}: {issue}. "
         f"The agent preserved existing commitments and used only the validated disposition; "
-        f"residual quantity is {_number(decision.residual_gap)} and cited rule IDs are "
+        f"residual quantity is {_number(decision.residual_gap)}. Applicable rule IDs "
         f"[{_list(rules)}].{quantified} Human action: {action}."
     )
 
@@ -658,10 +723,14 @@ def _approval_alert(
     approvals_by_route: Mapping[str, tuple[ApprovalRule, ...]],
 ) -> str:
     proposal_lines: list[str] = []
-    authorities: set[str] = set()
+    required_actions: set[tuple[str, str]] = set()
+    represented_rule_ids: set[str] = set()
     for line in plan.lines:
         approvals = approvals_by_route.get(line.route_id, ())
-        authorities.update(item.authority for item in approvals)
+        required_actions.update(
+            (item.authority, item.required_action) for item in approvals
+        )
+        represented_rule_ids.update(item.rule_id for item in approvals)
         thresholds = "; ".join(
             f"{item.threshold} under {item.rule_id}"
             for item in approvals
@@ -686,15 +755,18 @@ def _approval_alert(
             f"{line.material_available_date.isoformat()}, timing impact [{timing}], thresholds "
             f"crossed [{thresholds}], required authorities [{line_authorities}]"
         )
-    authority_text = _list(authorities)
+    action_text = "; ".join(
+        f"{authority} must {action}"
+        for authority, action in sorted(required_actions)
+    )
     return (
         f"Complete approval proposal for component {decision.component_id}, requirement "
         f"{decision.requirement_id}: [{'; '.join(proposal_lines)}]. The certified plan would "
         f"cover {_number(plan.eventual_covered_quantity)} units and leave "
         f"{_number(plan.residual_gap)} uncovered at the proposal snapshot. The agent withheld "
         f"every line atomically, including any sub-threshold companion line, so repeated runs "
-        f"cannot split the requirement around an approval threshold. Human action: "
-        f"{authority_text} must approve the complete proposal, then the planner must recompute "
+        f"cannot split the requirement around an approval threshold. Applicable rule IDs "
+        f"[{_list(represented_rule_ids)}]. Human action: {action_text}, then the planner must recompute "
         f"dates, quantities, eligibility, and price from a fresh snapshot."
     )
 
@@ -719,16 +791,18 @@ def _decision_alert(decision: DecisionRecord, plan: CandidatePlan) -> str:
             f"{decision.requirement_id}: authoritative production evidence is unavailable "
             f"[{missing}]. A non-executable diagnostic proposes [{proposals}], but the agent "
             f"placed no line and did not classify any supplier as ineligible from the absent "
-            f"facts. Residual quantity is {_number(decision.residual_gap)}. Human action: "
+            f"facts. Residual quantity is {_number(decision.residual_gap)}. Applicable rule IDs "
+            f"[{_list(item.rule_id for item in blocking)}]. Human action: "
             "supply the cited rolling-window or other authoritative contract evidence and "
             "rerun from a fresh snapshot."
         )
+    rule_ids = (*plan.relaxed_rule_ids, *_evidence_rule_ids(decision, plan))
     return (
         f"Decision required for component {decision.component_id}, requirement "
-        f"{decision.requirement_id}: alternative {plan.plan_id} proposes [{proposals}] under "
-        f"rule IDs [{_list((*plan.relaxed_rule_ids, *_evidence_rule_ids(decision, plan)))}]. "
+        f"{decision.requirement_id}: alternative {plan.plan_id} proposes [{proposals}]. "
         f"The agent did not place the alternative and left residual quantity "
-        f"{_number(decision.residual_gap)}. Human action: select an outcome and rerun from a "
+        f"{_number(decision.residual_gap)}. Applicable rule IDs [{_list(rule_ids)}]. "
+        f"Human action: select an outcome and rerun from a "
         f"fresh snapshot."
     )
 
@@ -811,11 +885,13 @@ def _residual_alert(decision: DecisionRecord) -> str:
 
 
 def _solver_alert(decision: DecisionRecord) -> str:
+    rule_ids = _evidence_rule_ids(decision, decision.selected_plan)
     return (
         f"Component {decision.component_id}, requirement {decision.requirement_id} has no proven "
         f"executable conclusion because the solver result was not certified complete. The agent "
-        f"placed no line supported by that result and did not claim infeasibility. Human action: "
-        f"rerun with a completed optimality certificate and exact post-validation."
+        f"placed no line supported by that result and did not claim infeasibility. Applicable "
+        f"rule IDs [{_list(rule_ids)}]. Engineering action: rerun with a completed optimality "
+        f"certificate and exact post-validation."
     )
 
 
@@ -835,7 +911,10 @@ def _late_alert(decision: DecisionRecord, due_date: date) -> str:
     )
 
 
-def _route_input_data_quality_alert(issue: RouteInputIssue) -> str:
+def _route_input_data_quality_alert(
+    issue: RouteInputIssue,
+    applicable_rule_ids: Iterable[str],
+) -> str:
     logical_key = f"supplier_id={issue.supplier_id}"
     if issue.component_id is not None:
         logical_key += f", component_id={issue.component_id}"
@@ -849,7 +928,9 @@ def _route_input_data_quality_alert(issue: RouteInputIssue) -> str:
         f"Source table {issue.source_table}, logical key ({logical_key}), field "
         f"{issue.field} failed the route-input contract because {issue.safe_reason} "
         f"(reason {issue.reason_code}). Blast radius: {blast_radius}; affected "
-        f"component IDs: [{affected}]. The agent {issue.action}. Human remediation: "
+        f"component IDs: [{affected}]. The agent {issue.action}. Applicable rule IDs "
+        f"[{_list(applicable_rule_ids, empty='none identifiable before source remediation')}]. "
+        f"Human remediation: "
         f"{issue.remediation}."
     )
 
@@ -884,6 +965,7 @@ def render_alerts(
     )
     provisional_requirements: list[str] = []
     evidence_contract_requirements: list[tuple[str, str, tuple[str, ...]]] = []
+    terminal_requirements: set[str] = set()
 
     def add(
         category: AlertCategory,
@@ -891,20 +973,39 @@ def render_alerts(
         body: str,
         *,
         decision: DecisionRecord | None = None,
+        terminal: bool = False,
     ) -> None:
         # ``decision`` remains an explicit call-site signal that this is a
         # requirement alert.  Run-global policy/contract boilerplate is
         # rendered once below rather than appended to every such alert.
-        del decision
+        if terminal:
+            if decision is None:
+                raise AssertionError(
+                    "a terminal requirement alert must identify its decision"
+                )
+            terminal_requirements.add(decision.requirement_id)
         rendered.append(
             make_owned_alert(category, scope, body, visible_prefix=visible_prefixes)
         )
 
     for issue in source_issues:
+        affected_decisions = tuple(
+            decision
+            for decision in records
+            if decision.component_id in issue.affected_component_ids
+        )
+        applicable_rule_ids = {
+            rule_id
+            for decision in affected_decisions
+            for rule_id in _evidence_rule_ids(decision, decision.selected_plan)
+        }
         add(
             AlertCategory.DATA_QUALITY,
             f"source-route-input:{issue.issue_id}",
-            _route_input_data_quality_alert(issue),
+            _route_input_data_quality_alert(issue, applicable_rule_ids),
+        )
+        terminal_requirements.update(
+            decision.requirement_id for decision in affected_decisions
         )
 
     for decision in records:
@@ -996,6 +1097,7 @@ def render_alerts(
                     f"{scope}:approval:{plan.plan_id}:{'-'.join(sorted(represented))}",
                     _approval_alert(decision, plan, approvals_by_route),
                     decision=decision,
+                    terminal=True,
                 )
                 approval_count += 1
             elif plan.disposition is PlanDisposition.DECISION_REQUIRED:
@@ -1004,6 +1106,7 @@ def render_alerts(
                     f"{scope}:decision:{plan.plan_id}",
                     _decision_alert(decision, plan),
                     decision=decision,
+                    terminal=True,
                 )
                 decision_count += 1
 
@@ -1056,9 +1159,12 @@ def render_alerts(
                     f"Decision required for component {decision.component_id}, requirement "
                     f"{decision.requirement_id}: no autonomous alternative is authorized and "
                     f"residual quantity is {_number(decision.residual_gap)}. The agent placed no "
-                    f"unsupported order. Human action: {remediation} and rerun from a fresh snapshot."
+                    f"unsupported order. Applicable rule IDs "
+                    f"[{_list(_evidence_rule_ids(decision))}]. Human action: {remediation} "
+                    f"and rerun from a fresh snapshot."
                 ),
                 decision=decision,
+                terminal=True,
             )
         if (
             AlertCategory.EVIDENCE_CONTRACT in decision.alert_categories
@@ -1084,6 +1190,7 @@ def render_alerts(
                 f"{scope}:solver",
                 _solver_alert(decision),
                 decision=decision,
+                terminal=True,
             )
         for category in sorted(set(decision.alert_categories) - special, key=lambda item: item.value):
             if category not in _GENERIC_ACTIONS:
@@ -1093,7 +1200,20 @@ def render_alerts(
                 f"{scope}:category:{category.value}",
                 _generic_alert(decision, category),
                 decision=decision,
+                terminal=category in _TERMINAL_RENDERING_CATEGORIES,
             )
+
+    unexplained = tuple(
+        f"{decision.component_id}/{decision.requirement_id}"
+        for decision in records
+        if decision.residual_gap > ZERO
+        and decision.requirement_id not in terminal_requirements
+    )
+    if unexplained:
+        raise ExplanationError(
+            "withheld or residual requirements lack a deterministic terminal "
+            f"explanation: [{_list(unexplained)}]"
+        )
 
     if provisional_requirements:
         parameters = next(

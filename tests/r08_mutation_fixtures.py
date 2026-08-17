@@ -271,7 +271,7 @@ def build_unrendered_withholding_policy_fixture(
         {
             "derivation_id": derivation_id,
             "value": "external_system",
-            "source_pointer": "POST_R07_CORRECTNESS_PLAN#R08/mutation-test",
+            "source_pointer": "MERGED_PLAN#R13/rendering-totality-mutation-test",
             "review_status": "approved",
             "reasoning": (
                 "Synthetic reviewed mutation declares a withholding disposition "

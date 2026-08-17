@@ -16,6 +16,14 @@ from pathlib import Path
 import re
 from typing import Any
 
+from .rendering import (
+    CONSTRAINT_RULE_KINDS,
+    ContractDisposition,
+    DIRECTIVE_RULE_KINDS,
+    TerminalRenderingPath,
+    terminal_rendering_path,
+)
+
 
 class PolicyValidationError(ValueError):
     """Raised when a compiled policy artifact is not safe to activate."""
@@ -28,9 +36,7 @@ SEVERITIES = frozenset({"hard", "shaping", "advisory"})
 EVIDENCE_BASES = frozenset(
     {"prospective_order", "entity_attribute", "rolling_window", "external_system"}
 )
-DISPOSITIONS = frozenset(
-    {"EXECUTE", "EXECUTE_WITH_ASSUMPTION", "RECOMMEND_APPROVAL", "DECISION_REQUIRED"}
-)
+DISPOSITIONS = frozenset(item.value for item in ContractDisposition)
 RULE_KINDS = frozenset(
     {
         "supplier_eligibility",
@@ -43,40 +49,8 @@ RULE_KINDS = frozenset(
         "documentation_requirement",
     }
 )
-CONSTRAINT_KINDS = frozenset(
-    {
-        "approved_supplier_required",
-        "required_certification",
-        "domestic_supplier_preference",
-        "international_sourcing_justification",
-        "supplier_volume_cap",
-        "minimum_qualified_suppliers",
-        "sole_source_justification",
-        "catalog_minimum_order_quantity",
-        "sub_moq_written_approval",
-        "hazardous_receiving_and_storage",
-        "hazardous_procurement_review",
-        "critical_component_categories",
-        "total_cost_of_ownership",
-        "order_value_approval",
-        "emergency_approval_bypass",
-        "sustainability_preference",
-        "below_rating_review",
-        "certification_preference",
-        "strategic_supplier_continuity",
-        "strategic_volume_shift_approval",
-        "on_time_arrival",
-        "quoted_lead_time_delivery_date",
-        "minimum_secondary_fraction",
-        "air_freight_authorization",
-        "air_freight_cost_documentation",
-        "air_freight_period_spend_cap",
-        "air_freight_individual_approval",
-        "shipment_certificate_of_conformance",
-        "incumbent_supplier_only",
-    }
-)
-DIRECTIVE_KINDS = frozenset({"named_primary_supplier"})
+CONSTRAINT_KINDS = CONSTRAINT_RULE_KINDS
+DIRECTIVE_KINDS = DIRECTIVE_RULE_KINDS
 SELECTOR_ENTITIES = frozenset(
     {"component", "supplier_route", "allocation_group", "purchase_order", "shipment"}
 )
@@ -1033,6 +1007,41 @@ def _validate_rules(
             )
             if resolution["missing_disposition"] != disposition:
                 _fail(disposition_location, "does not derive the configured rule disposition")
+
+    # A reviewed evidence disposition is activatable only when the rule kind
+    # has a reviewed deterministic terminal renderer for it.  Rule-specific
+    # resolutions take precedence over the evidence-basis default exactly as
+    # they do at runtime.
+    for rule_id, rule in rules_by_id.items():
+        payload = rule.get("constraint", rule.get("directive"))
+        assert isinstance(payload, Mapping)  # established above
+        kind = str(payload["kind"])
+        basis = str(rule["evidence_basis"])
+        for contract_name, contract in pack["contracts"].items():
+            rule_resolution = contract["rule_resolutions"].get(rule_id)
+            if isinstance(rule_resolution, Mapping):
+                disposition = str(rule_resolution["missing_disposition"])
+                disposition_location = (
+                    f"policy.contracts.{contract_name}.rule_resolutions."
+                    f"{rule_id}.missing_disposition"
+                )
+            else:
+                basis_resolution = contract.get(basis)
+                if not isinstance(basis_resolution, Mapping):
+                    continue
+                disposition = str(basis_resolution["disposition"])
+                disposition_location = (
+                    f"policy.contracts.{contract_name}.{basis}.disposition"
+                )
+            if (
+                terminal_rendering_path(kind, disposition)
+                is TerminalRenderingPath.INTERNAL_ERROR
+            ):
+                _fail(
+                    disposition_location,
+                    "no reviewed terminal renderer for rule "
+                    f"{rule_id!r} kind {kind!r} and disposition {disposition!r}",
+                )
 
     magnet_ids = {
         "MEMO-2025-041.magnet_rolling_cap",

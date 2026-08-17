@@ -10,10 +10,6 @@ from tests.r08_mutation_fixtures import (
 )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="R13: disposition/rendering totality",
-)
 def test_r13_pack_load_rejects_known_unrendered_withholding_disposition(
     tmp_path: Path,
 ) -> None:
