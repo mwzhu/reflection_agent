@@ -1,0 +1,307 @@
+{
+  "schema_version": 1,
+  "observed_revision": "3ba9259",
+  "behavioral_baseline_revision": "2c54873",
+  "command_contract": "python3 agent.py --scenario <temporary-copy> --contract=benchmark --llm=off --json",
+  "source_sha256": {
+    "data/scenarios/scenario_01_baseline.sqlite": "6c9e0727b2df87b551c3ba7ddf0b58fdab296e8fb3a016316219387a95c829c8",
+    "data/scenarios/scenario_06_simple.sqlite": "93e901d344f12be7c19f5b66522edf95312617a7dbf4704ad2b2e925cba603dc",
+    "src/apex_procurement/policy/compiled_policy.json": "4489cab2f9de52070e63078558f01dc7aed607ec3a30f4593be6c473a173246a",
+    "src/apex_procurement/policy/concepts.json": "5eedd31ca912f2c6e80d1afad5b787b87129800f69a5e42250900c2ec7ca60f8"
+  },
+  "observations": [
+    {
+      "case": "unknown_country",
+      "owner_package": "R10",
+      "target_test": "tests/integration/test_r08_policy_mutations.py::test_r10_unknown_supplier_country_crosses_optimizer_validator_cleanly",
+      "source_scenario": "scenario_06_simple.sqlite",
+      "mutation": "SUP-103 country = Freedonia",
+      "runs": [
+        {
+          "exit_code": 5,
+          "failure_type": "PlanningFailure",
+          "validation_issues": {
+            "BASELINE_COST_MISMATCH": ["CMP-014"],
+            "RATIONALE_MATERIAL_REJECTION_MISMATCH": ["CMP-014"],
+            "SOLVER_OBJECTIVE_DISAGREEMENT": ["CMP-014"]
+          },
+          "affected_component_ids": ["CMP-014"],
+          "po_rows": [],
+          "alert_categories": {}
+        }
+      ]
+    },
+    {
+      "case": "renamed_magnet",
+      "owner_package": "R10",
+      "target_test": "tests/integration/test_r08_policy_mutations.py::test_r10_renamed_magnet_has_a_validated_conservative_outcome",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "CMP-003 name = High-Coercivity Sintered Puck, Grade 52H",
+      "runs": [
+        {
+          "exit_code": 5,
+          "failure_type": "PlanningFailure",
+          "validation_issues": {
+            "RATIONALE_MATERIAL_REJECTION_MISMATCH": ["CMP-003"]
+          },
+          "affected_component_ids": ["CMP-003"],
+          "po_rows": [],
+          "alert_categories": {}
+        }
+      ]
+    },
+    {
+      "case": "replaced_magnet_suppliers",
+      "owner_package": "R09",
+      "target_test": "tests/integration/test_r08_policy_mutations.py::test_r09_replaced_named_magnet_suppliers_are_component_scoped",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "SUP-107/SUP-108 replaced consistently by SUP-207/SUP-208 with new legal names",
+      "runs": [
+        {
+          "exit_code": 0,
+          "failure_type": null,
+          "validation_issues": {},
+          "affected_component_ids": ["CMP-001", "CMP-002", "CMP-003", "CMP-004", "CMP-005", "CMP-006", "CMP-007", "CMP-008", "CMP-009", "CMP-010", "CMP-011", "CMP-012", "CMP-013", "CMP-014", "CMP-015", "CMP-016", "CMP-017", "CMP-018", "CMP-019"],
+          "po_rows": [
+            ["CMP-002", "SUP-102", "25.0"],
+            ["CMP-004", "SUP-102", "16.0"],
+            ["CMP-005", "SUP-101", "41.0"],
+            ["CMP-007", "SUP-101", "70.0"],
+            ["CMP-008", "SUP-102", "16.0"],
+            ["CMP-008", "SUP-109", "10.0"],
+            ["CMP-009", "SUP-102", "22.0"],
+            ["CMP-010", "SUP-101", "13.0"],
+            ["CMP-011", "SUP-101", "11.0"],
+            ["CMP-013", "SUP-112", "35.0"],
+            ["CMP-014", "SUP-112", "60.0"],
+            ["CMP-015", "SUP-112", "30.0"],
+            ["CMP-016", "SUP-102", "55.0"]
+          ],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 27,
+            "DECISION_REQUIRED": 19,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 3,
+            "LATE_ARRIVAL": 2,
+            "POLICY_CONFLICT": 19,
+            "RUN_ACCOUNTING": 1,
+            "UNMET_DEMAND": 1
+          }
+        }
+      ]
+    },
+    {
+      "case": "pre_memo_date",
+      "owner_package": "R11",
+      "target_test": "tests/integration/test_r08_date_mutations.py::test_r11_pre_memo_date_crosses_optimizer_validator_cleanly",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "scenario_config.current_date = 2025-04-14",
+      "runs": [
+        {
+          "exit_code": 5,
+          "failure_type": "PlanningFailure",
+          "validation_issues": {
+            "DELIVERY_DATE_MISMATCH": ["CMP-005", "CMP-013", "CMP-015"],
+            "OBJECTIVE_VECTOR_MISMATCH": ["CMP-005", "CMP-013", "CMP-015"],
+            "RATIONALE_MATERIAL_REJECTION_MISMATCH": ["CMP-003"],
+            "UPPER_BOUND_DERIVATION": ["CMP-005", "CMP-013", "CMP-015"]
+          },
+          "affected_component_ids": ["CMP-003", "CMP-005", "CMP-013", "CMP-015"],
+          "po_rows": [],
+          "alert_categories": {}
+        }
+      ]
+    },
+    {
+      "case": "pre_policy_date",
+      "owner_package": "R11",
+      "target_test": "tests/integration/test_r08_date_mutations.py::test_r11_pre_policy_date_is_a_clean_business_refusal",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "scenario_config.current_date = 2025-01-14",
+      "runs": [
+        {
+          "exit_code": 4,
+          "failure_type": "PolicyValidationError",
+          "error_message": "domestic premium rules require critical(any) and ordinary(none) scopes",
+          "validation_issues": {},
+          "affected_component_ids": [],
+          "po_rows": [],
+          "alert_categories": {}
+        }
+      ]
+    },
+    {
+      "case": "moq_25_net_need_5",
+      "owner_package": "R12",
+      "target_tests": [
+        "tests/integration/test_r08_decision_mutations.py::test_r12_executed_moq_has_no_mutually_exclusive_live_approval",
+        "tests/integration/test_r08_decision_mutations.py::test_r12_second_run_removes_obsolete_sub_moq_approval"
+      ],
+      "source_scenario": "scenario_06_simple.sqlite",
+      "mutation": "FG-1004 isolated to CMP-005; on hand 5 against demand 10 and catalog MOQ 25",
+      "runs": [
+        {
+          "run_number": 1,
+          "exit_code": 0,
+          "failure_type": null,
+          "validation_issues": {},
+          "affected_component_ids": ["CMP-005"],
+          "po_rows": [["CMP-005", "SUP-101", "25.0"]],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 5,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 1,
+            "RUN_ACCOUNTING": 1
+          },
+          "live_sub_moq_approval_count": 1
+        },
+        {
+          "run_number": 2,
+          "exit_code": 0,
+          "failure_type": null,
+          "validation_issues": {},
+          "affected_component_ids": ["CMP-005"],
+          "po_rows": [["CMP-005", "SUP-101", "25.0"]],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 5,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 1,
+            "RUN_ACCOUNTING": 1
+          },
+          "live_sub_moq_approval_count": 1,
+          "no_op": true
+        }
+      ]
+    },
+    {
+      "case": "stale_named_supplier_id",
+      "owner_package": "R14",
+      "target_test": "tests/integration/test_r08_decision_mutations.py::test_r14_stale_named_supplier_id_discloses_legal_name_resolution",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "SUP-107 renumbered consistently to SUP-207; unique legal name unchanged",
+      "runs": [
+        {
+          "exit_code": 0,
+          "failure_type": null,
+          "validation_issues": {},
+          "affected_component_ids": ["CMP-003"],
+          "po_rows": [
+            ["CMP-002", "SUP-102", "25.0"],
+            ["CMP-003", "SUP-108", "80.0"],
+            ["CMP-003", "SUP-207", "128.0"],
+            ["CMP-004", "SUP-102", "16.0"],
+            ["CMP-005", "SUP-101", "41.0"],
+            ["CMP-007", "SUP-101", "70.0"],
+            ["CMP-008", "SUP-102", "16.0"],
+            ["CMP-008", "SUP-109", "10.0"],
+            ["CMP-009", "SUP-102", "22.0"],
+            ["CMP-010", "SUP-101", "13.0"],
+            ["CMP-011", "SUP-101", "11.0"],
+            ["CMP-013", "SUP-112", "35.0"],
+            ["CMP-014", "SUP-112", "60.0"],
+            ["CMP-015", "SUP-112", "30.0"],
+            ["CMP-016", "SUP-102", "55.0"]
+          ],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 28,
+            "CAPACITY_UNKNOWN": 1,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 3,
+            "LATE_ARRIVAL": 1,
+            "RUN_ACCOUNTING": 1
+          },
+          "stale_id_data_quality_count": 0
+        }
+      ]
+    },
+    {
+      "case": "unknown_uom",
+      "owner_package": "R14",
+      "target_test": "tests/integration/test_r08_decision_mutations.py::test_r14_unknown_uom_discloses_discrete_rounding",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "CMP-011 unit_of_measure = box",
+      "runs": [
+        {
+          "exit_code": 0,
+          "failure_type": null,
+          "validation_issues": {},
+          "affected_component_ids": ["CMP-011"],
+          "po_rows": [
+            ["CMP-002", "SUP-102", "25.0"],
+            ["CMP-003", "SUP-107", "128.0"],
+            ["CMP-003", "SUP-108", "80.0"],
+            ["CMP-004", "SUP-102", "16.0"],
+            ["CMP-005", "SUP-101", "41.0"],
+            ["CMP-007", "SUP-101", "70.0"],
+            ["CMP-008", "SUP-102", "16.0"],
+            ["CMP-008", "SUP-109", "10.0"],
+            ["CMP-009", "SUP-102", "22.0"],
+            ["CMP-010", "SUP-101", "13.0"],
+            ["CMP-011", "SUP-101", "11.0"],
+            ["CMP-013", "SUP-112", "35.0"],
+            ["CMP-014", "SUP-112", "60.0"],
+            ["CMP-015", "SUP-112", "30.0"],
+            ["CMP-016", "SUP-102", "55.0"]
+          ],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 28,
+            "CAPACITY_UNKNOWN": 1,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 3,
+            "LATE_ARRIVAL": 1,
+            "RUN_ACCOUNTING": 1
+          },
+          "unknown_uom_assumption_count": 0
+        }
+      ]
+    },
+    {
+      "case": "unrendered_withholding_policy",
+      "owner_package": "R13",
+      "target_test": "tests/unit/test_r08_renderer_mutation.py::test_r13_pack_load_rejects_known_unrendered_withholding_disposition",
+      "source_scenario": "scenario_01_baseline.sqlite",
+      "mutation": "known total_cost_of_ownership kind changed to external_system evidence basis, declaring RECOMMEND_APPROVAL without a renderer",
+      "runs": [
+        {
+          "boundary": "temporary reviewed policy-pack load plus full pipeline with the loaded registry",
+          "exit_code": 0,
+          "failure_type": null,
+          "policy_pack_load": "accepted",
+          "validation_issues": {},
+          "affected_component_ids": [],
+          "po_rows": [
+            ["CMP-002", "SUP-102", "25.0"],
+            ["CMP-003", "SUP-107", "128.0"],
+            ["CMP-003", "SUP-108", "80.0"],
+            ["CMP-004", "SUP-102", "16.0"],
+            ["CMP-005", "SUP-101", "41.0"],
+            ["CMP-007", "SUP-101", "70.0"],
+            ["CMP-008", "SUP-102", "16.0"],
+            ["CMP-008", "SUP-109", "10.0"],
+            ["CMP-009", "SUP-102", "22.0"],
+            ["CMP-010", "SUP-101", "13.0"],
+            ["CMP-011", "SUP-101", "11.0"],
+            ["CMP-013", "SUP-112", "35.0"],
+            ["CMP-014", "SUP-112", "60.0"],
+            ["CMP-015", "SUP-112", "30.0"],
+            ["CMP-016", "SUP-102", "55.0"]
+          ],
+          "alert_categories": {
+            "APPROVAL_REQUIRED": 1,
+            "ASSUMPTION": 28,
+            "CAPACITY_UNKNOWN": 1,
+            "EVIDENCE_CONTRACT": 1,
+            "FORCED_SURPLUS": 3,
+            "LATE_ARRIVAL": 1,
+            "RUN_ACCOUNTING": 1
+          }
+        }
+      ]
+    }
+  ]
+}
