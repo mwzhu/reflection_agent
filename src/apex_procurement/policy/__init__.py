@@ -17,6 +17,14 @@ from .parameters import (
     SustainabilityParameters,
 )
 from .registry import PolicyRegistry, PolicyRule, load_policy_registry
+from .rendering import (
+    ContractDisposition,
+    REVIEWED_RULE_RENDERING_CONTRACTS,
+    RuleKind,
+    RuleRenderingContract,
+    TerminalRenderingPath,
+    terminal_rendering_path,
+)
 from .schema import PolicyValidationError, compute_content_hash, validate_policy_documents
 
 __all__ = [
@@ -24,6 +32,7 @@ __all__ = [
     "AirFreightPeriodCapParameters",
     "ApplicablePolicyParameters",
     "ApprovalThresholdParameters",
+    "ContractDisposition",
     "DomesticPremiumParameter",
     "DomesticPremiumParameters",
     "EconomicAutonomyParameters",
@@ -31,13 +40,18 @@ __all__ = [
     "PolicyRegistry",
     "PolicyRule",
     "PolicyValidationError",
+    "REVIEWED_RULE_RENDERING_CONTRACTS",
+    "RuleKind",
+    "RuleRenderingContract",
     "SecondaryAllocationParameters",
     "SemanticScope",
     "StandardLeadTimeParameters",
     "StrategicContinuityParameters",
     "SupplierVolumeCapParameters",
     "SustainabilityParameters",
+    "TerminalRenderingPath",
     "compute_content_hash",
     "load_policy_registry",
+    "terminal_rendering_path",
     "validate_policy_documents",
 ]

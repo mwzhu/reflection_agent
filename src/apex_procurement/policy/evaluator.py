@@ -38,6 +38,11 @@ from .entity_resolution import (
     canonical_certification,
 )
 from .registry import PolicyRegistry, PolicyRule
+from .rendering import TerminalRenderingPath, terminal_rendering_path
+
+
+class PolicyEvaluationError(ValueError):
+    """An internal evaluator/renderer coverage defect, not a business decision."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,10 +594,9 @@ class PolicyEvaluator:
         kind = self._rule_kind(rule)
         method = getattr(self, f"_predicate_{kind}", None)
         if method is None:
-            return _PredicateResult(
-                EvidenceStatus.UNKNOWN,
-                f"No deterministic evaluator is registered for rule kind {kind!r}.",
-                ("RULE_KIND_UNSUPPORTED",),
+            raise PolicyEvaluationError(
+                "internal policy evaluator coverage defect: no deterministic "
+                f"evaluator is registered for rule kind {kind!r}"
             )
         return method(rule, context, named)
 
@@ -1063,14 +1067,31 @@ class PolicyEvaluator:
         contract = self.registry.pack["contracts"][self.contract.value]
         rule_resolution = contract.get("rule_resolutions", {}).get(rule.rule_id)
         if isinstance(rule_resolution, Mapping) and "missing_disposition" in rule_resolution:
-            return PlanDisposition(str(rule_resolution["missing_disposition"]))
-        basis = rule.evidence_basis
-        mapped = contract.get(basis)
-        if isinstance(mapped, Mapping) and "disposition" in mapped:
-            return PlanDisposition(str(mapped["disposition"]))
-        if self.contract is EvidenceContract.BENCHMARK:
-            return PlanDisposition.EXECUTE_WITH_ASSUMPTION
-        return PlanDisposition.DECISION_REQUIRED
+            disposition = PlanDisposition(str(rule_resolution["missing_disposition"]))
+        else:
+            basis = rule.evidence_basis
+            mapped = contract.get(basis)
+            if isinstance(mapped, Mapping) and "disposition" in mapped:
+                disposition = PlanDisposition(str(mapped["disposition"]))
+            elif self.contract is EvidenceContract.BENCHMARK:
+                disposition = PlanDisposition.EXECUTE_WITH_ASSUMPTION
+            else:
+                disposition = PlanDisposition.DECISION_REQUIRED
+        kind = self._rule_kind(rule)
+        try:
+            path = terminal_rendering_path(kind, disposition.value)
+        except (KeyError, ValueError) as error:
+            raise PolicyEvaluationError(
+                "internal policy rendering contract defect for rule "
+                f"{rule.rule_id!r} kind {kind!r}"
+            ) from error
+        if path is TerminalRenderingPath.INTERNAL_ERROR:
+            raise PolicyEvaluationError(
+                "internal policy rendering contract rejected rule "
+                f"{rule.rule_id!r} kind {kind!r} with disposition "
+                f"{disposition.value!r}"
+            )
+        return disposition
 
     def _evidence(
         self,
@@ -1193,5 +1214,6 @@ __all__ = [
     "EvaluationBatch",
     "EvaluationContext",
     "PolicyEvaluator",
+    "PolicyEvaluationError",
     "RuleEvaluation",
 ]
