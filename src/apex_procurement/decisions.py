@@ -23,11 +23,13 @@ from .domain import (
     DemandBucket,
     ExistingPurchaseOrder,
     InboundSupply,
+    InternalFailureExclusion,
     PlanLine,
     RouteInputIssue,
     ScenarioSnapshot,
     ValidationResult,
 )
+from .isolation import exclusion_validation_invariant
 from .explanations import (
     ExplanationError,
     RenderedAlert,
@@ -818,6 +820,7 @@ def build_decision_outputs(
     inactive_directives: Sequence[str] = (),
     visible_alert_prefixes: bool = False,
     route_input_issues: Sequence[RouteInputIssue] = (),
+    internal_failure_exclusions: Sequence[InternalFailureExclusion] = (),
 ) -> DecisionOutputs:
     """Normalize records and construct the exact PO and owned-alert target rows."""
 
@@ -851,6 +854,7 @@ def build_decision_outputs(
         inactive_directives=inactive_directives,
         visible_prefixes=visible_alert_prefixes,
         route_input_issues=route_input_issues,
+        internal_failure_exclusions=internal_failure_exclusions,
     )
     return DecisionOutputs(
         decisions=records,
@@ -1413,6 +1417,7 @@ class AtomicDecisionWriter:
         active_directives: Sequence[str] = (),
         inactive_directives: Sequence[str] = (),
         visible_alert_prefixes: bool = False,
+        internal_failure_exclusions: Sequence[InternalFailureExclusion] = (),
         step_hook: Callable[[CommitStep], None] | None = None,
         timeout_seconds: float = 5.0,
     ) -> None:
@@ -1428,6 +1433,14 @@ class AtomicDecisionWriter:
         self._active_directives = tuple(active_directives)
         self._inactive_directives = tuple(inactive_directives)
         self._visible_alert_prefixes = visible_alert_prefixes
+        self._internal_failure_exclusions = tuple(internal_failure_exclusions)
+        if any(
+            not isinstance(item, InternalFailureExclusion)
+            for item in self._internal_failure_exclusions
+        ):
+            raise TypeError(
+                "internal_failure_exclusions must contain InternalFailureExclusion values"
+            )
         self._step_hook = step_hook
         self._timeout_seconds = timeout_seconds
 
@@ -1450,6 +1463,12 @@ class AtomicDecisionWriter:
             raise TypeError("validation must be ValidationResult")
         if not validation.is_valid:
             raise DecisionError("invalid, incomplete, or unproven decisions cannot be committed")
+        if self._internal_failure_exclusions and exclusion_validation_invariant(
+            self._internal_failure_exclusions
+        ) not in validation.checked_invariants:
+            raise DecisionError(
+                "internal-failure exclusions were not bound to the final independent validation"
+            )
         outputs = build_decision_outputs(
             decisions,
             self._policy_pack_version,
@@ -1458,6 +1477,7 @@ class AtomicDecisionWriter:
             inactive_directives=self._inactive_directives,
             visible_alert_prefixes=self._visible_alert_prefixes,
             route_input_issues=snapshot.route_input_issues,
+            internal_failure_exclusions=self._internal_failure_exclusions,
         )
         try:
             resolved = resolve_scenario_path(self._scenario_path)
@@ -1759,6 +1779,7 @@ def commit_decisions(
     active_directives: Sequence[str] = (),
     inactive_directives: Sequence[str] = (),
     visible_alert_prefixes: bool = False,
+    internal_failure_exclusions: Sequence[InternalFailureExclusion] = (),
     step_hook: Callable[[CommitStep], None] | None = None,
 ) -> CommitResult:
     """Functional entry point for the atomic decision writer."""
@@ -1770,6 +1791,7 @@ def commit_decisions(
         active_directives=active_directives,
         inactive_directives=inactive_directives,
         visible_alert_prefixes=visible_alert_prefixes,
+        internal_failure_exclusions=internal_failure_exclusions,
         step_hook=step_hook,
     )
     return writer.commit(snapshot, decisions, validation, dry_run=dry_run)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from enum import IntEnum
@@ -51,6 +51,7 @@ from .domain import (
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
+    InternalFailureExclusion,
     MaterialRouteRejection,
     PlanDisposition,
     RequirementState,
@@ -62,11 +63,16 @@ from .domain import (
     SolverResult,
     SolverStatus,
     ValidationResult,
+    ValidationIssue,
     ValidationSeverity,
     UnitNormalizationDisclosure,
     ZERO,
 )
 from .explanations import render_decision_rationale
+from .isolation import (
+    build_internal_failure_exclusions,
+    is_containable_component_error,
+)
 from .ledgers import (
     LedgerBuildResult,
     RouteAvailability,
@@ -131,6 +137,20 @@ class RunArtifacts:
     outputs: DecisionOutputs
     commit: CommitResult
     audit_json_lines: tuple[str, ...] = ()
+    internal_failure_exclusions: tuple[InternalFailureExclusion, ...] = ()
+    validation_pass_count: int = 1
+
+
+TestValidationIssueInjector = Callable[
+    [
+        int,
+        ScenarioSnapshot,
+        tuple[DecisionRecord, ...],
+        tuple[SolverResult, ...],
+        tuple[InternalFailureExclusion, ...],
+    ],
+    Iterable[ValidationIssue],
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1362,6 +1382,8 @@ def _successful_audit_line(
     active_directives: tuple[str, ...],
     inactive_directives: tuple[str, ...],
     timings_us: Mapping[str, int],
+    internal_failure_exclusions: tuple[InternalFailureExclusion, ...] = (),
+    validation_pass_count: int = 1,
 ) -> str:
     active_rules = registry.active_rules(snapshot.configuration.current_date)
     active_rule_ids = {item.rule_id for item in active_rules}
@@ -1482,6 +1504,27 @@ def _successful_audit_line(
         },
         "timings_us": dict(timings_us),
     }
+    if internal_failure_exclusions:
+        fields["partial_run"] = {
+            "status": "COMPLETED_WITH_COMPONENT_EXCLUSIONS",
+            "validation_pass_count": validation_pass_count,
+            "excluded_component_ids": tuple(
+                item.component_id for item in internal_failure_exclusions
+            ),
+            "excluded_requirement_ids": tuple(
+                item.requirement_id for item in internal_failure_exclusions
+            ),
+            "validation_codes": tuple(
+                sorted(
+                    {
+                        issue.code
+                        for item in internal_failure_exclusions
+                        for issue in item.issues
+                    }
+                )
+            ),
+            "owner": "PROCUREMENT_ENGINEERING",
+        }
     return audit_json_line("run_completed", fields)
 
 def _build_planning_inputs(
@@ -1613,6 +1656,7 @@ def _run_once(
     scenario_path: Path,
     *,
     attempt: int,
+    _test_validation_issue_injector: TestValidationIssueInjector | None = None,
 ) -> RunArtifacts:
     """Plan, validate, and commit one optimistic-concurrency attempt."""
 
@@ -1752,15 +1796,12 @@ def _run_once(
     result_tuple = tuple(solver_results)
     phase_started = perf_counter_ns()
     validator = IndependentPlanValidator(
-        registry, policy_parameters=policy_parameters
+        registry,
+        policy_parameters=policy_parameters,
+        validation_pass=1,
+        test_issue_injector=_test_validation_issue_injector,
     )
     validation = validator.validate(planning_snapshot, planned, result_tuple)
-    timings_us["validation"] = (perf_counter_ns() - phase_started) // 1_000
-    if not validation.is_valid:
-        details = "; ".join(
-            f"{item.code}: {item.message}" for item in validation.issues
-        )
-        raise PlanningFailure(f"independent validation failed: {details}")
     warnings = tuple(
         item
         for item in validation.issues
@@ -1771,6 +1812,85 @@ def _run_once(
         raise PlanningFailure(f"strict validation rejected warnings: {details}")
     if _has_unproven_primary_solve(result_tuple):
         raise PlanningFailure("a primary optimization solve did not complete with a certificate")
+
+    internal_failure_exclusions: tuple[InternalFailureExclusion, ...] = ()
+    validation_pass_count = 1
+    if not validation.is_valid:
+        errors = tuple(
+            item
+            for item in validation.issues
+            if item.severity is ValidationSeverity.ERROR
+        )
+        safely_classified = (
+            validation.completed
+            and validation.exact_decimal_checks_completed
+            and validation.solver_results_verified
+            and bool(errors)
+            and all(is_containable_component_error(item) for item in errors)
+        )
+        if config.strict or not safely_classified:
+            details = "; ".join(
+                f"{item.code}: {item.message}" for item in validation.issues
+            ) or "validation did not complete all required proof checks"
+            raise PlanningFailure(f"independent validation failed: {details}")
+
+        requirement_ids = {
+            item.component_id: item.requirement_id for item in planned
+        }
+        internal_failure_exclusions = build_internal_failure_exclusions(
+            errors,
+            requirement_ids,
+        )
+        excluded_components = {
+            item.component_id for item in internal_failure_exclusions
+        }
+        if not excluded_components or len(excluded_components) >= len(planned):
+            raise PlanningFailure(
+                "component isolation requires at least one independently valid survivor"
+            )
+
+        # Existing managed commitments are immutable.  A partial run may not
+        # represent one as a current action for an excluded component, so it
+        # fails globally instead of silently leaving a stale managed PO.
+        for order in snapshot.purchase_orders:
+            parsed = parse_owned_purchase_order(order)
+            if parsed is not None and order.component_id in excluded_components:
+                raise PlanningFailure(
+                    "component isolation cannot proceed while an excluded component "
+                    "has an existing managed purchase order"
+                )
+
+        planned = tuple(
+            item
+            for item in planned
+            if item.component_id not in excluded_components
+        )
+        result_tuple = tuple(
+            item
+            for item in result_tuple
+            if item.component_id not in excluded_components
+        )
+        survivor_validator = IndependentPlanValidator(
+            registry,
+            policy_parameters=policy_parameters,
+            validation_pass=2,
+            test_issue_injector=_test_validation_issue_injector,
+        )
+        validation = survivor_validator.validate(
+            planning_snapshot,
+            planned,
+            result_tuple,
+            exclusions=internal_failure_exclusions,
+        )
+        validation_pass_count = 2
+        if not validation.is_valid:
+            details = "; ".join(
+                f"{item.code}: {item.message}" for item in validation.issues
+            ) or "survivor validation did not complete all required proof checks"
+            raise PlanningFailure(
+                f"independent survivor revalidation failed: {details}"
+            )
+    timings_us["validation"] = (perf_counter_ns() - phase_started) // 1_000
 
     reconciled = reconcile_managed_decisions(
         snapshot, planned, registry.content_hash
@@ -1793,6 +1913,7 @@ def _run_once(
         inactive_directives=inactive,
         visible_alert_prefixes=config.alert_prefixes,
         route_input_issues=snapshot.route_input_issues,
+        internal_failure_exclusions=internal_failure_exclusions,
     )
     phase_started = perf_counter_ns()
     commit = commit_decisions(
@@ -1806,6 +1927,7 @@ def _run_once(
         active_directives=active,
         inactive_directives=inactive,
         visible_alert_prefixes=config.alert_prefixes,
+        internal_failure_exclusions=internal_failure_exclusions,
     )
     timings_us["commit"] = (perf_counter_ns() - phase_started) // 1_000
     timings_us["total"] = (perf_counter_ns() - run_started) // 1_000
@@ -1824,22 +1946,30 @@ def _run_once(
         active_directives=active,
         inactive_directives=inactive,
         timings_us=timings_us,
+        internal_failure_exclusions=internal_failure_exclusions,
+        validation_pass_count=validation_pass_count,
     )
     return RunArtifacts(
-        snapshot,
-        registry,
-        ledgers,
-        candidates,
-        reconciled,
-        result_tuple,
-        validation,
-        outputs,
-        commit,
-        (audit_line,),
+        snapshot=snapshot,
+        registry=registry,
+        ledgers=ledgers,
+        candidates=candidates,
+        decisions=reconciled,
+        solver_results=result_tuple,
+        validation=validation,
+        outputs=outputs,
+        commit=commit,
+        audit_json_lines=(audit_line,),
+        internal_failure_exclusions=internal_failure_exclusions,
+        validation_pass_count=validation_pass_count,
     )
 
 
-def run(config: RuntimeConfig) -> RunArtifacts:
+def run(
+    config: RuntimeConfig,
+    *,
+    _test_validation_issue_injector: TestValidationIssueInjector | None = None,
+) -> RunArtifacts:
     """Execute one deterministic run, replanning once on a stale snapshot."""
 
     if config.model_mode is ModelMode.REQUIRED:
@@ -1851,7 +1981,12 @@ def run(config: RuntimeConfig) -> RunArtifacts:
     scenario_path = resolve_scenario_path(config.scenario_path)
     for attempt in range(2):
         try:
-            return _run_once(config, scenario_path, attempt=attempt)
+            return _run_once(
+                config,
+                scenario_path,
+                attempt=attempt,
+                _test_validation_issue_injector=_test_validation_issue_injector,
+            )
         except ConcurrentModificationError as error:
             if attempt == 1:
                 raise ConcurrentModificationError(
@@ -1871,8 +2006,17 @@ def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str,
         if config.explain_component_id is not None
         else artifacts.decisions
     )
-    return {
-        "status": "dry-run" if config.dry_run else "committed",
+    partial = bool(artifacts.internal_failure_exclusions)
+    payload: dict[str, object] = {
+        "status": (
+            "partial-dry-run"
+            if partial and config.dry_run
+            else "partially-committed"
+            if partial
+            else "dry-run"
+            if config.dry_run
+            else "committed"
+        ),
         "contract": config.contract,
         "model_mode": config.model_mode,
         "policy_pack_id": artifacts.registry.pack_id,
@@ -1885,6 +2029,14 @@ def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str,
         "validation": artifacts.validation,
         "commit": artifacts.commit,
     }
+    if partial:
+        payload["partial_run"] = {
+            "status": "COMPLETED_WITH_COMPONENT_EXCLUSIONS",
+            "validation_pass_count": artifacts.validation_pass_count,
+            "excluded_components": artifacts.internal_failure_exclusions,
+            "owner": "PROCUREMENT_ENGINEERING",
+        }
+    return payload
 
 
 def render_result(config: RuntimeConfig, artifacts: RunArtifacts) -> str:
@@ -1892,13 +2044,32 @@ def render_result(config: RuntimeConfig, artifacts: RunArtifacts) -> str:
 
     if config.json_output:
         return canonical_dumps(_result_payload(config, artifacts))
+    partial = bool(artifacts.internal_failure_exclusions)
+    status = (
+        "partial-dry-run"
+        if partial and config.dry_run
+        else "partially-committed"
+        if partial
+        else "dry-run"
+        if config.dry_run
+        else "committed"
+    )
     lines = [
         "Apex procurement run validated: "
         f"contract={config.contract.value}; decisions={len(artifacts.decisions)}; "
         f"purchase_orders={len(artifacts.outputs.purchase_orders)}; "
         f"alerts={len(artifacts.outputs.alerts)}; "
-        f"status={'dry-run' if config.dry_run else 'committed'}."
+        f"status={status}."
     ]
+    if partial:
+        lines.append(
+            "Engineering-owned component exclusions: "
+            + ", ".join(
+                item.component_id
+                for item in artifacts.internal_failure_exclusions
+            )
+            + f"; independent validation passes={artifacts.validation_pass_count}."
+        )
     if config.explain_component_id is not None:
         decision = next(
             item

@@ -11,7 +11,7 @@ planner would also share its mistakes.
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -37,6 +37,7 @@ from .domain import (
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
+    InternalFailureExclusion,
     MaterialRouteRejection,
     PlanDisposition,
     PlanLine,
@@ -57,6 +58,11 @@ from .domain import (
     ValidationResult,
     ValidationSeverity,
     ZERO,
+)
+from .isolation import (
+    exclusion_validation_invariant,
+    is_containable_component_error,
+    reviewed_validation_failure_scope,
 )
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
 from .policy.parameters import (
@@ -333,6 +339,7 @@ class _IssueSink:
                 component_id=component_id,
                 plan_id=plan_id,
                 rule_ids=tuple(rule_ids),
+                failure_scope=reviewed_validation_failure_scope(code),
             )
         )
 
@@ -353,6 +360,7 @@ class _IssueSink:
                 component_id=component_id,
                 plan_id=plan_id,
                 rule_ids=tuple(rule_ids),
+                failure_scope=reviewed_validation_failure_scope(code),
             )
         )
 
@@ -572,6 +580,18 @@ class IndependentPlanValidator:
         enumeration_node_limit: int = 2_000_000,
         tiny_case_unit_limit: int = 64,
         solver_limits: IndependentSolverLimits | None = None,
+        validation_pass: int = 1,
+        test_issue_injector: Callable[
+            [
+                int,
+                ScenarioSnapshot,
+                tuple[DecisionRecord, ...],
+                tuple[SolverResult, ...],
+                tuple[InternalFailureExclusion, ...],
+            ],
+            Iterable[ValidationIssue],
+        ]
+        | None = None,
     ) -> None:
         self.registry = registry or load_policy_registry()
         if not isinstance(self.registry, PolicyRegistry):
@@ -598,6 +618,14 @@ class IndependentPlanValidator:
             solver_limits, IndependentSolverLimits
         ):
             raise TypeError("solver_limits must be IndependentSolverLimits or None")
+        if (
+            not isinstance(validation_pass, int)
+            or isinstance(validation_pass, bool)
+            or validation_pass <= 0
+        ):
+            raise ValueError("validation_pass must be a positive int")
+        if test_issue_injector is not None and not callable(test_issue_injector):
+            raise TypeError("test_issue_injector must be callable or None")
         self.policy_parameters = policy_parameters
         self.autonomy = autonomy or (
             policy_parameters.economic_autonomy
@@ -614,6 +642,10 @@ class IndependentPlanValidator:
         self.enumeration_node_limit = enumeration_node_limit
         self.tiny_case_unit_limit = tiny_case_unit_limit
         self.solver_limits = solver_limits or IndependentSolverLimits()
+        self.validation_pass = validation_pass
+        # Explicit deterministic seam for boundary tests.  The CLI never
+        # sources this callback from flags, files, environment, or fixture IDs.
+        self._test_issue_injector = test_issue_injector
         self._concepts = {
             str(item["concept_id"]): item for item in self.registry.concepts["concepts"]
         }
@@ -5902,23 +5934,96 @@ class IndependentPlanValidator:
                 component_id=decision.component_id,
             )
 
+    def _check_internal_failure_exclusions(
+        self,
+        source: Mapping[str, _SourceRequirement],
+        decisions: Sequence[DecisionRecord],
+        solver_results: Sequence[SolverResult],
+        exclusions: Sequence[InternalFailureExclusion],
+        sink: _IssueSink,
+    ) -> frozenset[str]:
+        """Validate typed exclusions before no-silent-gap accounting.
+
+        Every defect in an exclusion record is global because a malformed
+        record could hide an arbitrary component from the normal invariants.
+        """
+
+        excluded_components: set[str] = set()
+        decision_components = {item.component_id for item in decisions}
+        result_components = {item.component_id for item in solver_results}
+        for exclusion in exclusions:
+            component_id = exclusion.component_id
+            if component_id in excluded_components:
+                sink.error(
+                    "DUPLICATE_INTERNAL_FAILURE_EXCLUSION",
+                    "A component appears more than once in internal-failure exclusions.",
+                )
+                continue
+            excluded_components.add(component_id)
+            requirement = source.get(component_id)
+            if requirement is None:
+                sink.error(
+                    "UNKNOWN_INTERNAL_FAILURE_EXCLUSION",
+                    "An internal-failure exclusion has no source requirement.",
+                )
+            if exclusion.requirement_id != f"requirement:{component_id}":
+                sink.error(
+                    "INTERNAL_FAILURE_REQUIREMENT_MISMATCH",
+                    "An exclusion requirement identity does not match its component.",
+                )
+            if component_id in decision_components:
+                sink.error(
+                    "EXCLUDED_COMPONENT_DECISION_PRESENT",
+                    "An excluded component still has a DecisionRecord.",
+                )
+            if component_id in result_components:
+                sink.error(
+                    "EXCLUDED_COMPONENT_SOLVER_RESULT_PRESENT",
+                    "An excluded component still has a solver result.",
+                )
+            if any(
+                issue.component_id != component_id
+                or not is_containable_component_error(issue)
+                for issue in exclusion.issues
+            ):
+                sink.error(
+                    "UNREVIEWED_INTERNAL_FAILURE_EXCLUSION",
+                    "An exclusion contains an unknown, global, ambiguous, or mismatched failure.",
+                )
+        return frozenset(excluded_components)
+
     def validate(
         self,
         snapshot: ScenarioSnapshot,
         decisions: Sequence[DecisionRecord],
         solver_results: Sequence[SolverResult],
         /,
+        *,
+        exclusions: Sequence[InternalFailureExclusion] = (),
     ) -> ValidationResult:
         if not isinstance(snapshot, ScenarioSnapshot):
             raise TypeError("snapshot must be ScenarioSnapshot")
         decision_tuple = tuple(decisions)
         result_tuple = tuple(solver_results)
+        exclusion_tuple = tuple(exclusions)
         if any(not isinstance(item, DecisionRecord) for item in decision_tuple):
             raise TypeError("decisions contains an invalid item")
         if any(not isinstance(item, SolverResult) for item in result_tuple):
             raise TypeError("solver_results contains an invalid item")
+        if any(
+            not isinstance(item, InternalFailureExclusion)
+            for item in exclusion_tuple
+        ):
+            raise TypeError("exclusions contains an invalid item")
         sink = _IssueSink([])
         source = self._source_requirements(snapshot, sink)
+        excluded_components = self._check_internal_failure_exclusions(
+            source,
+            decision_tuple,
+            result_tuple,
+            exclusion_tuple,
+            sink,
+        )
         by_component: dict[str, list[DecisionRecord]] = defaultdict(list)
         requirement_ids: set[str] = set()
         executable_action_keys: set[tuple[object, ...]] = set()
@@ -6112,6 +6217,8 @@ class IndependentPlanValidator:
             if not decision.rationale.strip() or not citations:
                 sink.error("RATIONALE_CITATION_MISSING", "Decision rationale must cite at least one active policy source.", component_id=decision.component_id)
         for component_id, requirement in source.items():
+            if component_id in excluded_components:
+                continue
             records = by_component.get(component_id, ())
             if requirement.eventual_gap > ZERO and len(records) != 1:
                 sink.error("INITIAL_GAP_DECISION_CARDINALITY", "Every positive initial gap requires exactly one DecisionRecord.", component_id=component_id)
@@ -6131,28 +6238,46 @@ class IndependentPlanValidator:
                 )
                 if forced_options and set(decision.alert_categories) <= {AlertCategory.DECISION_REQUIRED, AlertCategory.FORCED_SURPLUS, AlertCategory.RUN_ACCOUNTING}:
                     sink.error("FORCED_SURPLUS_MISCLASSIFIED", "Forced solve-Q surplus was treated as a business rejection; only discretionary surplus is ratio-gated.", component_id=decision.component_id)
+        if self._test_issue_injector is not None:
+            injected = tuple(
+                self._test_issue_injector(
+                    self.validation_pass,
+                    snapshot,
+                    decision_tuple,
+                    result_tuple,
+                    exclusion_tuple,
+                )
+            )
+            if any(not isinstance(item, ValidationIssue) for item in injected):
+                raise TypeError("test_issue_injector returned an invalid item")
+            sink.values.extend(injected)
+        checked_invariants = [
+            "action-uniqueness",
+            "approval-line-classification-and-complete-proposals",
+            "allocation-and-exception-scoping",
+            "catalog-asl-certification-dates",
+            "evidence-contract-and-entity-ladder",
+            "exact-objective-and-certified-solves",
+            "forced-discretionary-surplus-and-autonomy",
+            "inbound-delivery-date-netting",
+            "no-silent-gap-and-requirement-state",
+            "normalization-disclosure-source-and-rounding-parity",
+            "policy-window-comparators-6-8",
+            "rationale-citations-and-capacity-disclosure",
+            "structured-quantity-comparators-and-material-rejections",
+            "route-input-quarantine-and-data-quality",
+            "time-phased-recovery-lateness-and-alerts",
+            "u-derivation",
+        ]
+        if exclusion_tuple:
+            checked_invariants.append(
+                exclusion_validation_invariant(exclusion_tuple)
+            )
         return ValidationResult(
             completed=True,
             exact_decimal_checks_completed=True,
             solver_results_verified=solver_verified,
-            checked_invariants=(
-                "action-uniqueness",
-                "approval-line-classification-and-complete-proposals",
-                "allocation-and-exception-scoping",
-                "catalog-asl-certification-dates",
-                "evidence-contract-and-entity-ladder",
-                "exact-objective-and-certified-solves",
-                "forced-discretionary-surplus-and-autonomy",
-                "inbound-delivery-date-netting",
-                "no-silent-gap-and-requirement-state",
-                "normalization-disclosure-source-and-rounding-parity",
-                "policy-window-comparators-6-8",
-                "rationale-citations-and-capacity-disclosure",
-                "structured-quantity-comparators-and-material-rejections",
-                "route-input-quarantine-and-data-quality",
-                "time-phased-recovery-lateness-and-alerts",
-                "u-derivation",
-            ),
+            checked_invariants=tuple(checked_invariants),
             issues=tuple(sink.values),
         )
 
@@ -6193,8 +6318,14 @@ def validate_plans(
     solver_results: Sequence[SolverResult],
     *,
     registry: PolicyRegistry | None = None,
+    exclusions: Sequence[InternalFailureExclusion] = (),
 ) -> ValidationResult:
-    return IndependentPlanValidator(registry).validate(snapshot, decisions, solver_results)
+    return IndependentPlanValidator(registry).validate(
+        snapshot,
+        decisions,
+        solver_results,
+        exclusions=exclusions,
+    )
 
 
 __all__ = [
