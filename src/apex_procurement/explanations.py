@@ -611,7 +611,23 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
     rules = _evidence_rule_ids(decision, decision.selected_plan)
     quantified = ""
     if decision.selected_plan is not None and category is AlertCategory.FORCED_SURPLUS:
-        quantified = f" Forced surplus is {_number(decision.selected_plan.forced_surplus)}."
+        plan = decision.selected_plan
+        lines = "; ".join(
+            f"supplier {line.supplier_id}, quantity {_number(line.quantity)}, "
+            f"unit price {_number(line.unit_price)}, line total {_number(line.line_total)}"
+            for line in plan.lines
+        )
+        return (
+            f"Component {decision.component_id}, requirement {decision.requirement_id}: {issue}. "
+            f"Executed action: [{lines}], total cost {_number(plan.total_cost)}, forced "
+            f"surplus {_number(plan.forced_surplus)} against net requirement "
+            f"{_number(plan.net_requirement)}. The agent preserved existing commitments and "
+            f"committed only this minimum compliant outcome under rule IDs [{_list(rules)}]; "
+            "no mutually exclusive sub-MOQ approval request remains live. A sub-MOQ "
+            "alternative could be considered only after a future cancellation contract "
+            "authorizes changing the commitment and a fresh run revalidates demand, inbound, "
+            f"policy, quantity, supplier, price, and dates. Human action: {action}."
+        )
     elif decision.selected_plan is not None and category is AlertCategory.RECOVERY_SURPLUS:
         quantified = (
             " Strictly improving recovery quantity is "

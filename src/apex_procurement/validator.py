@@ -5335,6 +5335,13 @@ class IndependentPlanValidator:
         requirement_ids: set[str] = set()
         executable_action_keys: set[tuple[object, ...]] = set()
         solver_verified = True
+        sub_moq_rule_ids = {
+            rule.rule_id
+            for rule in self._rules(
+                snapshot.configuration.current_date,
+                "sub_moq_written_approval",
+            )
+        }
         for decision in decision_tuple:
             by_component[decision.component_id].append(decision)
             if decision.requirement_id in requirement_ids:
@@ -5420,6 +5427,24 @@ class IndependentPlanValidator:
                 for plan in decision.alternatives
                 if plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
             )
+            live_sub_moq_plans = tuple(
+                plan
+                for plan in approval_plans
+                if sub_moq_rule_ids
+                & set(plan.relaxed_rule_ids)
+                & set(plan.unresolved_approval_ids)
+            )
+            if (
+                decision.selected_plan is not None
+                and decision.selected_plan.forced_surplus > ZERO
+                and live_sub_moq_plans
+            ):
+                sink.error(
+                    "LIVE_SUB_MOQ_AFTER_COMMIT",
+                    "A selected minimum-compliant MOQ action and its mutually exclusive sub-MOQ approval request cannot both remain live.",
+                    component_id=decision.component_id,
+                    rule_ids=tuple(sorted(sub_moq_rule_ids)),
+                )
             if (
                 approval_plans
                 and AlertCategory.APPROVAL_REQUIRED
