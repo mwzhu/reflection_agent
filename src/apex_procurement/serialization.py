@@ -45,6 +45,13 @@ def sanitize_control_characters(value: str, /) -> str:
 
     if not isinstance(value, str):
         raise TypeError("value must be str")
+    # Rationale reconstruction sanitizes at every trust boundary. Large
+    # generated scenarios therefore revisit the same long, ordinary ASCII
+    # text several times. CPython performs both predicates in C; their
+    # conjunction proves that none of the control, surrogate, or dangerous
+    # format characters handled below can be present.
+    if value.isascii() and value.isprintable():
+        return value
     return "".join(
         "\N{REPLACEMENT CHARACTER}"
         if _is_unsafe_character(character)

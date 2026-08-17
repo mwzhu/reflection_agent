@@ -151,6 +151,11 @@ class SerializationTests(unittest.TestCase):
             canonical_dumps({"quantity": 1.5})
 
     def test_control_sanitation_preserves_ordinary_unicode(self) -> None:
+        printable_ascii = "APEX rationale 123: safe punctuation [ok]."
+        self.assertIs(
+            sanitize_control_characters(printable_ascii),
+            printable_ascii,
+        )
         self.assertEqual(
             sanitize_control_characters("café 東京 👨‍👩\x1b\u202e"),
             "café 東京 👨‍👩\ufffd\ufffd",

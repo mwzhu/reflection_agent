@@ -1267,6 +1267,74 @@ class AssembledCliTests(unittest.TestCase):
             ),
         )
 
+    def test_principal_cli_shortage_crosses_every_commit_boundary_layer(self) -> None:
+        """The principal CLI evidence must exercise procurement, not covered demand."""
+
+        scenario = self.source_scenario("principal-shortage.sqlite")
+        before_orders, _before_alerts = output_rows(scenario)
+
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        audit = json.loads(completed.stderr)
+        shortage_decisions = tuple(
+            item
+            for item in payload["decisions"]
+            if Decimal(item["initial_eventual_gap"]) > 0
+        )
+        executable = tuple(
+            item for item in shortage_decisions if item["selected_plan"] is not None
+        )
+        self.assertTrue(shortage_decisions)
+        self.assertTrue(executable)
+
+        # Optimizer and independent validator both completed their proof work.
+        executable_components = {item["component_id"] for item in executable}
+        certified_components = {
+            item["component_id"]
+            for item in audit["solver_outcomes"]
+            if item["solve_kind"] == "executable"
+            and item["status"] == "OPTIMAL"
+            and item["exact_post_validated"]
+        }
+        self.assertTrue(executable_components <= certified_components)
+        self.assertTrue(audit["validation"]["is_valid"])
+        self.assertTrue(audit["validation"]["solver_results_verified"])
+
+        # Decision rendering and the atomic commit are visible in the actual DB.
+        after_orders, after_alerts = output_rows(scenario)
+        self.assertGreater(len(after_orders), len(before_orders))
+        self.assertEqual(
+            set(payload["commit"]["committed_po_numbers"]),
+            {row[0] for row in after_orders} - {row[0] for row in before_orders},
+        )
+        self.assertTrue(
+            all(
+                row[7].startswith("[APEX_AGENT:v4 ")
+                and "component " in row[7]
+                and "disposition " in row[7]
+                for row in after_orders
+                if row[0] in payload["commit"]["committed_po_numbers"]
+            )
+        )
+        parsed_alerts = tuple(
+            parsed
+            for _alert_id, description in after_alerts
+            if (parsed := parse_owned_alert(description)) is not None
+        )
+        self.assertTrue(parsed_alerts)
+        self.assertEqual(
+            sum(item.category is AlertCategory.RUN_ACCOUNTING for item in parsed_alerts),
+            1,
+        )
+
     def test_installed_runtime_layout_executes_scenario_six(self) -> None:
         install_root = Path(self.temporary_directory.name) / "site-packages"
         shutil.copytree(

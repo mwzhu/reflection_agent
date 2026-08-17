@@ -19,19 +19,26 @@ class CliObservation:
     stderr: str
 
 
-def run_cli(scenario_path: str | Path) -> CliObservation:
+def run_cli(
+    scenario_path: str | Path,
+    *,
+    contract: str = "benchmark",
+    strict: bool = False,
+    llm: str = "off",
+) -> CliObservation:
     stdout = StringIO()
     stderr = StringIO()
+    arguments = [
+        "--scenario",
+        str(scenario_path),
+        f"--contract={contract}",
+        f"--llm={llm}",
+        "--json",
+    ]
+    if strict:
+        arguments.append("--strict")
     with redirect_stdout(stdout), redirect_stderr(stderr):
-        exit_code = main(
-            (
-                "--scenario",
-                str(scenario_path),
-                "--contract=benchmark",
-                "--llm=off",
-                "--json",
-            )
-        )
+        exit_code = main(arguments)
     return CliObservation(int(exit_code), stdout.getvalue(), stderr.getvalue())
 
 
