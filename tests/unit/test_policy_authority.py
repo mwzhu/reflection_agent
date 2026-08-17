@@ -342,13 +342,14 @@ class PolicyAuthorityTests(unittest.TestCase):
         self.assertTrue(validation.is_valid, validation.issues)
         self.assertIn("economic_autonomy(provisional=true", decision.rationale)
         alerts = render_alerts((decision,), policy_registry=load_policy_registry())
-        self.assertTrue(
-            all(
-                "economic_autonomy(provisional=true" in item.description
-                for item in alerts
-                if item.category is not AlertCategory.RUN_ACCOUNTING
-            )
+        provisional = tuple(
+            item
+            for item in alerts
+            if item.category is AlertCategory.ASSUMPTION
+            and "PROVISIONAL_ECONOMIC_AUTONOMY" in item.description
         )
+        self.assertEqual(len(provisional), 1)
+        self.assertIn("economic_autonomy(provisional=true", provisional[0].description)
         validator_source = inspect.getsource(validator_module)
         self.assertNotIn("from .optimizer import", validator_source)
         self.assertNotIn("import apex_procurement.optimizer", validator_source)

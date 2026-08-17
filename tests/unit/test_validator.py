@@ -16,6 +16,7 @@ from apex_procurement.domain import (
     Component,
     DeadlineLateness,
     DeadlineSupplyPosition,
+    DecisionComparatorFact,
     DecisionRecord,
     DemandBucket,
     DemandContribution,
@@ -229,7 +230,45 @@ def _decision_and_results(
     offers = validator._offers(snapshot, requirement, EvidenceContract.BENCHMARK)
     objective = validator._objective(snapshot, requirement, plan, offers)
     plan = replace(plan, objective_vector=objective, unit_late_days=objective[1])
-    decision = replace(decision, selected_plan=plan)
+    quantity_rules = tuple(
+        sorted(
+            rule.rule_id
+            for kind in ("on_time_arrival", "total_cost_of_ownership")
+            for rule in validator._rules(snapshot.configuration.current_date, kind)
+        )
+    )
+    selected_total = sum((item.quantity for item in plan.lines), Decimal("0"))
+    assert plan.minimum_compliant_total is not None
+    decision = replace(
+        decision,
+        selected_plan=plan,
+        comparator_facts=(
+            DecisionComparatorFact(
+                stage=0,
+                kind="quantity_calibration",
+                comparator="certified_quantity_calibration",
+                outcome=(
+                    f"selected total {selected_total} against certified minimum "
+                    f"{plan.minimum_compliant_total}; forced surplus "
+                    f"{plan.forced_surplus}; discretionary surplus "
+                    f"{plan.discretionary_surplus}"
+                ),
+                selected_route_ids=tuple(item.route_id for item in plan.lines),
+                compared_route_ids=(),
+                rule_ids=quantity_rules,
+                decisive=True,
+                quantity_delta=selected_total - plan.minimum_compliant_total,
+                cost_delta=(
+                    plan.total_cost - plan.cheapest_covering_cost
+                    if plan.cheapest_covering_cost is not None
+                    else None
+                ),
+                policy_window=validator._parameters(
+                    snapshot.configuration.current_date
+                ).economic_autonomy.disclosure(),
+            ),
+        ),
+    )
     q = validator.independently_solve(snapshot, decision, SolveKind.QUANTITY_CALIBRATION)
     baseline = validator.independently_solve(snapshot, decision, SolveKind.BASELINE)
     executable = validator.independently_solve(snapshot, decision, SolveKind.EXECUTABLE)

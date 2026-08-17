@@ -34,6 +34,10 @@ from .decisions import (
     DecisionOutputs,
     build_decision_outputs,
     commit_decisions,
+    component_source_fingerprint,
+    current_managed_order_numbers,
+    demand_fingerprint_from_facts,
+    parse_owned_purchase_order,
     reconcile_managed_decisions,
 )
 from .domain import (
@@ -41,11 +45,13 @@ from .domain import (
     CandidatePlan,
     CandidateRoute,
     CommitResult,
+    DecisionComparatorFact,
     DecisionRecord,
     EvidenceResult,
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
+    MaterialRouteRejection,
     PlanDisposition,
     RequirementState,
     ResolutionStatus,
@@ -85,6 +91,7 @@ from .repository import (
     resolve_scenario_path,
 )
 from .serialization import canonical_dumps, sanitize_control_characters
+from .snapshot import build_snapshot
 from .validator import IndependentPlanValidator
 
 
@@ -151,11 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional model behavior (default: off)",
     )
     parser.add_argument(
-        "--recompile-policy",
-        action="store_true",
-        help="request offline policy-pack recompilation before planning",
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="validate and explain the plan without committing rows",
@@ -192,7 +194,6 @@ def parse_config(argv: Sequence[str] | None = None) -> RuntimeConfig:
         scenario_path=args.scenario,
         contract=EvidenceContract(args.contract),
         model_mode=ModelMode(args.llm),
-        recompile_policy=args.recompile_policy,
         dry_run=args.dry_run,
         explain_component_id=args.explain,
         strict=args.strict,
@@ -682,6 +683,8 @@ def _closed_decision(
     candidates: CandidateBuildResult,
     registry: PolicyRegistry,
     component_id: str,
+    *,
+    source_fingerprint: str | None = None,
 ) -> DecisionRecord:
     ledger = ledgers.ledger_for(component_id)
     categories = _decision_categories(
@@ -717,6 +720,7 @@ def _closed_decision(
             ledgers.buckets_for(component_id),
         ),
         economic_autonomy=registry.economic_autonomy,
+        source_fingerprint=source_fingerprint,
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -730,6 +734,8 @@ def _planned_decision(
     batch: EvaluationBatch,
     outcome: object,
     component_id: str,
+    *,
+    source_fingerprint: str | None = None,
 ) -> DecisionRecord:
     ledger = ledgers.ledger_for(component_id)
     selected = getattr(outcome, "selected_plan")
@@ -745,6 +751,13 @@ def _planned_decision(
             requirement_state.fulfillment,
             ResolutionStatus.UNRESOLVED,
         )
+    comparator_facts, material_rejections = _structured_rationale_facts(
+        snapshot,
+        registry,
+        candidates,
+        selected,
+        component_id,
+    )
     decision = DecisionRecord(
         requirement_id=f"requirement:{component_id}",
         component_id=component_id,
@@ -776,8 +789,431 @@ def _planned_decision(
             selected.lines if selected is not None else (),
         ),
         economic_autonomy=registry.economic_autonomy,
+        source_fingerprint=(
+            source_fingerprint
+            if source_fingerprint is not None
+            else component_source_fingerprint(
+                snapshot,
+                component_id,
+                registry.content_hash,
+                contract,
+                policy_concepts_version=registry.concepts_hash,
+                candidate_routes=candidates.routes,
+                candidate_rejections=candidates.rejections,
+                candidate_alerts=candidates.alerts,
+            )
+        ),
+        comparator_facts=comparator_facts,
+        material_rejections=material_rejections,
     )
     return replace(decision, rationale=render_decision_rationale(decision))
+
+
+def _trace_for_stage(route: CandidateRoute, stage: int):
+    return next((item for item in route.comparator_trace if item.stage == stage), None)
+
+
+def _structured_rationale_facts(
+    snapshot: ScenarioSnapshot,
+    registry: PolicyRegistry,
+    candidates: CandidateBuildResult,
+    selected: CandidatePlan | None,
+    component_id: str,
+) -> tuple[tuple[DecisionComparatorFact, ...], tuple[MaterialRouteRejection, ...]]:
+    """Carry a compact, deterministic explanation boundary into decisions."""
+
+    if selected is None:
+        return (), ()
+    selected_route_ids = tuple(line.route_id for line in selected.lines)
+    selected_routes = {
+        route.route_id: route
+        for route in candidates.routes_for(component_id)
+        if route.route_id in selected_route_ids
+    }
+    if set(selected_routes) != set(selected_route_ids):
+        raise PlanningFailure(
+            f"selected plan for {component_id} references a missing candidate route"
+        )
+    selected_lines = {line.route_id: line for line in selected.lines}
+    selected_total = sum((line.quantity for line in selected.lines), ZERO)
+    minimum = selected.minimum_compliant_total
+    if minimum is None:
+        raise PlanningFailure(
+            f"selected plan for {component_id} has no certified quantity calibration"
+        )
+    quantity_rules = tuple(
+        sorted(
+            {
+                rule_id
+                for route in selected_routes.values()
+                for trace in route.comparator_trace
+                if trace.stage in {1, 5}
+                for rule_id in trace.source_rule_ids
+            }
+            | {
+                exception_id.split(":condition_", 1)[0]
+                for line in selected.lines
+                for allocation in line.bucket_allocations
+                for exception_id in allocation.exception_ids
+            }
+        )
+    )
+    if not quantity_rules:
+        raise PlanningFailure(
+            f"selected plan for {component_id} has no rule-backed quantity facts"
+        )
+    comparator_facts: list[DecisionComparatorFact] = [
+        DecisionComparatorFact(
+            stage=0,
+            kind="quantity_calibration",
+            comparator="certified_quantity_calibration",
+            outcome=(
+                f"selected total {selected_total} against certified minimum {minimum}; "
+                f"forced surplus {selected.forced_surplus}; discretionary surplus "
+                f"{selected.discretionary_surplus}"
+            ),
+            selected_route_ids=selected_route_ids,
+            compared_route_ids=(),
+            rule_ids=quantity_rules,
+            decisive=True,
+            quantity_delta=selected_total - minimum,
+            cost_delta=(
+                selected.total_cost - selected.cheapest_covering_cost
+                if selected.cheapest_covering_cost is not None
+                else None
+            ),
+            policy_window=registry.economic_autonomy.disclosure(),
+        )
+    ]
+
+    rejection_by_route: dict[str, list[CandidateRejection]] = {}
+    for rejection in candidates.rejections:
+        if rejection.component_id == component_id:
+            rejection_by_route.setdefault(rejection.route_id, []).append(rejection)
+    unselected_by_supplier: dict[str, list[CandidateRoute]] = {}
+    selected_supplier_ids = {line.supplier_id for line in selected.lines}
+    for route in candidates.routes_for(component_id):
+        if route.supplier_id not in selected_supplier_ids:
+            unselected_by_supplier.setdefault(route.supplier_id, []).append(route)
+
+    material: list[MaterialRouteRejection] = []
+    suppliers = {item.supplier_id: item for item in snapshot.suppliers}
+    resolver = EntityResolver(registry)
+    rejection_priority = {
+        "EVIDENCE_CONTRACT_BLOCKED": 0,
+        "POLICY_GATE_FAILED": 1,
+        "POLICY_GATE_UNRESOLVED": 2,
+        "APPROVAL_OR_CERTIFICATE_REQUIRED": 3,
+        "NO_FEASIBLE_DEADLINE": 4,
+    }
+    for supplier_id, supplier_routes in sorted(unselected_by_supplier.items()):
+        rejected = min(
+            supplier_routes,
+            key=lambda route: (
+                route.eligibility is not EvidenceStatus.PASS,
+                bool(route.approval_requirements),
+                route.unit_price,
+                route.material_available_date,
+                route.route_id,
+            ),
+        )
+        selected_route = min(
+            selected_routes.values(),
+            key=lambda route: (
+                abs(route.unit_price - rejected.unit_price),
+                abs((route.material_available_date - rejected.material_available_date).days),
+                route.route_id,
+            ),
+        )
+        selected_line = selected_lines[selected_route.route_id]
+        route_rejections = rejection_by_route.get(rejected.route_id, [])
+        primary_rejection = min(
+            route_rejections,
+            key=lambda item: (
+                rejection_priority.get(item.code, 99),
+                item.code,
+                item.rule_ids,
+            ),
+            default=None,
+        )
+
+        price_delta = rejected.unit_price - selected_route.unit_price
+        delivery_delta = (
+            rejected.material_available_date - selected_route.material_available_date
+        ).days
+        if not rejected.may_enter_executable_model:
+            material_rule_ids = tuple(
+                sorted(
+                    {
+                        rule_id
+                        for item in route_rejections
+                        for rule_id in item.rule_ids
+                    }
+                )
+            )
+            material.append(
+                MaterialRouteRejection(
+                    route_id=rejected.route_id,
+                    supplier_id=supplier_id,
+                    reason_code=(
+                        primary_rejection.code
+                        if primary_rejection is not None
+                        else "POLICY_GATE_FAILED"
+                    ),
+                    eligibility=rejected.eligibility,
+                    rule_ids=material_rule_ids,
+                    unit_price=rejected.unit_price,
+                    selected_unit_price=selected_route.unit_price,
+                    price_delta=price_delta,
+                    material_available_date=rejected.material_available_date,
+                    selected_material_available_date=selected_route.material_available_date,
+                    delivery_delta_days=delivery_delta,
+                )
+            )
+            continue
+        first_due = min(
+            allocation.due_date for allocation in selected_line.bucket_allocations
+        )
+        selected_domestic = resolver.resolve_concept(
+            "domestic_supplier", suppliers[selected_route.supplier_id]
+        ).status
+        rejected_domestic = resolver.resolve_concept(
+            "domestic_supplier", suppliers[rejected.supplier_id]
+        ).status
+        stage_outcomes: list[tuple[int, str]] = []
+        selected_on_time = first_due in selected_route.feasible_deadlines
+        rejected_on_time = first_due in rejected.feasible_deadlines
+        stage_outcomes.append(
+            (
+                1,
+                "selected_on_time"
+                if selected_on_time and not rejected_on_time
+                else "rejected_on_time_advantage"
+                if rejected_on_time and not selected_on_time
+                else f"equal_on_time={str(selected_on_time).lower()}",
+            )
+        )
+        selected_domestic_trace = _trace_for_stage(selected_route, 2)
+        rejected_domestic_trace = _trace_for_stage(rejected, 2)
+        domestic_states = {
+            trace.outcome
+            for trace in (selected_domestic_trace, rejected_domestic_trace)
+            if trace is not None
+        }
+        if "skipped" in domestic_states:
+            domestic_outcome = "skipped_condition_b"
+        elif "moot" in domestic_states:
+            domestic_outcome = "moot_condition_a_or_c"
+        elif selected_domestic is rejected_domestic:
+            domestic_outcome = "moot_same_domesticity"
+        elif (
+            selected_domestic is EvidenceStatus.PASS
+            and rejected_domestic is EvidenceStatus.FAIL
+        ):
+            domestic_outcome = "selected_domestic_preference_applied"
+        else:
+            domestic_outcome = "rejected_domestic_preference_advantage"
+        stage_outcomes.append((2, domestic_outcome))
+
+        for stage, selected_label in (
+            (3, "selected_strategic_retention"),
+            (4, "selected_sustainability_preference"),
+        ):
+            selected_trace = _trace_for_stage(selected_route, stage)
+            rejected_trace = _trace_for_stage(rejected, stage)
+            due_token = first_due.isoformat()
+            selected_penalty = bool(
+                selected_trace is not None
+                and selected_trace.outcome.startswith("penalty:")
+                and due_token in selected_trace.outcome.split(":", 1)[1].split(",")
+            )
+            rejected_penalty = bool(
+                rejected_trace is not None
+                and rejected_trace.outcome.startswith("penalty:")
+                and due_token in rejected_trace.outcome.split(":", 1)[1].split(",")
+            )
+            stage_outcomes.append(
+                (
+                    stage,
+                    selected_label
+                    if not selected_penalty and rejected_penalty
+                    else "rejected_policy_preference_advantage"
+                    if selected_penalty and not rejected_penalty
+                    else "outside_window_or_equal",
+                )
+            )
+        stage_outcomes.extend(
+            (
+                (
+                    5,
+                    "selected_lower_known_cost"
+                    if selected_route.unit_price < rejected.unit_price
+                    else "rejected_lower_known_cost"
+                    if rejected.unit_price < selected_route.unit_price
+                    else "equal_known_cost",
+                ),
+                (
+                    6,
+                    "selected_shorter_lead_time"
+                    if selected_route.lead_time_days < rejected.lead_time_days
+                    else "rejected_shorter_lead_time"
+                    if rejected.lead_time_days < selected_route.lead_time_days
+                    else "equal_lead_time",
+                ),
+                (
+                    7,
+                    "selected_lower_id_free_fingerprint"
+                    if (
+                        selected_route.supplier_fingerprint,
+                        selected_route.route_fingerprint,
+                    )
+                    < (rejected.supplier_fingerprint, rejected.route_fingerprint)
+                    else "rejected_lower_id_free_fingerprint",
+                ),
+            )
+        )
+        selected_outcomes = {
+            "selected_on_time",
+            "selected_domestic_preference_applied",
+            "selected_strategic_retention",
+            "selected_sustainability_preference",
+            "selected_lower_known_cost",
+            "selected_shorter_lead_time",
+            "selected_lower_id_free_fingerprint",
+        }
+        rejected_outcomes = {
+            "rejected_on_time_advantage",
+            "rejected_domestic_preference_advantage",
+            "rejected_policy_preference_advantage",
+            "rejected_lower_known_cost",
+            "rejected_shorter_lead_time",
+            "rejected_lower_id_free_fingerprint",
+        }
+        decisive_stage = next(
+            (
+                stage
+                for stage, outcome in stage_outcomes
+                if outcome in selected_outcomes | rejected_outcomes
+            ),
+            None,
+        )
+        decisive_outcome = next(
+            (
+                outcome
+                for stage, outcome in stage_outcomes
+                if stage == decisive_stage
+            ),
+            None,
+        )
+        if decisive_stage is None or decisive_outcome not in selected_outcomes:
+            allocation_rules = tuple(
+                sorted(
+                    set(quantity_rules)
+                    | {
+                        rule_id
+                        for item in route_rejections
+                        for rule_id in item.rule_ids
+                    }
+                )
+            )
+            material.append(
+                MaterialRouteRejection(
+                    route_id=rejected.route_id,
+                    supplier_id=supplier_id,
+                    reason_code="NOT_SELECTED_BY_CERTIFIED_ALLOCATION",
+                    eligibility=rejected.eligibility,
+                    rule_ids=allocation_rules,
+                    unit_price=rejected.unit_price,
+                    selected_unit_price=selected_route.unit_price,
+                    price_delta=price_delta,
+                    material_available_date=rejected.material_available_date,
+                    selected_material_available_date=selected_route.material_available_date,
+                    delivery_delta_days=delivery_delta,
+                )
+            )
+            continue
+        for stage, raw_outcome in stage_outcomes:
+            selected_trace = _trace_for_stage(selected_route, stage)
+            rejected_trace = _trace_for_stage(rejected, stage)
+            rule_ids = tuple(
+                sorted(
+                    {
+                        rule_id
+                        for trace in (selected_trace, rejected_trace)
+                        if trace is not None
+                        for rule_id in trace.source_rule_ids
+                    }
+                )
+            )
+            if stage < 7 and not rule_ids:
+                raise PlanningFailure(
+                    f"route comparator stage {stage} for {component_id} has no source rule"
+                )
+            comparator_facts.append(
+                DecisionComparatorFact(
+                    stage=stage,
+                    kind="route_selection",
+                    comparator=(
+                        selected_trace.comparator
+                        if selected_trace is not None
+                        else "id_free_fingerprint"
+                    ),
+                    outcome=(
+                        raw_outcome
+                        if stage <= decisive_stage
+                        else f"not_evaluated_after_stage_{decisive_stage}"
+                    ),
+                    selected_route_ids=(selected_route.route_id,),
+                    compared_route_ids=(rejected.route_id,),
+                    rule_ids=rule_ids,
+                    decisive=stage == decisive_stage,
+                    cost_delta=price_delta if stage in {3, 4, 5} else None,
+                    delivery_delta_days=(
+                        delivery_delta if stage in {1, 4, 6} else None
+                    ),
+                    policy_window=(
+                        selected_trace.explanation
+                        if selected_trace is not None
+                        else "ID-free deterministic tie key"
+                    ),
+                )
+            )
+        material_rule_ids = tuple(
+            sorted(
+                {
+                    rule_id
+                    for item in route_rejections
+                    for rule_id in item.rule_ids
+                }
+                | {
+                    rule_id
+                    for fact in comparator_facts
+                    if fact.compared_route_ids == (rejected.route_id,)
+                    and fact.decisive
+                    for rule_id in fact.rule_ids
+                }
+            )
+        )
+        material.append(
+            MaterialRouteRejection(
+                route_id=rejected.route_id,
+                supplier_id=supplier_id,
+                reason_code=(
+                    primary_rejection.code
+                    if primary_rejection is not None
+                    else "NOT_SELECTED_BY_COMPARATOR"
+                ),
+                eligibility=rejected.eligibility,
+                rule_ids=material_rule_ids,
+                unit_price=rejected.unit_price,
+                selected_unit_price=selected_route.unit_price,
+                price_delta=price_delta,
+                material_available_date=rejected.material_available_date,
+                selected_material_available_date=selected_route.material_available_date,
+                delivery_delta_days=delivery_delta,
+            )
+        )
+    return tuple(comparator_facts), tuple(material)
 
 
 def _plan_line_facts(plan: CandidatePlan) -> tuple[tuple[object, ...], ...]:
@@ -974,6 +1410,130 @@ def _successful_audit_line(
     }
     return audit_json_line("run_completed", fields)
 
+def _build_planning_inputs(
+    snapshot: ScenarioSnapshot,
+    registry: PolicyRegistry,
+    contract: EvidenceContract,
+    policy_parameters: ApplicablePolicyParameters,
+) -> tuple[
+    LedgerBuildResult,
+    dict[str, EvaluationBatch],
+    CandidateBuildResult,
+]:
+    ledgers = build_ledgers(snapshot)
+    evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+    candidates = _merge_component_rule_evidence(
+        build_candidate_routes(
+            snapshot,
+            ledgers,
+            registry=registry,
+            contract=contract,
+            policy_parameters=policy_parameters,
+        ),
+        evaluations,
+    )
+    ledgers = _route_aware_ledgers(snapshot, candidates)
+    evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+    candidates = _merge_component_rule_evidence(candidates, evaluations)
+    no_alternative_proofs = _below_b_no_alternative_proofs(
+        snapshot,
+        registry,
+        contract,
+        ledgers,
+        candidates,
+        evaluations,
+        policy_parameters,
+    )
+    if no_alternative_proofs:
+        candidates = _merge_component_rule_evidence(
+            build_candidate_routes(
+                snapshot,
+                ledgers,
+                registry=registry,
+                contract=contract,
+                no_alternative_proofs=no_alternative_proofs,
+                policy_parameters=policy_parameters,
+            ),
+            evaluations,
+        )
+        ledgers = _route_aware_ledgers(snapshot, candidates)
+        evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+        candidates = _merge_component_rule_evidence(candidates, evaluations)
+    return ledgers, evaluations, candidates
+
+
+def _snapshot_without_managed_outputs(
+    snapshot: ScenarioSnapshot,
+) -> ScenarioSnapshot:
+    external_orders = tuple(
+        order
+        for order in snapshot.purchase_orders
+        if parse_owned_purchase_order(order) is None
+    )
+    if len(external_orders) == len(snapshot.purchase_orders):
+        return snapshot
+    return build_snapshot(
+        configuration=snapshot.configuration,
+        products=snapshot.products,
+        components=snapshot.components,
+        suppliers=snapshot.suppliers,
+        bom_lines=snapshot.bom_lines,
+        catalog_lines=snapshot.catalog_lines,
+        production_orders=snapshot.production_orders,
+        inventory=snapshot.inventory,
+        purchase_orders=external_orders,
+        alerts=snapshot.alerts,
+        route_input_issues=snapshot.route_input_issues,
+    )
+
+
+def _snapshot_for_current_reconstruction(
+    snapshot: ScenarioSnapshot,
+    ledgers: LedgerBuildResult,
+    candidates: CandidateBuildResult,
+    policy_pack_version: str,
+    policy_concepts_version: str,
+    contract: EvidenceContract,
+) -> ScenarioSnapshot:
+    demand_digests = {
+        ledger.component_id: demand_fingerprint_from_facts(
+            ledgers.buckets_for(ledger.component_id),
+            ledger.on_hand,
+            ledger.committed_inbound,
+        )
+        for ledger in ledgers.supply_ledgers
+    }
+    current_numbers = current_managed_order_numbers(
+        snapshot,
+        demand_digests,
+        policy_pack_version,
+        contract,
+        candidates.routes,
+        policy_concepts_version=policy_concepts_version,
+        candidate_rejections=candidates.rejections,
+        candidate_alerts=candidates.alerts,
+    )
+    if not current_numbers:
+        return snapshot
+    return build_snapshot(
+        configuration=snapshot.configuration,
+        products=snapshot.products,
+        components=snapshot.components,
+        suppliers=snapshot.suppliers,
+        bom_lines=snapshot.bom_lines,
+        catalog_lines=snapshot.catalog_lines,
+        production_orders=snapshot.production_orders,
+        inventory=snapshot.inventory,
+        purchase_orders=tuple(
+            order
+            for order in snapshot.purchase_orders
+            if order.po_number not in current_numbers
+        ),
+        alerts=snapshot.alerts,
+        route_input_issues=snapshot.route_input_issues,
+    )
+
+
 def _run_once(
     config: RuntimeConfig,
     scenario_path: Path,
@@ -996,53 +1556,48 @@ def _run_once(
     timings_us["policy_load"] = (perf_counter_ns() - phase_started) // 1_000
 
     phase_started = perf_counter_ns()
-    ledgers = build_ledgers(snapshot)
-    timings_us["ledger_build"] = (perf_counter_ns() - phase_started) // 1_000
-    phase_started = perf_counter_ns()
-    evaluations = _component_evaluations(
-        snapshot, registry, config.contract, ledgers
-    )
-    candidates = _merge_component_rule_evidence(
-        build_candidate_routes(
-            snapshot,
-            ledgers,
-            registry=registry,
-            contract=config.contract,
-            policy_parameters=policy_parameters,
-        ),
-        evaluations,
-    )
-    ledgers = _route_aware_ledgers(snapshot, candidates)
-    evaluations = _component_evaluations(
-        snapshot, registry, config.contract, ledgers
-    )
-    candidates = _merge_component_rule_evidence(candidates, evaluations)
-    no_alternative_proofs = _below_b_no_alternative_proofs(
-        snapshot,
+    ownership_snapshot = _snapshot_without_managed_outputs(snapshot)
+    ownership_ledgers, ownership_evaluations, ownership_candidates = _build_planning_inputs(
+        ownership_snapshot,
         registry,
         config.contract,
-        ledgers,
-        candidates,
-        evaluations,
         policy_parameters,
     )
-    if no_alternative_proofs:
-        candidates = _merge_component_rule_evidence(
-            build_candidate_routes(
-                snapshot,
-                ledgers,
-                registry=registry,
-                contract=config.contract,
-                no_alternative_proofs=no_alternative_proofs,
-                policy_parameters=policy_parameters,
-            ),
-            evaluations,
+    if ownership_snapshot is snapshot:
+        current_ledgers, current_evaluations, current_candidates = (
+            ownership_ledgers,
+            ownership_evaluations,
+            ownership_candidates,
         )
-        ledgers = _route_aware_ledgers(snapshot, candidates)
-        evaluations = _component_evaluations(
-            snapshot, registry, config.contract, ledgers
+    else:
+        current_ledgers, current_evaluations, current_candidates = _build_planning_inputs(
+            snapshot,
+            registry,
+            config.contract,
+            policy_parameters,
         )
-        candidates = _merge_component_rule_evidence(candidates, evaluations)
+    planning_snapshot = _snapshot_for_current_reconstruction(
+        snapshot,
+        current_ledgers,
+        ownership_candidates,
+        registry.content_hash,
+        registry.concepts_hash,
+        config.contract,
+    )
+    if planning_snapshot is snapshot:
+        ledgers, evaluations, candidates = (
+            current_ledgers,
+            current_evaluations,
+            current_candidates,
+        )
+    else:
+        ledgers, evaluations, candidates = _build_planning_inputs(
+            planning_snapshot,
+            registry,
+            config.contract,
+            policy_parameters,
+        )
+    timings_us["ledger_build"] = (perf_counter_ns() - phase_started) // 1_000
     timings_us["candidate_build"] = (perf_counter_ns() - phase_started) // 1_000
 
     component_ids = tuple(item.component_id for item in ledgers.supply_ledgers)
@@ -1068,7 +1623,7 @@ def _run_once(
         ):
             decisions.append(
                 _closed_decision(
-                    snapshot,
+                    planning_snapshot,
                     config.contract,
                     ledgers,
                     batch,
@@ -1079,7 +1634,7 @@ def _run_once(
             )
             continue
         problem = _optimizer_problem(
-            snapshot,
+            planning_snapshot,
             registry,
             ledgers,
             candidates,
@@ -1088,11 +1643,25 @@ def _run_once(
             policy_parameters,
         )
         outcome = optimizer.optimize(problem)
+        ownership_source_fingerprint = (
+            component_source_fingerprint(
+                ownership_snapshot,
+                component_id,
+                registry.content_hash,
+                config.contract,
+                policy_concepts_version=registry.concepts_hash,
+                candidate_routes=ownership_candidates.routes,
+                candidate_rejections=ownership_candidates.rejections,
+                candidate_alerts=ownership_candidates.alerts,
+            )
+            if getattr(outcome, "selected_plan") is not None
+            else None
+        )
         results = _solver_results(outcome)
         solver_results.extend(results)
         decisions.append(
             _planned_decision(
-                snapshot,
+                planning_snapshot,
                 registry,
                 config.contract,
                 ledgers,
@@ -1100,6 +1669,7 @@ def _run_once(
                 batch,
                 outcome,
                 component_id,
+                source_fingerprint=ownership_source_fingerprint,
             )
         )
     timings_us["optimization"] = (perf_counter_ns() - phase_started) // 1_000
@@ -1110,7 +1680,7 @@ def _run_once(
     validator = IndependentPlanValidator(
         registry, policy_parameters=policy_parameters
     )
-    validation = validator.validate(snapshot, planned, result_tuple)
+    validation = validator.validate(planning_snapshot, planned, result_tuple)
     timings_us["validation"] = (perf_counter_ns() - phase_started) // 1_000
     if not validation.is_valid:
         details = "; ".join(
@@ -1198,10 +1768,6 @@ def _run_once(
 def run(config: RuntimeConfig) -> RunArtifacts:
     """Execute one deterministic run, replanning once on a stale snapshot."""
 
-    if config.recompile_policy:
-        raise OptionalModelUnavailable(
-            "live policy recompilation is unavailable; use the reviewed compiled policy pack"
-        )
     if config.model_mode is ModelMode.REQUIRED:
         raise OptionalModelUnavailable(
             "--llm=required is unavailable because no optional model adapter is configured "

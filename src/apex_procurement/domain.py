@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
+import re
 from typing import Iterable
 
 from .config import EvidenceContract
@@ -776,6 +777,107 @@ class ComparatorTrace:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionComparatorFact:
+    """Structured fact showing why a selected plan beat an option."""
+
+    stage: int
+    kind: str
+    comparator: str
+    outcome: str
+    selected_route_ids: tuple[str, ...]
+    compared_route_ids: tuple[str, ...]
+    rule_ids: tuple[str, ...]
+    decisive: bool = False
+    quantity_delta: Decimal | None = None
+    cost_delta: Decimal | None = None
+    delivery_delta_days: int | None = None
+    policy_window: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, int) or isinstance(self.stage, bool):
+            raise TypeError("stage must be int")
+        if self.stage < 0:
+            raise ValueError("stage must be nonnegative")
+        _require_text(self.kind, "kind")
+        if self.kind == "quantity_calibration" and self.stage != 0:
+            raise ValueError("quantity calibration must use reserved stage 0")
+        if self.kind == "route_selection" and not 1 <= self.stage <= 7:
+            raise ValueError("route selection must use comparator stages 1 through 7")
+        if not isinstance(self.decisive, bool):
+            raise TypeError("decisive must be bool")
+        _require_text(self.comparator, "comparator")
+        _require_text(self.outcome, "outcome")
+        for name in ("selected_route_ids", "compared_route_ids", "rule_ids"):
+            values = _text_tuple(getattr(self, name), name)
+            _require_unique(values, name)
+            object.__setattr__(self, name, values)
+        if not self.selected_route_ids:
+            raise ValueError("selected_route_ids must not be empty")
+        if not self.rule_ids and not (
+            self.kind == "route_selection" and self.stage == 7
+        ):
+            raise ValueError(
+                "rule_ids may be empty only for the deterministic stage-7 tie-break"
+            )
+        for name in ("quantity_delta", "cost_delta"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_decimal(value, name)
+        if self.delivery_delta_days is not None and (
+            not isinstance(self.delivery_delta_days, int)
+            or isinstance(self.delivery_delta_days, bool)
+        ):
+            raise TypeError("delivery_delta_days must be int or None")
+        _require_optional_text(self.policy_window, "policy_window")
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialRouteRejection:
+    """One material, de-noised route that was considered but not selected."""
+
+    route_id: str
+    supplier_id: str
+    reason_code: str
+    eligibility: EvidenceStatus
+    rule_ids: tuple[str, ...]
+    unit_price: Decimal
+    selected_unit_price: Decimal
+    price_delta: Decimal
+    material_available_date: date
+    selected_material_available_date: date
+    delivery_delta_days: int
+
+    def __post_init__(self) -> None:
+        for name in ("route_id", "supplier_id", "reason_code"):
+            _require_text(getattr(self, name), name)
+        if not isinstance(self.eligibility, EvidenceStatus):
+            raise TypeError("eligibility must be EvidenceStatus")
+        rules = _text_tuple(self.rule_ids, "rule_ids")
+        _require_unique(rules, "rule_ids")
+        object.__setattr__(self, "rule_ids", rules)
+        _require_decimal(self.unit_price, "unit_price", nonnegative=True)
+        _require_decimal(self.selected_unit_price, "selected_unit_price", nonnegative=True)
+        _require_decimal(self.price_delta, "price_delta")
+        if self.price_delta != self.unit_price - self.selected_unit_price:
+            raise ValueError("price_delta must equal route price minus selected price")
+        _require_date(self.material_available_date, "material_available_date")
+        _require_date(
+            self.selected_material_available_date,
+            "selected_material_available_date",
+        )
+        if not isinstance(self.delivery_delta_days, int) or isinstance(
+            self.delivery_delta_days, bool
+        ):
+            raise TypeError("delivery_delta_days must be int")
+        if self.delivery_delta_days != (
+            self.material_available_date - self.selected_material_available_date
+        ).days:
+            raise ValueError(
+                "delivery_delta_days must equal rejected minus selected availability"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateRoute:
     """One immutable supplier route with separate physical and policy dates.
 
@@ -1168,6 +1270,9 @@ class DecisionRecord:
     rationale: str
     deadline_lateness: tuple[DeadlineLateness, ...] = ()
     economic_autonomy: EconomicAutonomyParameters | None = None
+    source_fingerprint: str | None = None
+    comparator_facts: tuple[DecisionComparatorFact, ...] = ()
+    material_rejections: tuple[MaterialRouteRejection, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.requirement_id, "requirement_id")
@@ -1265,6 +1370,73 @@ class DecisionRecord:
             raise TypeError(
                 "economic_autonomy must be EconomicAutonomyParameters or None"
             )
+        if self.source_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.source_fingerprint
+        ):
+            raise ValueError("source_fingerprint must be a lowercase SHA-256 digest or None")
+        comparators = _tuple(self.comparator_facts, "comparator_facts")
+        if any(not isinstance(item, DecisionComparatorFact) for item in comparators):
+            raise TypeError("comparator_facts contains an invalid item")
+        quantity_facts = tuple(
+            item for item in comparators if item.kind == "quantity_calibration"
+        )
+        if any(not item.decisive for item in quantity_facts):
+            raise ValueError("quantity calibration facts must be decisive")
+        route_facts = tuple(
+            item for item in comparators if item.kind == "route_selection"
+        )
+        route_pairs = {
+            (item.selected_route_ids, item.compared_route_ids) for item in route_facts
+        }
+        for pair in route_pairs:
+            path = tuple(
+                sorted(
+                    (
+                        item
+                        for item in route_facts
+                        if (item.selected_route_ids, item.compared_route_ids) == pair
+                    ),
+                    key=lambda item: item.stage,
+                )
+            )
+            if tuple(item.stage for item in path) != tuple(range(1, 8)):
+                raise ValueError("route comparison facts must reproduce stages 1 through 7")
+            decisive = tuple(item for item in path if item.decisive)
+            if len(decisive) != 1:
+                raise ValueError("route comparison facts require exactly one deciding stage")
+            deciding_stage = decisive[0].stage
+            if any(
+                item.stage > deciding_stage
+                and item.outcome != f"not_evaluated_after_stage_{deciding_stage}"
+                for item in path
+            ):
+                raise ValueError("route comparator stages after the first difference must not be evaluated")
+        object.__setattr__(
+            self,
+            "comparator_facts",
+            tuple(
+                sorted(
+                    comparators,
+                    key=lambda item: (
+                        item.stage,
+                        item.comparator,
+                        item.compared_route_ids,
+                    ),
+                )
+            ),
+        )
+        rejections = _tuple(self.material_rejections, "material_rejections")
+        if any(not isinstance(item, MaterialRouteRejection) for item in rejections):
+            raise TypeError("material_rejections contains an invalid item")
+        _require_unique(
+            (item.supplier_id for item in rejections),
+            "material rejection suppliers",
+        )
+        object.__setattr__(
+            self,
+            "material_rejections",
+            tuple(sorted(rejections, key=lambda item: (item.supplier_id, item.route_id))),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1469,6 +1641,7 @@ __all__ = [
     "DeadlineLateness",
     "DeadlineSupplyPosition",
     "DecisionRecord",
+    "DecisionComparatorFact",
     "DemandBucket",
     "DemandContribution",
     "EvidenceBasis",
@@ -1480,6 +1653,7 @@ __all__ = [
     "FulfillmentStatus",
     "InboundSupply",
     "InventoryPosition",
+    "MaterialRouteRejection",
     "PlanDisposition",
     "PlanLine",
     "Product",

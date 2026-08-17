@@ -27,7 +27,6 @@ class CliContractTests(unittest.TestCase):
             "--scenario",
             "--contract",
             "--llm",
-            "--recompile-policy",
             "--dry-run",
             "--explain",
             "--strict",
@@ -35,6 +34,7 @@ class CliContractTests(unittest.TestCase):
             "--json",
         ):
             self.assertIn(flag, completed.stdout)
+        self.assertNotIn("--recompile-policy", completed.stdout)
         self.assertIn("{benchmark,production}", completed.stdout)
         self.assertIn("{off,auto,required}", completed.stdout)
 
@@ -75,6 +75,31 @@ class CliContractTests(unittest.TestCase):
         self.assertIs(config.contract, EvidenceContract.BENCHMARK)
         self.assertIs(config.model_mode, ModelMode.OFF)
         self.assertFalse(config.dry_run)
+
+    def test_readme_documents_install_command_contracts_and_exit_codes(self) -> None:
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for expected in (
+            "python3 -m pip install -e '.[test]'",
+            "python3 agent.py",
+            "--scenario data/scenarios/scenario_06_simple.sqlite",
+            "--contract benchmark",
+            "--llm off",
+            "benchmark",
+            "production",
+            "deterministic and offline",
+            "compiled_policy.json",
+            "Monday–Friday",
+            "no holiday calendar",
+            "no supplier capacity history",
+            "No safety-stock",
+        ):
+            self.assertIn(expected, readme)
+        for code in range(8):
+            if code == 1:
+                continue
+            self.assertIn(f"| {code} |", readme)
+        self.assertNotIn("`--recompile-policy` flag is available", readme)
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from .domain import (
     EvidenceStatus,
     PlanDisposition,
     PlanLine,
+    ResolutionStatus,
     RouteInputIssue,
     RouteQuarantineScope,
     RuleSeverity,
@@ -217,6 +218,79 @@ def _contract_blocking_evidence(
     )
 
 
+def _comparator_facts(decision: DecisionRecord) -> str:
+    quantity = tuple(
+        item for item in decision.comparator_facts if item.kind == "quantity_calibration"
+    )
+    route = tuple(
+        item for item in decision.comparator_facts if item.kind == "route_selection"
+    )
+    rendered = [
+        (
+            f"quantity calibration stage 0: {item.outcome}; selected routes "
+            f"[{_list(item.selected_route_ids)}]; rule IDs [{_list(item.rule_ids)}]; "
+            f"quantity delta {_number(item.quantity_delta) if item.quantity_delta is not None else 'n/a'}; "
+            f"cost delta {_number(item.cost_delta) if item.cost_delta is not None else 'n/a'}; "
+            f"window [{item.policy_window or 'none'}]"
+        )
+        for item in quantity
+    ]
+    pairs = sorted(
+        {
+            (item.selected_route_ids, item.compared_route_ids)
+            for item in route
+        }
+    )
+    for selected_ids, compared_ids in pairs:
+        path = tuple(
+            sorted(
+                (
+                    item
+                    for item in route
+                    if item.selected_route_ids == selected_ids
+                    and item.compared_route_ids == compared_ids
+                ),
+                key=lambda item: item.stage,
+            )
+        )
+        decisive = tuple(item for item in path if item.decisive)
+        if len(decisive) != 1:
+            raise ExplanationError(
+                "each structured route comparison requires exactly one deciding stage"
+            )
+        winner = decisive[0]
+        rendered.append(
+            f"route selection selected [{_list(selected_ids)}] over "
+            f"[{_list(compared_ids)}]; comparison path ["
+            + ", ".join(
+                f"{item.stage}:{item.comparator}={item.outcome}" for item in path
+            )
+            + f"]; deciding stage {winner.stage} {winner.comparator}; rule IDs "
+            f"[{_list(winner.rule_ids)}]; cost delta "
+            f"{_number(winner.cost_delta) if winner.cost_delta is not None else 'n/a'}; "
+            f"delivery delta days "
+            f"{winner.delivery_delta_days if winner.delivery_delta_days is not None else 'n/a'}; "
+            f"window [{winner.policy_window or 'none'}]"
+        )
+    return "; ".join(rendered) or "none"
+
+
+def _material_rejections(decision: DecisionRecord) -> str:
+    return "; ".join(
+        (
+            f"supplier {item.supplier_id} route {item.route_id}: reason "
+            f"{item.reason_code}; eligibility {item.eligibility.value}; rule IDs "
+            f"[{_list(item.rule_ids)}]; unit price {_number(item.unit_price)} versus "
+            f"selected {_number(item.selected_unit_price)} (delta "
+            f"{_number(item.price_delta)}); material available "
+            f"{item.material_available_date.isoformat()} versus selected "
+            f"{item.selected_material_available_date.isoformat()} (delta "
+            f"{item.delivery_delta_days} days)"
+        )
+        for item in decision.material_rejections
+    ) or "none"
+
+
 def render_decision_rationale(decision: DecisionRecord) -> str:
     """Render a canonical requirement rationale without upstream free text."""
 
@@ -269,6 +343,8 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         f"{decision.requirement_state.resolution.value}; evidence contract "
         f"{decision.evidence_contract.value}; rule IDs [{_list(rules)}]."
         f"{contract_dispositions} Post-plan deadline misses [{lateness}]."
+        f" Structured deciding comparators [{_comparator_facts(decision)}]."
+        f" Material rejected routes [{_material_rejections(decision)}]."
         f"{_economic_autonomy_disclosure(decision)}"
     )
 
@@ -294,12 +370,6 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
             key=lambda item: (item.rule_id, item.status.value),
         )
     ) or "none"
-    alternatives = "; ".join(
-        f"{candidate.plan_id} disposition {candidate.disposition.value}, routes "
-        f"[{_list(item.route_id for item in candidate.lines)}], relaxed rules "
-        f"[{_list(candidate.relaxed_rule_ids)}]"
-        for candidate in decision.alternatives
-    ) or "none"
     objective = ", ".join(_number(item) for item in plan.objective_vector) or "none"
     lead_days = (line.expected_delivery_date - line.order_date).days
     return sanitize_control_characters(
@@ -321,8 +391,10 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
         f"{_number(decision.residual_gap)}. Fulfillment "
         f"{decision.requirement_state.fulfillment.value}; resolution "
         f"{decision.requirement_state.resolution.value}; disposition {plan.disposition.value}; "
-        f"objective [{objective}]; evidence [{evidence}]; alternatives and material rejections "
-        f"[{alternatives}]; disclosures [{_list(item.value for item in decision.alert_categories)}]; "
+        f"objective [{objective}]; evidence [{evidence}]; deciding comparators "
+        f"[{_comparator_facts(decision)}]; material rejected routes "
+        f"[{_material_rejections(decision)}]; disclosures "
+        f"[{_list(item.value for item in decision.alert_categories)}]; "
         f"assumptions [{_list(assumptions)}]."
         f"{_economic_autonomy_disclosure(decision)}"
     )
@@ -761,6 +833,8 @@ def render_alerts(
         for issue in source_issues
         for component_id in issue.affected_component_ids
     )
+    provisional_requirements: list[str] = []
+    evidence_contract_requirements: list[tuple[str, str, tuple[str, ...]]] = []
 
     def add(
         category: AlertCategory,
@@ -769,8 +843,10 @@ def render_alerts(
         *,
         decision: DecisionRecord | None = None,
     ) -> None:
-        if decision is not None:
-            body += _economic_autonomy_disclosure(decision)
+        # ``decision`` remains an explicit call-site signal that this is a
+        # requirement alert.  Run-global policy/contract boilerplate is
+        # rendered once below rather than appended to every such alert.
+        del decision
         rendered.append(
             make_owned_alert(category, scope, body, visible_prefix=visible_prefixes)
         )
@@ -809,7 +885,10 @@ def render_alerts(
             decision.economic_autonomy is not None
             and decision.economic_autonomy.provisional
         ):
-            assumptions.add("PROVISIONAL_ECONOMIC_AUTONOMY")
+            provisional_requirements.append(
+                f"{decision.component_id}/{decision.requirement_id}"
+            )
+        assumptions.discard("PROVISIONAL_ECONOMIC_AUTONOMY")
         for code in sorted(assumptions):
             add(
                 AlertCategory.ASSUMPTION,
@@ -913,15 +992,22 @@ def render_alerts(
                 decision=decision,
             )
         if (
-            decision.evidence_contract is EvidenceContract.PRODUCTION
-            and AlertCategory.EVIDENCE_CONTRACT in decision.alert_categories
+            AlertCategory.EVIDENCE_CONTRACT in decision.alert_categories
         ):
             special.add(AlertCategory.EVIDENCE_CONTRACT)
-            add(
-                AlertCategory.EVIDENCE_CONTRACT,
-                f"{scope}:evidence-contract",
-                _evidence_contract_alert(decision),
-                decision=decision,
+            blocking = _contract_blocking_evidence(decision)
+            contract_rules = tuple(
+                sorted(
+                    {
+                        item.rule_id
+                        for item in (*decision.evidence,)
+                        if item.status is EvidenceStatus.UNKNOWN
+                    }
+                    | {item.rule_id for item in blocking}
+                )
+            )
+            evidence_contract_requirements.append(
+                (decision.component_id, decision.requirement_id, contract_rules)
             )
         if AlertCategory.SOLVER_UNPROVEN in decision.alert_categories:
             add(
@@ -940,6 +1026,44 @@ def render_alerts(
                 decision=decision,
             )
 
+    if provisional_requirements:
+        parameters = next(
+            item.economic_autonomy
+            for item in records
+            if item.economic_autonomy is not None
+            and item.economic_autonomy.provisional
+        )
+        assert parameters is not None
+        add(
+            AlertCategory.ASSUMPTION,
+            "run:assumption:PROVISIONAL_ECONOMIC_AUTONOMY",
+            "Run-global policy assumption PROVISIONAL_ECONOMIC_AUTONOMY applies to "
+            f"components/requirements [{_list(provisional_requirements)}]. The agent used "
+            "the reviewed provisional thresholds consistently and retained component "
+            "traceability in each managed decision. Human action: approve or replace the "
+            "values in a reviewed policy pack and rerun if they change. Active values: "
+            f"{parameters.disclosure()}.",
+        )
+
+    if evidence_contract_requirements:
+        contract = records[0].evidence_contract.value if records else "none"
+        listing = "; ".join(
+            f"{component_id}/{requirement_id} rule IDs [{_list(rule_ids)}]"
+            for component_id, requirement_id, rule_ids in sorted(
+                evidence_contract_requirements
+            )
+        )
+        add(
+            AlertCategory.EVIDENCE_CONTRACT,
+            "run:evidence-contract",
+            f"Run-global {contract} evidence-contract trace: [{listing}]. The agent "
+            "preserved every hard UNKNOWN disposition, withheld affected actions where the "
+            "contract requires DECISION_REQUIRED, and did not infer zero history or supplier "
+            "ineligibility. Component-specific DECISION_REQUIRED alerts state each terminal "
+            "impact. Human action: provide the cited authoritative evidence and rerun from a "
+            "fresh snapshot.",
+        )
+
     po_count = sum(
         len(item.selected_plan.lines) if item.selected_plan is not None else 0
         for item in records
@@ -952,23 +1076,60 @@ def render_alerts(
         )
         for item in records
     )
-    ordered_requirements = sum(item.selected_plan is not None for item in records)
-    decision_required = sum(
-        any(plan.disposition is PlanDisposition.DECISION_REQUIRED for plan in item.alternatives)
-        or AlertCategory.DECISION_REQUIRED in item.alert_categories
-        for item in records
+    buckets = {
+        "AGENT_ORDERED_RESOLVED": 0,
+        "AGENT_ORDERED_WITH_RESIDUAL": 0,
+        "APPROVAL_WITHHELD": 0,
+        "DECISION_DEFERRED": 0,
+        "PROVEN_INFEASIBLE": 0,
+        "COVERED_WITHOUT_NEW_ORDER": 0,
+        "OTHER_UNRESOLVED": 0,
+    }
+    for decision in records:
+        if decision.selected_plan is not None:
+            key = (
+                "AGENT_ORDERED_RESOLVED"
+                if decision.residual_gap == ZERO
+                else "AGENT_ORDERED_WITH_RESIDUAL"
+            )
+        elif decision.residual_gap == ZERO:
+            key = "COVERED_WITHOUT_NEW_ORDER"
+        elif (
+            AlertCategory.APPROVAL_REQUIRED in decision.alert_categories
+            or any(
+                plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+                for plan in decision.alternatives
+            )
+        ):
+            key = "APPROVAL_WITHHELD"
+        elif (
+            AlertCategory.DECISION_REQUIRED in decision.alert_categories
+            or any(
+                plan.disposition is PlanDisposition.DECISION_REQUIRED
+                for plan in decision.alternatives
+            )
+        ):
+            key = "DECISION_DEFERRED"
+        elif decision.requirement_state.resolution is ResolutionStatus.INFEASIBLE:
+            key = "PROVEN_INFEASIBLE"
+        else:
+            key = "OTHER_UNRESOLVED"
+        buckets[key] += 1
+    bucket_sum = sum(buckets.values())
+    if bucket_sum != len(records):
+        raise AssertionError("run-accounting buckets do not reconcile")
+    bucket_text = ", ".join(
+        f"{name}={count}" for name, count in buckets.items()
     )
     no_eligible = sum(
-        AlertCategory.NO_ELIGIBLE_SUPPLIER in item.alert_categories for item in records
-    )
-    existing_covered = sum(
-        item.selected_plan is None and item.residual_gap == ZERO for item in records
+        AlertCategory.NO_ELIGIBLE_SUPPLIER in item.alert_categories
+        for item in records
     )
     accounting = (
-        f"Managed {len(records)} component requirements: {ordered_requirements} covered by agent "
-        f"orders ({_number(ordered_cost)} across {po_count} POs), {decision_required} deferred "
-        f"for decision, {no_eligible} have no eligible supplier, {existing_covered} fully covered "
-        f"without a new agent order. Evidence contract: "
+        f"Managed {len(records)} component requirements in mutually exclusive buckets "
+        f"[{bucket_text}]; bucket sum {bucket_sum}. Agent purchase orders: {po_count}; "
+        f"ordered cost: {_number(ordered_cost)}; requirements with a NO_ELIGIBLE_SUPPLIER "
+        f"diagnostic: {no_eligible}. Evidence contract: "
         f"{records[0].evidence_contract.value if records else 'none'}. Active directives: "
         f"{_list(active_directives)}. Inactive directives: {_list(inactive_directives)}."
     )

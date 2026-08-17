@@ -1,0 +1,82 @@
+# Apex Procurement Agent
+
+Apex Procurement is a deterministic, offline-first planner for the supplied SQLite procurement scenarios. It reconstructs time-phased component demand, evaluates the checked-in policy pack, solves exact procurement quantities, independently validates the result, and atomically reconciles agent-owned purchase orders and alerts.
+
+## Install
+
+Python 3.11 or newer is required. From the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -e '.[test]'
+python3 -m pytest -q
+```
+
+SciPy is the only runtime dependency. No network service, API key, or model is required for normal planning.
+
+## Run
+
+The required command is:
+
+```bash
+python3 agent.py \
+  --scenario data/scenarios/scenario_06_simple.sqlite \
+  --contract benchmark \
+  --llm off
+```
+
+An installed equivalent is `apex-procurement --scenario SCENARIO.sqlite`. A normal run writes verified purchase orders and alerts to the supplied database. Start with `--dry-run --json` when inspecting an unfamiliar scenario.
+
+### Evidence contracts
+
+- `--contract benchmark` is the default. It applies the assignment's explicit benchmark missing-evidence assumptions and labels them.
+- `--contract production` never converts missing rolling evidence into an assumption. It retains `UNKNOWN`, emits component-specific `DECISION_REQUIRED` signals, and records one run-global `EVIDENCE_CONTRACT` alert with component traceability.
+
+The default execution is deterministic and offline. `--llm off` makes that contract explicit. `--llm auto` permits an optional, non-load-bearing model adapter if one is configured, but this repository has no adapter and planning remains deterministic. `--llm required` therefore exits with code 4; model output can never replace policy evaluation, exact optimization, or independent validation.
+
+### Flags
+
+- `--scenario PATH` selects one readable, regular SQLite snapshot and is required.
+- `--contract {benchmark,production}` selects the missing-evidence contract.
+- `--llm {off,auto,required}` controls optional model behavior; the default is `off`.
+- `--dry-run` validates and renders without database writes.
+- `--explain COMPONENT_ID` prints the canonical rationale for one demanded component.
+- `--strict` turns independent-validation warnings into a failed run.
+- `--alert-prefixes` includes visible category prefixes in alert prose.
+- `--json` writes a deterministic result object to stdout.
+
+Every run writes one structured audit line to stderr. Human output or the result JSON goes to stdout. In commit mode, verified POs are inserted and owned alerts are reconciled in one transaction. External rows are never updated or deleted.
+
+### Exit codes
+
+| Code | Meaning |
+|---:|---|
+| 0 | Run validated and completed (including a no-op or dry run). |
+| 2 | Invalid CLI scope or unsafe/missing scenario path. |
+| 3 | Scenario schema or source data cannot be read safely. |
+| 4 | Reviewed policy pack is invalid, or a required optional model is unavailable. |
+| 5 | Planning, exact solve, or independent validation did not complete safely. |
+| 6 | The database changed twice during planning; no duplicate write was made. |
+| 7 | Ownership validation or the atomic commit failed. |
+
+## Idempotency and ownership
+
+New managed POs use a compact v4 marker. It stores full action, demand, component-source, group, and business-field digests plus route/policy/line identity; it does not embed a serialized `DecisionRecord`. Before a managed PO is temporarily removed for fresh reconstruction, the planner must reproduce the complete component source fingerprint, including relevant supplier, catalog, external-PO evidence, contract, and policy facts. If any competing route or source fact changed, the old PO remains physical inbound and cannot be silently replaced by a duplicate full-demand order.
+
+Markers v1, v2, and v3 remain strictly parseable and fail closed on malformed markers, APX prefix collisions, forged payloads, incomplete line groups, or changed stored business fields. Because legacy markers lack the all-candidate source digest, they are conservatively retained as physical commitments rather than temporarily removed. Exact unchanged v4 reruns preserve PO rows, alert IDs, and SQLite sequences.
+
+## Reviewed policy-pack workflow
+
+`src/apex_procurement/policy/compiled_policy.json` and `concepts.json` are reviewed, checked-in runtime inputs. Their schema, provenance, hashes, effective dates, and typed parameters are validated every run. This repository does not contain a reviewed offline policy compiler, so there is no `--recompile-policy` flag. Editing source policy documents, compiling them, reviewing the diff, and checking in a new artifact is a separate controlled process; runtime planning never recompiles or waives policy.
+
+## Operational limitations
+
+- Catalog lead times are calendar days. Comparator windows use Monday–Friday business days with no holiday calendar.
+- The snapshot has no supplier capacity history; capacity remains disclosed as unknown rather than invented.
+- No safety-stock policy or safety-stock source data is represented.
+- Rolling supplier history, approved exception spend, and other evidence may be absent. Benchmark assumptions are explicit; production defers decisions that require missing evidence.
+- Known catalog unit price is used where no freight, tax, tariff, or other landed-cost fact exists.
+- Existing PO delivery dates are trusted only after repository validation; the system has no external shipment-status feed.
+- The planner operates on one SQLite snapshot and performs at most one optimistic-concurrency replan.
