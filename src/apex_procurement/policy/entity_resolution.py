@@ -233,6 +233,7 @@ class EntityResolver:
             "category": component.category or "",
         }
         target_tokens = normalized_tokens(" ".join(fields.values()))
+        description_tokens = normalized_tokens(component.description or "")
         negative = self._matching_phrase(target_tokens, concept.get("negative_fixtures", ()))
         if negative is not None:
             return ConceptResolution(
@@ -284,9 +285,24 @@ class EntityResolver:
             )
 
         strategy = str(concept["resolution"])
-        if strategy == "enumerated_both_ways" and self._has_source_term_overlap(
-            target_tokens, concept.get("source_terms", ())
-        ):
+        residual_semantic_evidence = (
+            self._has_source_term_overlap(
+                target_tokens, concept.get("source_terms", ())
+            )
+            or self._matching_phrase(
+                description_tokens, concept.get("synonyms", ())
+            )
+            is not None
+            or self._has_source_term_overlap(
+                description_tokens, concept.get("source_terms", ())
+            )
+            or self._has_residual_term_overlap(
+                description_tokens,
+                tuple(concept.get("synonyms", ()))
+                + tuple(concept.get("source_terms", ())),
+            )
+        )
+        if strategy == "enumerated_both_ways" and residual_semantic_evidence:
             alert = ResolutionAlert(
                 AlertCategory.ASSUMPTION,
                 "INFERRED_CONCEPT_MEMBERSHIP",
@@ -297,7 +313,9 @@ class EntityResolver:
                 component.component_id,
                 EvidenceStatus.UNKNOWN,
                 "enumerated-both-ways",
-                ("source terminology overlaps without an exact deterministic match",),
+                (
+                    "residual name, category, or description evidence overlaps the closed enumeration without proving exact membership",
+                ),
                 (alert,),
                 ("INFERRED_CONCEPT_MEMBERSHIP",),
             )
@@ -487,6 +505,26 @@ class EntityResolver:
             if acronyms.intersection(target):
                 return True
         return False
+
+    @staticmethod
+    def _has_residual_term_overlap(
+        tokens: tuple[str, ...], terms: Sequence[object]
+    ) -> bool:
+        """Treat two corroborating semantic tokens as uncertainty, not proof."""
+
+        target = frozenset(token for token in tokens if len(token) > 2)
+        return any(
+            len(
+                target
+                & {
+                    token
+                    for token in normalized_tokens(str(term))
+                    if len(token) > 2
+                }
+            )
+            >= 2
+            for term in terms
+        )
 
     def resolve_named_supplier(
         self,

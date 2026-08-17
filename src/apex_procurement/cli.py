@@ -336,7 +336,8 @@ def _applicable_rule_ids(batch: EvaluationBatch) -> frozenset[str]:
     return frozenset(
         item.rule_id
         for item in batch.active
-        if item.applicable is True and item.selector_status is EvidenceStatus.PASS
+        if item.applicable is not False
+        and item.selector_status is not EvidenceStatus.FAIL
     )
 
 

@@ -309,6 +309,22 @@ class ApplicablePolicyParameters:
             if item.scope.matches(semantic_status) is True
         )
 
+    def robust_secondary_allocations(
+        self, semantic_status: Mapping[str, bool | None]
+    ) -> tuple[SecondaryAllocationParameters, ...]:
+        """Return constraints that apply under either membership reading.
+
+        A prospective hard allocation rule is part of the conservative
+        intersection when its selector is proven or unresolved.  Proven
+        non-membership is the only state that removes it.
+        """
+
+        return tuple(
+            item
+            for item in self.secondary_allocations
+            if item.scope.matches(semantic_status) is not False
+        )
+
 
 __all__ = [
     "AirFreightPeriodCapParameters",

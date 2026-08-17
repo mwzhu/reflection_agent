@@ -296,6 +296,7 @@ class _Offer:
     lead_days: int
     shipping_method: str
     international: bool
+    country_status: EvidenceStatus
     review_keys: frozenset[str]
     allowed_buckets: tuple[date, ...]
     gate_conditions: tuple[tuple[date, str], ...]
@@ -387,6 +388,24 @@ def _source_term_overlap(tokens: tuple[str, ...], terms: Iterable[object]) -> bo
         if acronyms.intersection(target):
             return True
     return False
+
+
+def _residual_term_overlap(
+    tokens: tuple[str, ...], terms: Iterable[object]
+) -> bool:
+    target = frozenset(token for token in tokens if len(token) > 2)
+    return any(
+        len(
+            target
+            & {
+                token
+                for token in _tokens(str(term))
+                if len(token) > 2
+            }
+        )
+        >= 2
+        for term in terms
+    )
 
 
 def _certification(value: str) -> str:
@@ -651,7 +670,9 @@ class IndependentPlanValidator:
                     domestic = not domestic
                 return EvidenceStatus.PASS if domestic else EvidenceStatus.FAIL
             if concept_id == "strategic_supplier":
-                return EvidenceStatus.PASS if _tokens(entity.relationship_tier or "") == ("strategic",) else EvidenceStatus.FAIL
+                if entity.relationship_tier is None:
+                    return EvidenceStatus.UNKNOWN
+                return EvidenceStatus.PASS if _tokens(entity.relationship_tier) == ("strategic",) else EvidenceStatus.FAIL
             return EvidenceStatus.UNKNOWN
         if not isinstance(entity, Component):
             return EvidenceStatus.UNKNOWN
@@ -679,6 +700,7 @@ class IndependentPlanValidator:
                 else EvidenceStatus.FAIL
             )
         identity = _tokens(" ".join(filter(None, (entity.name, entity.category))))
+        description = _tokens(entity.description or "")
         if any(_phrase(identity, str(item)) for item in concept.get("negative_fixtures", ())):
             return EvidenceStatus.FAIL
         if concept_id == "safety_critical_part" and entity.required_certifications:
@@ -689,7 +711,21 @@ class IndependentPlanValidator:
             return EvidenceStatus.PASS
         if (
             str(concept.get("resolution")) == "enumerated_both_ways"
-            and _source_term_overlap(identity, concept.get("source_terms", ()))
+            and (
+                _source_term_overlap(identity, concept.get("source_terms", ()))
+                or any(
+                    _phrase(description, str(item))
+                    for item in concept.get("synonyms", ())
+                )
+                or _source_term_overlap(
+                    description, concept.get("source_terms", ())
+                )
+                or _residual_term_overlap(
+                    description,
+                    tuple(concept.get("synonyms", ()))
+                    + tuple(concept.get("source_terms", ())),
+                )
+            )
         ):
             return EvidenceStatus.UNKNOWN
         return EvidenceStatus.FAIL
@@ -960,6 +996,12 @@ class IndependentPlanValidator:
         keys = set(
             self._rolling_review_keys(snapshot, requirement.component, contract)
         )
+        if (
+            contract is EvidenceContract.BENCHMARK
+            and self._concept("domestic_supplier", supplier)
+            is EvidenceStatus.UNKNOWN
+        ):
+            keys.update(("ROBUST_BOTH_WAYS", "SUPPLIER_ATTRIBUTE_UNKNOWN"))
         pcb_rules = self._rules(snapshot.configuration.current_date, "incumbent_supplier_only")
         if (
             contract is EvidenceContract.BENCHMARK
@@ -1039,13 +1081,85 @@ class IndependentPlanValidator:
             assumption = True
         return True, assumption
 
+    def _route_fact_eligible(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        supplier: Supplier,
+        catalog: SupplierCatalogLine,
+        contract: EvidenceContract,
+    ) -> bool:
+        """Rebuild the pre-rating facts used to classify a catalog route.
+
+        Sustainability is deliberately excluded here: the planner constructs
+        the §3 route fact before attaching the below-B review gate, so a hard
+        sustainability rejection must not rewrite the route's rationale ID.
+        """
+
+        if supplier.on_approved_list is not True:
+            return False
+        if any(
+            not _holds(supplier, required)
+            for required in self._required_certifications(
+                requirement.component, snapshot.configuration.current_date
+            )
+        ):
+            return False
+        pcb_rules = self._rules(
+            snapshot.configuration.current_date, "incumbent_supplier_only"
+        )
+        if (
+            pcb_rules
+            and self._concept(
+                "printed_circuit_board_component", requirement.component
+            )
+            is EvidenceStatus.PASS
+        ):
+            pair = (requirement.component.component_id, supplier.supplier_id)
+            if pair not in self.accepted_shipment_pairs:
+                if contract is EvidenceContract.PRODUCTION:
+                    return False
+                prior = any(
+                    item.component_id == requirement.component.component_id
+                    and item.supplier_id == supplier.supplier_id
+                    for item in snapshot.purchase_orders
+                )
+                if not prior and not self._relationship_predates(
+                    supplier, pcb_rules[0].effective_from
+                ):
+                    return False
+        return True
+
+    def _supplier_attribute_quality_required(
+        self, snapshot: ScenarioSnapshot, component_id: str
+    ) -> bool:
+        """Independently identify R10 supplier facts requiring disclosure."""
+
+        supplier_ids = {
+            item.supplier_id
+            for item in snapshot.catalog_lines
+            if item.component_id == component_id
+        }
+        return any(
+            supplier.supplier_id in supplier_ids
+            and (
+                supplier.on_approved_list is None
+                or _rating(supplier.sustainability_rating) is None
+                or self._concept("domestic_supplier", supplier)
+                is EvidenceStatus.UNKNOWN
+                or self._concept("strategic_supplier", supplier)
+                is EvidenceStatus.UNKNOWN
+            )
+            for supplier in snapshot.suppliers
+        )
+
     def _named_primary(self, snapshot: ScenarioSnapshot, component: Component) -> NamedEntityCheck | None:
         rules = tuple(
             rule
             for rule in self._directive_rules(
                 snapshot.configuration.current_date, "named_primary_supplier"
             )
-            if self._selector_status(rule, component) is EvidenceStatus.PASS
+            if self._selector_status(rule, component) is not EvidenceStatus.FAIL
         )
         if not rules:
             return None
@@ -1058,7 +1172,7 @@ class IndependentPlanValidator:
             for rule in self._directive_rules(
                 snapshot.configuration.current_date, "named_primary_supplier"
             )
-            if self._selector_status(rule, component) is EvidenceStatus.PASS
+            if self._selector_status(rule, component) is not EvidenceStatus.FAIL
         )
         if not rules:
             return None
@@ -1115,7 +1229,7 @@ class IndependentPlanValidator:
         }
         matches = self._parameters(
             snapshot.configuration.current_date
-        ).matching_secondary_allocations(semantic_status)
+        ).robust_secondary_allocations(semantic_status)
         if len(matches) > 1:
             raise ValueError("multiple minimum-secondary parameters match one component")
         return matches[0] if matches else None
@@ -1269,6 +1383,18 @@ class IndependentPlanValidator:
         international = tuple(
             item for item in eligible if self._concept("international_supplier", item[0]) is EvidenceStatus.PASS
         )
+        return self._domestic_gate_from_polarized(
+            snapshot, requirement, due, domestic, international
+        )
+
+    def _domestic_gate_from_polarized(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        due: date,
+        domestic: Sequence[tuple[Supplier, SupplierCatalogLine]],
+        international: Sequence[tuple[Supplier, SupplierCatalogLine]],
+    ) -> str | None:
         if not international:
             return None
         if not domestic:
@@ -1297,6 +1423,64 @@ class IndependentPlanValidator:
             ZERO if best_international == ZERO else (best_domestic - best_international) / best_international
         )
         return "b" if premium > threshold else None
+
+    def _route_domestic_gate(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        due: date,
+        eligible: Sequence[tuple[Supplier, SupplierCatalogLine]],
+        route_supplier_id: str,
+    ) -> str | None:
+        """Reconstruct the conservative country reading for one route."""
+
+        target = next(
+            (
+                item
+                for item in eligible
+                if item[0].supplier_id == route_supplier_id
+            ),
+            None,
+        )
+        target_supplier = next(
+            item
+            for item in snapshot.suppliers
+            if item.supplier_id == route_supplier_id
+        )
+        target_status = self._concept("domestic_supplier", target_supplier)
+        known_domestic = tuple(
+            item
+            for item in eligible
+            if self._concept("domestic_supplier", item[0])
+            is EvidenceStatus.PASS
+        )
+        known_international = tuple(
+            item
+            for item in eligible
+            if self._concept("domestic_supplier", item[0])
+            is EvidenceStatus.FAIL
+        )
+        unresolved = tuple(
+            item
+            for item in eligible
+            if self._concept("domestic_supplier", item[0])
+            is EvidenceStatus.UNKNOWN
+        )
+        if target_status is EvidenceStatus.UNKNOWN:
+            domestic = known_domestic + tuple(
+                item for item in unresolved if item[0].supplier_id != route_supplier_id
+            )
+            international = known_international + (
+                (target,) if target is not None else ()
+            )
+        elif target_status is EvidenceStatus.FAIL:
+            domestic = known_domestic + unresolved
+            international = known_international
+        else:
+            return None
+        return self._domestic_gate_from_polarized(
+            snapshot, requirement, due, domestic, international
+        )
 
     def _offers(
         self,
@@ -1334,8 +1518,19 @@ class IndependentPlanValidator:
             )
             if allowed:
                 eligible.append((supplier, catalog, assumption))
+        eligible_pairs = tuple(
+            (supplier, catalog)
+            for supplier, catalog, _assumption in eligible
+        )
         gate = {
-            due: self._domestic_gate(snapshot, requirement, due, tuple((supplier, catalog) for supplier, catalog, _assumption in eligible))
+            (supplier.supplier_id, due): self._route_domestic_gate(
+                snapshot,
+                requirement,
+                due,
+                eligible_pairs,
+                supplier.supplier_id,
+            )
+            for supplier, _catalog, _assumption in eligible
             for due, _quantity in requirement.bucket_quantities
         }
         upper = self.derive_upper_bounds(
@@ -1361,7 +1556,9 @@ class IndependentPlanValidator:
         ).domestic_premiums.for_critical_status(critical_status).rule_id
         result: list[_Offer] = []
         for supplier, catalog, _assumption in eligible:
-            international = self._concept("international_supplier", supplier) is EvidenceStatus.PASS
+            country_status = self._concept("domestic_supplier", supplier)
+            country_unknown = country_status is EvidenceStatus.UNKNOWN
+            international = country_status is not EvidenceStatus.PASS
             expected = snapshot.configuration.current_date + timedelta(days=catalog.lead_time_days)
             pcb = self._concept("printed_circuit_board_component", requirement.component) is EvidenceStatus.PASS
             buffer = self.receiving_buffer_days if requirement.component.is_hazardous or pcb else 0
@@ -1374,15 +1571,17 @@ class IndependentPlanValidator:
                 requirement.component, catalog, "standard", catalog.lead_time_days
             )
             gate_conditions = tuple(
-                (due, gate[due] or "shut")
+                (due, gate[(supplier.supplier_id, due)] or "shut")
                 for due, _quantity in requirement.bucket_quantities
             )
             if international:
                 standard_groups: dict[str, list[date]] = defaultdict(list)
                 for due, _quantity in requirement.bucket_quantities:
-                    condition = gate[due]
+                    condition = gate[(supplier.supplier_id, due)]
                     if condition is not None:
                         standard_groups[condition].append(due)
+                if country_unknown and contract is EvidenceContract.PRODUCTION:
+                    standard_groups = {}
             else:
                 # Ordinary domestic routes may be allocated late and priced
                 # by unit-late-days, so their bucket scope is not restricted
@@ -1429,6 +1628,7 @@ class IndependentPlanValidator:
                         catalog.lead_time_days,
                         "standard",
                         international,
+                        country_status,
                         review_keys,
                         allowed_buckets,
                         gate_conditions,
@@ -1445,7 +1645,7 @@ class IndependentPlanValidator:
                     )
                 )
             air_rules = self._rules(snapshot.configuration.current_date, "air_freight_authorization")
-            if not international or not air_rules:
+            if not international or country_unknown or not air_rules:
                 continue
             air_rule = air_rules[0]
             reduction = int(air_rule.data["constraint"]["lead_time_reduction_days"])
@@ -1467,7 +1667,7 @@ class IndependentPlanValidator:
             )
             air_groups: dict[str, list[date]] = defaultdict(list)
             for due, _quantity in requirement.bucket_quantities:
-                condition = gate[due]
+                condition = gate[(supplier.supplier_id, due)]
                 if (
                     condition is not None
                     and material > due
@@ -1498,6 +1698,7 @@ class IndependentPlanValidator:
                         air_lead,
                         "air freight",
                         international,
+                        country_status,
                         review_keys,
                         air_allowed,
                         gate_conditions,
@@ -1516,7 +1717,7 @@ class IndependentPlanValidator:
                         ),
                     )
                 )
-        return tuple(
+        ordered = tuple(
             sorted(
                 result,
                 key=lambda item: (
@@ -1525,6 +1726,69 @@ class IndependentPlanValidator:
                 ),
             )
         )
+        return () if self._relationship_tier_material(ordered) else ordered
+
+    def _relationship_tier_material(self, offers: Sequence[_Offer]) -> bool:
+        """Independently test whether tier readings change stage 7."""
+
+        maximum_savings = (
+            self._parameters(offers[0].expected_delivery - timedelta(days=offers[0].lead_days))
+            .strategic_continuity.maximum_alternative_savings_fraction
+            if offers
+            else ZERO
+        )
+
+        def readings(status: EvidenceStatus) -> tuple[bool, ...]:
+            if status is EvidenceStatus.PASS:
+                return (True,)
+            if status is EvidenceStatus.FAIL:
+                return (False,)
+            return (False, True)
+
+        def outcome(
+            left: _Offer,
+            right: _Offer,
+            left_strategic: bool,
+            right_strategic: bool,
+        ) -> int:
+            if left_strategic == right_strategic:
+                return 0
+            strategic = left if left_strategic else right
+            alternative = right if left_strategic else left
+            savings = (
+                ZERO
+                if strategic.catalog.unit_price == ZERO
+                else (
+                    strategic.catalog.unit_price
+                    - alternative.catalog.unit_price
+                )
+                / strategic.catalog.unit_price
+            )
+            if savings > maximum_savings:
+                return 0
+            return -1 if left_strategic else 1
+
+        for index, left in enumerate(offers):
+            left_status = self._concept("strategic_supplier", left.supplier)
+            for right in offers[index + 1 :]:
+                right_status = self._concept("strategic_supplier", right.supplier)
+                if EvidenceStatus.UNKNOWN not in {left_status, right_status}:
+                    continue
+                shared = set(left.allowed_buckets) & set(right.allowed_buckets)
+                if not any(
+                    max(0, (left.material_available - due).days)
+                    == max(0, (right.material_available - due).days)
+                    for due in shared
+                ):
+                    continue
+                outcomes = {
+                    outcome(left, right, left_value, right_value)
+                    for left_value in readings(left_status)
+                    for right_value in readings(right_status)
+                }
+                if len(outcomes) > 1:
+                    return True
+        return False
 
     # ---- exact plan arithmetic and objective reconstruction ------------
 
@@ -1992,7 +2256,27 @@ class IndependentPlanValidator:
 
         domestic = self._concept("domestic_supplier", supplier)
         if domestic is EvidenceStatus.UNKNOWN:
-            unknown.add("DATA-QUALITY.supplier_domesticity")
+            country_safe = offer.international and any(
+                condition != "shut"
+                for _due, condition in offer.gate_conditions
+            )
+            if contract is EvidenceContract.PRODUCTION or not country_safe:
+                unknown.add("DATA-QUALITY.supplier_domesticity")
+                critical = self._concept("critical_component", component)
+                critical_status = (
+                    True
+                    if critical is EvidenceStatus.PASS
+                    else False
+                    if critical is EvidenceStatus.FAIL
+                    else None
+                )
+                unknown.add(
+                    self._parameters(
+                        snapshot.configuration.current_date
+                    ).domestic_premiums.for_critical_status(
+                        critical_status
+                    ).rule_id
+                )
 
         pcb_rules = self._rules(current, "incumbent_supplier_only")
         if (
@@ -2016,7 +2300,7 @@ class IndependentPlanValidator:
                 if not prior and not relationship:
                     failed.add(pcb_rules[0].rule_id)
 
-        if offer.international and all(
+        if offer.country_status is EvidenceStatus.FAIL and offer.international and all(
             condition == "shut" for _due, condition in offer.gate_conditions
         ):
             failed.update(
@@ -2034,6 +2318,7 @@ class IndependentPlanValidator:
             )
             if rating is None or boundary is None:
                 unknown.add(below_rules[0].rule_id)
+                unknown.add(f"{below_rules[0].rule_id}:rating-evidence")
             elif rating < boundary:
                 suppliers = {
                     item.supplier_id: item for item in snapshot.suppliers
@@ -2198,7 +2483,6 @@ class IndependentPlanValidator:
                 component_id=decision.component_id,
             )
 
-        gate_conditions = offers[0].gate_conditions
         buffer_days = (
             self.receiving_buffer_days
             if requirement.component.is_hazardous
@@ -2213,6 +2497,17 @@ class IndependentPlanValidator:
         offer_rules: dict[str, tuple[str, ...]] = {
             item.route_id: () for item in offers
         }
+        rationale_eligible_pairs = tuple(
+            (suppliers[catalog.supplier_id], catalog)
+            for catalog in relevant_catalogs
+            if self._route_fact_eligible(
+                snapshot,
+                requirement,
+                suppliers[catalog.supplier_id],
+                catalog,
+                decision.evidence_contract,
+            )
+        )
         for catalog in relevant_catalogs:
             supplier = suppliers[catalog.supplier_id]
             if any(
@@ -2233,10 +2528,8 @@ class IndependentPlanValidator:
                 days=catalog.lead_time_days
             )
             material = expected + timedelta(days=buffer_days)
-            international = (
-                self._concept("international_supplier", supplier)
-                is EvidenceStatus.PASS
-            )
+            country_status = self._concept("domestic_supplier", supplier)
+            international = country_status is not EvidenceStatus.PASS
             all_deadlines = tuple(
                 due for due, _quantity in requirement.bucket_quantities
             )
@@ -2245,8 +2538,15 @@ class IndependentPlanValidator:
             ] = []
             if international:
                 by_condition: dict[str, list[date]] = defaultdict(list)
-                for due, condition in gate_conditions:
-                    if condition != "shut":
+                for due in all_deadlines:
+                    condition = self._route_domestic_gate(
+                        snapshot,
+                        requirement,
+                        due,
+                        rationale_eligible_pairs,
+                        supplier.supplier_id,
+                    )
+                    if condition is not None:
                         by_condition[condition].append(due)
                 if by_condition:
                     critical = self._concept(
@@ -2296,9 +2596,23 @@ class IndependentPlanValidator:
                     catalog.lead_time_days,
                     "standard",
                     international,
+                    country_status,
                     frozenset(),
                     exception_scope or all_deadlines,
-                    gate_conditions,
+                    tuple(
+                        (
+                            due,
+                            self._route_domestic_gate(
+                                snapshot,
+                                requirement,
+                                due,
+                                rationale_eligible_pairs,
+                                supplier.supplier_id,
+                            )
+                            or "shut",
+                        )
+                        for due in all_deadlines
+                    ),
                     ZERO,
                     supplier_hash,
                     route_hash,
@@ -5396,6 +5710,18 @@ class IndependentPlanValidator:
             if requirement is None:
                 sink.error("UNKNOWN_REQUIREMENT_COMPONENT", "Decision has no independently reconstructed source requirement.", component_id=decision.component_id)
                 continue
+            if (
+                self._supplier_attribute_quality_required(
+                    snapshot, decision.component_id
+                )
+                and AlertCategory.DATA_QUALITY
+                not in decision.alert_categories
+            ):
+                sink.error(
+                    "SUPPLIER_ATTRIBUTE_DISCLOSURE_MISSING",
+                    "An unresolved supplier attribute in the component's catalog requires component-scoped DATA_QUALITY disclosure.",
+                    component_id=decision.component_id,
+                )
             if self.policy_parameters is not None:
                 expected_autonomy = self._parameters(
                     snapshot.configuration.current_date

@@ -450,6 +450,16 @@ class _OfferFacts:
     base_status: EvidenceStatus
 
 
+def _status_bool_values(status: EvidenceStatus) -> tuple[bool, ...]:
+    """Return the deterministic readings represented by one tri-state fact."""
+
+    if status is EvidenceStatus.PASS:
+        return (True,)
+    if status is EvidenceStatus.FAIL:
+        return (False,)
+    return (False, True)
+
+
 def _rule_kind(rule: PolicyRule) -> str:
     body = rule.data.get("constraint") or rule.data.get("directive")
     return str(body.get("kind")) if isinstance(body, Mapping) else ""
@@ -851,16 +861,6 @@ class CandidateBuilder:
                 self._pcb_evidence(snapshot, component, supplier, catalog, evidence)
             )
             domestic = self.resolver.resolve_concept("domestic_supplier", supplier)
-            if domestic.status is EvidenceStatus.UNKNOWN:
-                evidence.append(
-                    _synthetic_evidence(
-                        "DATA-QUALITY.supplier_domesticity",
-                        EvidenceStatus.UNKNOWN,
-                        "Supplier country cannot be resolved against the reviewed domestic aliases.",
-                        assumptions=("SUPPLIER_ATTRIBUTE_UNKNOWN",),
-                        disposition=PlanDisposition.DECISION_REQUIRED,
-                    )
-                )
             result.append(
                 _OfferFacts(
                     component=component,
@@ -874,6 +874,79 @@ class CandidateBuilder:
             )
         return tuple(result)
 
+    def _supplier_attribute_alerts(
+        self, facts: Sequence[_OfferFacts], scenario_date: date
+    ) -> tuple[CandidateAlert, ...]:
+        """Disclose unresolved route facts without widening their rule scope."""
+
+        alerts: list[CandidateAlert] = []
+        for item in facts:
+            if item.domestic_status is EvidenceStatus.UNKNOWN:
+                alerts.append(
+                    CandidateAlert(
+                        AlertCategory.DATA_QUALITY,
+                        "SUPPLIER_COUNTRY_UNKNOWN",
+                        "Supplier country is outside the reviewed aliases; domesticity is evaluated under both readings and never taken from is_domestic.",
+                        component_id=item.component.component_id,
+                        supplier_id=item.supplier.supplier_id,
+                        rule_ids=("DATA-QUALITY.supplier_domesticity",),
+                    )
+                )
+            if _rating(item.supplier.sustainability_rating) is None:
+                alerts.append(
+                    CandidateAlert(
+                        AlertCategory.DATA_QUALITY,
+                        "SUSTAINABILITY_RATING_UNKNOWN",
+                        "Supplier sustainability rating is absent or unparseable; the below-B gate is evaluated under both readings.",
+                        component_id=item.component.component_id,
+                        supplier_id=item.supplier.supplier_id,
+                        rule_ids=(
+                            self._one_rule(
+                                "below_rating_review",
+                                scenario_date,
+                            ).rule_id,
+                        ),
+                    )
+                )
+            if (
+                self.resolver.resolve_concept(
+                    "strategic_supplier", item.supplier
+                ).status
+                is EvidenceStatus.UNKNOWN
+            ):
+                alerts.append(
+                    CandidateAlert(
+                        AlertCategory.DATA_QUALITY,
+                        "RELATIONSHIP_TIER_UNKNOWN",
+                        "Supplier relationship tier is absent; uncertainty is retained only in tier-dependent rules and comparators.",
+                        component_id=item.component.component_id,
+                        supplier_id=item.supplier.supplier_id,
+                        rule_ids=(
+                            self._one_rule(
+                                "strategic_supplier_continuity",
+                                scenario_date,
+                            ).rule_id,
+                        ),
+                    )
+                )
+            if item.supplier.on_approved_list is None:
+                alerts.append(
+                    CandidateAlert(
+                        AlertCategory.DATA_QUALITY,
+                        "APPROVED_LIST_STATE_UNKNOWN",
+                        "Supplier approved-list state is NULL; positive ASL evidence is required and this route fails closed.",
+                        component_id=item.component.component_id,
+                        supplier_id=item.supplier.supplier_id,
+                        rule_ids=(
+                            self._one_rule(
+                                "approved_supplier_required",
+                                scenario_date,
+                            ).rule_id,
+                        ),
+                    )
+                )
+        return tuple(alerts)
+
     def _critical_status(self, component: Component) -> EvidenceStatus:
         return self.resolver.resolve_concept("critical_component", component).status
 
@@ -882,49 +955,131 @@ class CandidateBuilder:
         snapshot: ScenarioSnapshot,
         ledgers: LedgerBuildResult,
         facts: Sequence[_OfferFacts],
-    ) -> dict[tuple[str, date], DomesticGateDecision]:
+    ) -> dict[tuple[str, str, date], DomesticGateDecision]:
+        """Evaluate country uncertainty at the predicate that consumes it.
+
+        A known international route is tested against the conservative reading
+        where every unresolved-country alternative is domestic.  An
+        unresolved-country route is tested as international while every other
+        unresolved alternative is domestic.  Its domestic reading is always
+        eligible, so the resulting international decision is exactly the
+        intersection of the two readings.
+        """
+
         scenario_date = snapshot.configuration.current_date
         by_component: dict[str, list[_OfferFacts]] = defaultdict(list)
         for item in facts:
             by_component[item.component.component_id].append(item)
-        result: dict[tuple[str, date], DomesticGateDecision] = {}
+        result: dict[tuple[str, str, date], DomesticGateDecision] = {}
         for component_id, offers in by_component.items():
             component = offers[0].component
-            domestic = tuple(
+            eligible = tuple(
                 item
                 for item in offers
+                if item.base_status is EvidenceStatus.PASS
+            )
+            known_domestic = tuple(
+                item
+                for item in eligible
                 if item.domestic_status is EvidenceStatus.PASS
-                and item.base_status is EvidenceStatus.PASS
             )
-            international = tuple(
+            known_international = tuple(
                 item
-                for item in offers
+                for item in eligible
                 if item.domestic_status is EvidenceStatus.FAIL
-                and item.base_status is EvidenceStatus.PASS
             )
-            best_domestic = min(
-                (item.catalog.unit_price for item in domestic), default=None
-            )
-            best_international = min(
-                (item.catalog.unit_price for item in international), default=None
+            unresolved = tuple(
+                item
+                for item in eligible
+                if item.domestic_status is EvidenceStatus.UNKNOWN
             )
             critical_status = self._critical_status(component)
-            for bucket in ledgers.buckets_for(component_id):
-                domestic_can_meet = any(
-                    self._standard_material_date(item, scenario_date) <= bucket.due_date
-                    for item in domestic
+            for route_facts in offers:
+                if route_facts.domestic_status is EvidenceStatus.PASS:
+                    continue
+                if route_facts.domestic_status is EvidenceStatus.UNKNOWN:
+                    domestic = known_domestic + tuple(
+                        item for item in unresolved if item is not route_facts
+                    )
+                    international = known_international + (
+                        (route_facts,)
+                        if route_facts.base_status is EvidenceStatus.PASS
+                        else ()
+                    )
+                else:
+                    # This is the least permissive reading for a known
+                    # international route: every unresolved alternative may
+                    # be a cheaper or faster domestic source.
+                    domestic = known_domestic + unresolved
+                    international = known_international
+                best_domestic = min(
+                    (item.catalog.unit_price for item in domestic), default=None
                 )
-                result[(component_id, bucket.due_date)] = evaluate_domestic_gate(
-                    domestic_source_exists=bool(domestic),
-                    domestic_can_meet_deadline=domestic_can_meet,
-                    best_domestic_price=best_domestic,
-                    best_international_price=best_international,
-                    critical_status=critical_status,
-                    premium_parameters=self._parameters(
-                        scenario_date
-                    ).domestic_premiums,
+                best_international = min(
+                    (item.catalog.unit_price for item in international),
+                    default=None,
                 )
+                for bucket in ledgers.buckets_for(component_id):
+                    domestic_can_meet = any(
+                        self._standard_material_date(item, scenario_date)
+                        <= bucket.due_date
+                        for item in domestic
+                    )
+                    result[
+                        (component_id, route_facts.supplier.supplier_id, bucket.due_date)
+                    ] = evaluate_domestic_gate(
+                        domestic_source_exists=bool(domestic),
+                        domestic_can_meet_deadline=domestic_can_meet,
+                        best_domestic_price=best_domestic,
+                        best_international_price=best_international,
+                        critical_status=critical_status,
+                        premium_parameters=self._parameters(
+                            scenario_date
+                        ).domestic_premiums,
+                    )
         return result
+
+    def _unknown_country_evidence(
+        self,
+        decision: DomesticGateDecision,
+        *,
+        safe_under_both_readings: bool,
+    ) -> tuple[EvidenceResult, ...]:
+        disposition = (
+            PlanDisposition.EXECUTE_WITH_ASSUMPTION
+            if safe_under_both_readings
+            and self.contract is EvidenceContract.BENCHMARK
+            else PlanDisposition.DECISION_REQUIRED
+        )
+        scope = (
+            EvidenceScope.RULE
+            if safe_under_both_readings
+            else EvidenceScope.CANDIDATE
+        )
+        assumptions = ("ROBUST_BOTH_WAYS", "SUPPLIER_ATTRIBUTE_UNKNOWN")
+        parameter_rule = self.registry.rule(decision.rule_ids[0])
+        return (
+            _synthetic_evidence(
+                "DATA-QUALITY.supplier_domesticity",
+                EvidenceStatus.UNKNOWN,
+                "Supplier country is unresolved; stored is_domestic is supporting evidence only.",
+                scope=scope,
+                assumptions=assumptions,
+                disposition=disposition,
+            ),
+            _evidence(
+                parameter_rule,
+                EvidenceStatus.UNKNOWN,
+                (
+                    "The route is valid under both domestic and international readings."
+                    if safe_under_both_readings
+                    else "The route is valid only under the domestic reading; the international reading fails the sourcing gate."
+                ),
+                scope=scope,
+                assumptions=assumptions,
+                disposition=disposition,
+            ),
+        )
 
     def _is_pcb(self, component: Component) -> bool:
         return (
@@ -1246,7 +1401,7 @@ class CandidateBuilder:
         snapshot: ScenarioSnapshot,
         ledgers: LedgerBuildResult,
         facts: _OfferFacts,
-        gate: Mapping[tuple[str, date], DomesticGateDecision],
+        gate: Mapping[tuple[str, str, date], DomesticGateDecision],
     ) -> tuple[CandidateRoute, ...]:
         order_date = snapshot.configuration.current_date
         material_date = self._standard_material_date(facts, order_date)
@@ -1266,27 +1421,127 @@ class CandidateBuilder:
                 ),
             )
         if facts.domestic_status is EvidenceStatus.UNKNOWN:
-            return (
-                self._make_route(
-                    snapshot,
-                    facts,
-                    shipping_method=_STANDARD_SHIPPING,
-                    lead_time_days=facts.catalog.lead_time_days,
-                    deadlines=(),
-                    evidence=facts.base_evidence,
-                ),
-            )
+            grouped_unknown: dict[DomesticGateCondition, list[date]] = defaultdict(list)
+            for bucket in buckets:
+                decision = gate[
+                    (
+                        facts.component.component_id,
+                        facts.supplier.supplier_id,
+                        bucket.due_date,
+                    )
+                ]
+                if decision.permits_international:
+                    grouped_unknown[decision.condition].append(bucket.due_date)
+            if not grouped_unknown:
+                decision = next(
+                    (
+                        gate[
+                            (
+                                facts.component.component_id,
+                                facts.supplier.supplier_id,
+                                bucket.due_date,
+                            )
+                        ]
+                        for bucket in buckets
+                    ),
+                    None,
+                )
+                if decision is None:
+                    critical = self._critical_status(facts.component)
+                    parameter = self._parameters(
+                        order_date
+                    ).domestic_premiums.for_critical_status(
+                        critical is not EvidenceStatus.FAIL
+                    )
+                    decision = DomesticGateDecision(
+                        DomesticGateCondition.SHUT,
+                        parameter.maximum_premium_fraction,
+                        None,
+                        (parameter.rule_id,),
+                    )
+                return (
+                    self._make_route(
+                        snapshot,
+                        facts,
+                        shipping_method=_STANDARD_SHIPPING,
+                        lead_time_days=facts.catalog.lead_time_days,
+                        deadlines=(),
+                        evidence=facts.base_evidence
+                        + self._unknown_country_evidence(
+                            decision, safe_under_both_readings=False
+                        ),
+                    ),
+                )
+            routes = []
+            for condition, scoped_deadlines in sorted(
+                grouped_unknown.items(), key=lambda item: item[0].value
+            ):
+                representative = next(
+                    gate[
+                        (
+                            facts.component.component_id,
+                            facts.supplier.supplier_id,
+                            due,
+                        )
+                    ]
+                    for due in scoped_deadlines
+                    if gate[
+                        (
+                            facts.component.component_id,
+                            facts.supplier.supplier_id,
+                            due,
+                        )
+                    ].condition
+                    is condition
+                )
+                allowed = tuple(
+                    due for due in scoped_deadlines if due in physical_deadlines
+                )
+                exception = (
+                    f"{representative.rule_ids[0]}:condition_{condition.value}"
+                )
+                routes.append(
+                    self._make_route(
+                        snapshot,
+                        facts,
+                        shipping_method=_STANDARD_SHIPPING,
+                        lead_time_days=facts.catalog.lead_time_days,
+                        deadlines=allowed,
+                        evidence=facts.base_evidence
+                        + self._unknown_country_evidence(
+                            representative, safe_under_both_readings=True
+                        )
+                        + self._international_evidence(
+                            representative, order_date
+                        ),
+                        exception_codes=(exception,),
+                        exception_scope_deadlines=scoped_deadlines,
+                    )
+                )
+            return tuple(routes)
 
         grouped: dict[DomesticGateCondition, list[date]] = defaultdict(list)
         for bucket in buckets:
-            decision = gate[(facts.component.component_id, bucket.due_date)]
+            decision = gate[
+                (
+                    facts.component.component_id,
+                    facts.supplier.supplier_id,
+                    bucket.due_date,
+                )
+            ]
             if decision.permits_international:
                 grouped[decision.condition].append(bucket.due_date)
         if not grouped:
             # Preserve one classified route for the catalog offer even though
             # the international eligibility gate is shut.
             if buckets:
-                decision = gate[(facts.component.component_id, buckets[0].due_date)]
+                decision = gate[
+                    (
+                        facts.component.component_id,
+                        facts.supplier.supplier_id,
+                        buckets[0].due_date,
+                    )
+                ]
             else:
                 critical = self._critical_status(facts.component)
                 parameter = self._parameters(order_date).domestic_premiums.for_critical_status(
@@ -1314,9 +1569,22 @@ class CandidateBuilder:
             grouped.items(), key=lambda item: item[0].value
         ):
             representative = next(
-                gate[(facts.component.component_id, due)]
+                gate[
+                    (
+                        facts.component.component_id,
+                        facts.supplier.supplier_id,
+                        due,
+                    )
+                ]
                 for due in scoped_deadlines
-                if gate[(facts.component.component_id, due)].condition is condition
+                if gate[
+                    (
+                        facts.component.component_id,
+                        facts.supplier.supplier_id,
+                        due,
+                    )
+                ].condition
+                is condition
             )
             allowed = tuple(
                 due for due in scoped_deadlines if due in physical_deadlines
@@ -1342,7 +1610,7 @@ class CandidateBuilder:
         snapshot: ScenarioSnapshot,
         ledgers: LedgerBuildResult,
         facts: _OfferFacts,
-        gate: Mapping[tuple[str, date], DomesticGateDecision],
+        gate: Mapping[tuple[str, str, date], DomesticGateDecision],
     ) -> tuple[CandidateRoute, ...]:
         scenario_date = snapshot.configuration.current_date
         air_rules = self._rules("air_freight_authorization", scenario_date)
@@ -1362,7 +1630,13 @@ class CandidateBuilder:
         )
         grouped: dict[DomesticGateCondition, list[date]] = defaultdict(list)
         for bucket in ledgers.buckets_for(facts.component.component_id):
-            decision = gate[(facts.component.component_id, bucket.due_date)]
+            decision = gate[
+                (
+                    facts.component.component_id,
+                    facts.supplier.supplier_id,
+                    bucket.due_date,
+                )
+            ]
             if (
                 decision.permits_international
                 and standard_material > bucket.due_date
@@ -1377,7 +1651,13 @@ class CandidateBuilder:
         for condition, deadlines in sorted(
             grouped.items(), key=lambda item: item[0].value
         ):
-            representative = gate[(facts.component.component_id, deadlines[0])]
+            representative = gate[
+                (
+                    facts.component.component_id,
+                    facts.supplier.supplier_id,
+                    deadlines[0],
+                )
+            ]
             exceptions = (
                 f"{representative.rule_ids[0]}:condition_{condition.value}",
                 air_rule.rule_id,
@@ -1471,18 +1751,20 @@ class CandidateBuilder:
                 domestic_outcome = "not_reached"
 
             supplier = suppliers[route.supplier_id]
-            strategic = _normalise_text(supplier.relationship_tier) == "strategic"
+            strategic_status = self.resolver.resolve_concept(
+                "strategic_supplier", supplier
+            ).status
             strategic_penalty_deadlines: list[str] = []
-            if not strategic:
+            if strategic_status is EvidenceStatus.FAIL:
                 for due in route.feasible_deadlines:
                     candidates = tuple(
                         item
                         for item in alternatives
                         if due in item.feasible_deadlines
-                        and _normalise_text(
-                            suppliers[item.supplier_id].relationship_tier
-                        )
-                        == "strategic"
+                        and self.resolver.resolve_concept(
+                            "strategic_supplier", suppliers[item.supplier_id]
+                        ).status
+                        is EvidenceStatus.PASS
                     )
                     if not candidates:
                         continue
@@ -1592,6 +1874,130 @@ class CandidateBuilder:
             traced.append(replace(route, comparator_trace=trace))
         return tuple(traced)
 
+    def _scope_relationship_tier_uncertainty(
+        self,
+        snapshot: ScenarioSnapshot,
+        ledgers: LedgerBuildResult,
+        routes: Sequence[CandidateRoute],
+    ) -> tuple[tuple[CandidateRoute, ...], tuple[CandidateAlert, ...]]:
+        """Block only selections whose strategic comparator changes by reading."""
+
+        suppliers = {item.supplier_id: item for item in snapshot.suppliers}
+        rule = self._one_rule(
+            "strategic_supplier_continuity",
+            snapshot.configuration.current_date,
+        )
+        maximum_savings = (
+            self._parameters(snapshot.configuration.current_date)
+            .strategic_continuity.maximum_alternative_savings_fraction
+        )
+        by_component: dict[str, list[CandidateRoute]] = defaultdict(list)
+        for route in routes:
+            if route.eligibility is EvidenceStatus.PASS and not route.approval_requirements:
+                by_component[route.component_id].append(route)
+
+        def can_serve(route: CandidateRoute, due: date) -> bool:
+            return not route.exception_codes or due in route.exception_scope_deadlines
+
+        def tier_outcome(
+            left: CandidateRoute,
+            right: CandidateRoute,
+            left_strategic: bool,
+            right_strategic: bool,
+        ) -> int:
+            if left_strategic == right_strategic:
+                return 0
+            strategic_route = left if left_strategic else right
+            alternative = right if left_strategic else left
+            savings = (
+                ZERO
+                if strategic_route.unit_price == ZERO
+                else (
+                    strategic_route.unit_price - alternative.unit_price
+                )
+                / strategic_route.unit_price
+            )
+            if savings > maximum_savings:
+                return 0
+            return -1 if left_strategic else 1
+
+        affected: set[str] = set()
+        for component_id, component_routes in by_component.items():
+            deadlines = tuple(
+                bucket.due_date for bucket in ledgers.buckets_for(component_id)
+            )
+            for index, left in enumerate(component_routes):
+                left_status = self.resolver.resolve_concept(
+                    "strategic_supplier", suppliers[left.supplier_id]
+                ).status
+                for right in component_routes[index + 1 :]:
+                    right_status = self.resolver.resolve_concept(
+                        "strategic_supplier", suppliers[right.supplier_id]
+                    ).status
+                    if EvidenceStatus.UNKNOWN not in {left_status, right_status}:
+                        continue
+                    shared = tuple(
+                        due
+                        for due in deadlines
+                        if can_serve(left, due)
+                        and can_serve(right, due)
+                        and max(
+                            0, (left.material_available_date - due).days
+                        )
+                        == max(0, (right.material_available_date - due).days)
+                    )
+                    if not shared:
+                        continue
+                    outcomes = {
+                        tier_outcome(left, right, left_value, right_value)
+                        for left_value in _status_bool_values(left_status)
+                        for right_value in _status_bool_values(right_status)
+                    }
+                    if len(outcomes) > 1:
+                        affected.add(component_id)
+                        break
+                if component_id in affected:
+                    break
+
+        if not affected:
+            return tuple(routes), ()
+        scoped: list[CandidateRoute] = []
+        alerts: list[CandidateAlert] = []
+        for route in routes:
+            if route.component_id not in affected:
+                scoped.append(route)
+                continue
+            uncertainty = _evidence(
+                rule,
+                EvidenceStatus.UNKNOWN,
+                "An unresolved relationship tier changes the strategic-retention comparator outcome.",
+                assumptions=("RELATIONSHIP_TIER_UNKNOWN", "ROBUST_BOTH_WAYS"),
+                disposition=PlanDisposition.DECISION_REQUIRED,
+            )
+            scoped.append(
+                replace(
+                    route,
+                    evidence=route.evidence + (uncertainty,),
+                    eligibility=(
+                        EvidenceStatus.UNKNOWN
+                        if route.eligibility is EvidenceStatus.PASS
+                        else route.eligibility
+                    ),
+                )
+            )
+            alerts.append(
+                CandidateAlert(
+                    AlertCategory.DECISION_REQUIRED,
+                    "RELATIONSHIP_TIER_COMPARATOR_UNRESOLVED",
+                    "Supplier relationship-tier uncertainty changes the route comparator; no autonomous selection is safe under both readings.",
+                    component_id=route.component_id,
+                    supplier_id=route.supplier_id,
+                    route_id=route.route_id,
+                    rule_ids=(rule.rule_id,),
+                )
+            )
+        return tuple(scoped), tuple(alerts)
+
     def _mark_ambiguous_fingerprints(
         self, routes: Sequence[CandidateRoute]
     ) -> tuple[tuple[CandidateRoute, ...], tuple[CandidateAlert, ...]]:
@@ -1642,8 +2048,15 @@ class CandidateBuilder:
             blocking = tuple(
                 item
                 for item in route.evidence
-                if item.severity is RuleSeverity.HARD
-                and item.status in {EvidenceStatus.FAIL, EvidenceStatus.UNKNOWN}
+                if item.status in {EvidenceStatus.FAIL, EvidenceStatus.UNKNOWN}
+                and (
+                    item.severity is RuleSeverity.HARD
+                    or (
+                        route.eligibility is EvidenceStatus.UNKNOWN
+                        and item.status is EvidenceStatus.UNKNOWN
+                        and item.scope is EvidenceScope.CANDIDATE
+                    )
+                )
                 and not (
                     item.status is EvidenceStatus.UNKNOWN
                     and item.scope is EvidenceScope.RULE
@@ -1729,7 +2142,13 @@ class CandidateBuilder:
         for item in facts:
             routes.extend(self._build_standard_routes(snapshot, ledgers, item, gate))
             routes.extend(self._build_air_routes(snapshot, ledgers, item, gate))
-        routes, alerts = self._mark_ambiguous_fingerprints(routes)
+        attribute_alerts = self._supplier_attribute_alerts(
+            facts, snapshot.configuration.current_date
+        )
+        routes, tier_alerts = self._scope_relationship_tier_uncertainty(
+            snapshot, ledgers, routes
+        )
+        routes, fingerprint_alerts = self._mark_ambiguous_fingerprints(routes)
         routes = self._comparator_traces(snapshot, routes)
         return CandidateBuildResult(
             routes=routes,
@@ -1737,7 +2156,7 @@ class CandidateBuilder:
                 *self._rejections(routes),
                 *self._quarantine_rejections(snapshot),
             ),
-            alerts=alerts,
+            alerts=attribute_alerts + tier_alerts + fingerprint_alerts,
         )
 
 
@@ -1798,9 +2217,21 @@ def _compare_routes(
 
     left_supplier = suppliers[left.supplier_id]
     right_supplier = suppliers[right.supplier_id]
-    left_strategic = _normalise_text(left_supplier.relationship_tier) == "strategic"
-    right_strategic = _normalise_text(right_supplier.relationship_tier) == "strategic"
-    if left_strategic != right_strategic:
+    left_strategic = (
+        None
+        if left_supplier.relationship_tier is None
+        else _normalise_text(left_supplier.relationship_tier) == "strategic"
+    )
+    right_strategic = (
+        None
+        if right_supplier.relationship_tier is None
+        else _normalise_text(right_supplier.relationship_tier) == "strategic"
+    )
+    if (
+        left_strategic is not None
+        and right_strategic is not None
+        and left_strategic != right_strategic
+    ):
         strategic_route = left if left_strategic else right
         alternative = right if left_strategic else left
         if strategic_route.unit_price == ZERO:
