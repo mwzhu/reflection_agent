@@ -231,9 +231,29 @@ class OptimizerContractTests(unittest.TestCase):
         self.assertEqual(outcome.calibration.objective_vector, (ZERO, Decimal("5")))
         self.assertEqual(outcome.baseline.objective_vector, (ZERO, Decimal("50")))
         self.assertEqual(dict(outcome.derived_upper_bounds)[route.route_id], Decimal("5"))
-        self.assertIn(AlertCategory.FORCED_SURPLUS, {item.category for item in outcome.alerts})
+        self.assertEqual(selected.estimated_forced_surplus_value, Decimal("30"))
+        self.assertNotIn(
+            AlertCategory.FORCED_SURPLUS,
+            {item.category for item in outcome.alerts},
+        )
         self.assertEqual(outcome.requirement_state.fulfillment, FulfillmentStatus.FULFILLED)
         self.assertEqual(outcome.requirement_state.resolution, ResolutionStatus.RESOLVED)
+
+        review_outcome = ProcurementOptimizer(_stdlib_solver()).optimize(
+            replace(
+                problem,
+                autonomy=EconomicAutonomy(
+                    forced_surplus_review_usd=Decimal("30")
+                ),
+            )
+        )
+        review_alert = next(
+            item
+            for item in review_outcome.alerts
+            if item.category is AlertCategory.FORCED_SURPLUS
+        )
+        self.assertIn("estimated surplus value 30", review_alert.message)
+        self.assertIn("review threshold 30", review_alert.message)
 
         sub_moq = next(
             item

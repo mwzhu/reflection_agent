@@ -63,13 +63,13 @@ Every run writes one structured success or failure audit line to stderr. Human o
 
 ## Idempotency and ownership
 
-Human-facing business columns now contain only readable summaries. `purchase_orders.rationale` explains the order, shortage, timing, and material assumptions; `alerts.description` states the issue and the required action. Agent ownership, hashes, and exhaustive audit facts are stored separately in three agent-owned tables:
+Human-facing business columns now contain only readable, non-duplicative information. `purchase_orders.rationale` explains the demand trigger, why the supplier and quantity were selected, and any material assumption or sourcing exception in plain language; it does not restate quantity, component, supplier, price, or delivery columns. `alerts.description` states the issue and the required action. Agent ownership, hashes, raw assumption codes, and exhaustive audit facts are stored separately in three agent-owned tables:
 
 - `apex_po_metadata` holds purchase-order ownership and idempotency fields.
 - `apex_alert_metadata` holds alert ownership plus the full diagnostic description.
 - `apex_decision_audit` holds one structured decision record per evaluated requirement and component.
 
-The `alerts` table is intentionally operational and sparse: each agent-owned row must describe a problem that merits attention or recommend a human action. Successful-run accounting and raw assumption codes are audit facts, so they are excluded from `alerts`. When missing evidence materially affects procurement, the agent emits one consolidated, plain-language evidence alert while retaining component-level assumption details in `apex_decision_audit`.
+The `alerts` table is intentionally operational and sparse. Every agent-owned description begins with `Error:` for a current failure or blocked outcome, or `Recommendation:` for a non-blocking action worth reviewing. Successful-run accounting, raw assumption codes, immaterial forced surplus, and counterfactual plans for already-resolved requirements are audit facts, so they are excluded from `alerts`. Forced surplus remains recorded on the decision and becomes a recommendation only when its estimated value reaches the reviewed `forced_surplus_review_usd` threshold. When missing supplier-allocation history materially affects procurement, the agent emits one consolidated, plain-language recommendation while retaining component-level evidence and alternative-plan details in `apex_decision_audit`. A genuine decision request states why an order was withheld and summarizes the lowest-cost available option without exposing internal plan IDs.
 
 New managed POs use metadata version 5. Before a managed PO is temporarily removed for fresh reconstruction, the planner must reproduce the complete component source fingerprint, including relevant supplier, catalog, external-PO evidence, contract, and policy facts. If any competing route or source fact changed, the old PO remains physical inbound and cannot be silently replaced by a duplicate full-demand order.
 

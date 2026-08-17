@@ -26,6 +26,7 @@ from .domain import (
     InternalFailureExclusion,
     PlanDisposition,
     PlanLine,
+    ResolutionStatus,
     RouteInputIssue,
     RouteQuarantineScope,
     RuleSeverity,
@@ -45,6 +46,18 @@ from .serialization import canonical_dumps, sanitize_control_characters
 ALERT_MARKER_VERSION = 2
 AUDIT_ONLY_ALERT_CATEGORIES = frozenset(
     {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+)
+ERROR_ALERT_CATEGORIES = frozenset(
+    {
+        AlertCategory.UNMET_DEMAND,
+        AlertCategory.LATE_ARRIVAL,
+        AlertCategory.NO_ELIGIBLE_SUPPLIER,
+        AlertCategory.POLICY_CONFLICT,
+        AlertCategory.DECISION_REQUIRED,
+        AlertCategory.PRE_EXISTING_VIOLATION,
+        AlertCategory.SOLVER_UNPROVEN,
+        AlertCategory.INTERNAL_FAILURE,
+    }
 )
 _SUPPORTED_ALERT_MARKER_VERSIONS = frozenset({1, ALERT_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
@@ -186,6 +199,12 @@ def _number(value: Decimal) -> str:
     if not isinstance(value, Decimal) or not value.is_finite():
         raise TypeError("rendered numeric facts must be finite Decimal values")
     return format(value, "f")
+
+
+def _money(value: Decimal) -> str:
+    if not isinstance(value, Decimal) or not value.is_finite():
+        raise TypeError("rendered monetary facts must be finite Decimal values")
+    return f"${value:,.2f}"
 
 
 def _economic_autonomy_disclosure(decision: DecisionRecord) -> str:
@@ -428,33 +447,277 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
     )
 
 
-def render_purchase_order_rationale(decision: DecisionRecord, line: PlanLine) -> str:
-    """Render the concise, human-facing explanation stored on a purchase order.
+_ASSUMPTION_EXPLANATIONS = {
+    "ROLLING_HISTORY_UNKNOWN": (
+        "missing 12-month supplier-allocation history is permitted by the benchmark contract"
+    ),
+    "INFERRED_CONCEPT_MEMBERSHIP": (
+        "component policy classification is inferred from master data"
+    ),
+    "ROBUST_BOTH_WAYS": (
+        "the plan passes both possible policy classifications"
+    ),
+    "PCB_INCUMBENCY_INFERRED": (
+        "prior orders establish PCB supplier incumbency because accepted-receipt "
+        "history is missing"
+    ),
+    "PCB_INBOUND_HISTORY_UNKNOWN": (
+        "accepted-receipt history needed to prove PCB supplier incumbency is unavailable"
+    ),
+    "BELOW_B_REVIEW_DISCHARGED_BY_MEMO": (
+        "a VP memo satisfies additional review for a below-B supplier in the plan"
+    ),
+    "SUSTAINABILITY_RATING_UNKNOWN": "the supplier's sustainability rating is unavailable",
+    "RELATIONSHIP_TIER_UNKNOWN": "the supplier's relationship tier is unavailable",
+    "SUPPLIER_ATTRIBUTE_UNKNOWN": "a required supplier attribute is unavailable",
+    "SUPPLIER_COUNTRY_UNKNOWN": "the supplier's country is unavailable",
+    "APPROVED_LIST_STATE_UNKNOWN": "the supplier's approved-list state is unavailable",
+    "DEMAND_CLASSIFICATION_UNKNOWN": "the demand classification is unavailable",
+    "SOURCE_NAMED_ENTITY_UNRESOLVED": (
+        "a supplier named by the governing source document could not be resolved"
+    ),
+    "SELECTOR_ENTITY_MISSING": (
+        "an entity needed to determine policy scope is unavailable"
+    ),
+    "AIR_FREIGHT_PERIOD_SPEND_UNKNOWN": (
+        "air-freight spend for the applicable authorization period is unavailable"
+    ),
+    "NO_ALTERNATIVE_PROOF_REQUIRED": (
+        "the absence of a better-qualified alternative has not been independently proven"
+    ),
+    "BELOW_B_REVIEW_REQUIRED": (
+        "additional review is still required for the supplier's below-B rating"
+    ),
+    "UNKNOWN_UNIT_TREATED_AS_DISCRETE": (
+        "the unrecognized unit of measure was conservatively treated as discrete"
+    ),
+}
 
-    The complete decision, evidence, comparator trace, and rejected alternatives
-    are persisted separately in the decision-audit table.  This field is kept
-    deliberately short because it is an operational purchase-order attribute,
-    not an audit transport.
+
+_SELECTION_REASONS = {
+    "on_time_feasibility": "best meets the required material dates",
+    "domestic_preference": "follows the domestic-sourcing preference",
+    "strategic_retention": (
+        "preserves strategic-supplier continuity within the policy savings threshold"
+    ),
+    "sustainability_band": (
+        "follows the sustainability preference among comparable offers"
+    ),
+    "known_landed_cost": "has the lowest known cost after policy checks",
+    "shorter_lead_time": (
+        "has the shorter lead time after higher-priority policy ties"
+    ),
+    "id_free_fingerprint": (
+        "uses the deterministic tie-break among otherwise equivalent routes"
+    ),
+}
+
+
+def _human_join(values: Sequence[str]) -> str:
+    items = tuple(value for value in values if value)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _purchase_order_demand_reason(
+    decision: DecisionRecord,
+    line: PlanLine,
+) -> str:
+    plan = decision.selected_plan
+    if plan is None:
+        raise ExplanationError("purchase-order demand reasoning requires a selected plan")
+    due_dates = tuple(sorted({item.due_date for item in line.bucket_allocations}))
+    order_ids = tuple(
+        sorted(
+            {
+                contribution.order_id
+                for bucket in decision.demand_buckets
+                if bucket.due_date in due_dates
+                for contribution in bucket.contributions
+            }
+        )
+    )
+    if len(plan.lines) > 1:
+        effect = (
+            "Contributes to closing"
+            if decision.residual_gap == ZERO
+            else "Contributes to reducing"
+        )
+    else:
+        effect = "Closes" if decision.residual_gap == ZERO else "Reduces"
+    target = (
+        f" for {_human_join(order_ids)}"
+        if order_ids
+        else " for the assigned production demand"
+    )
+    if len(due_dates) == 1:
+        timing = f" due {due_dates[0].isoformat()}"
+    elif due_dates:
+        timing = (
+            f", with demand due from {due_dates[0].isoformat()} through "
+            f"{due_dates[-1].isoformat()}"
+        )
+    else:
+        timing = ""
+    return (
+        f"{effect} the {_number(plan.net_requirement)}-unit projected shortage"
+        f"{target}{timing}."
+    )
+
+
+def _purchase_order_selection_reason(
+    decision: DecisionRecord,
+    line: PlanLine,
+) -> str:
+    plan = decision.selected_plan
+    if plan is None:
+        raise ExplanationError("purchase-order selection reasoning requires a selected plan")
+    decisive = tuple(
+        item
+        for item in decision.comparator_facts
+        if item.kind == "route_selection"
+        and item.decisive
+        and line.route_id in item.selected_route_ids
+    )
+    reasons: list[str] = []
+    for item in decisive:
+        reason = _SELECTION_REASONS.get(
+            item.comparator,
+            "won the decisive reviewed policy comparison",
+        )
+        if reason not in reasons:
+            reasons.append(reason)
+    late_allocations = tuple(
+        item
+        for item in line.bucket_allocations
+        if line.material_available_date > item.due_date
+    )
+    if late_allocations:
+        recovery = (
+            "Recovery supply: no executable route met every assigned material deadline."
+        )
+    else:
+        recovery = ""
+    if reasons:
+        selection = f"Supplier choice {_human_join(reasons)}."
+    elif len(plan.lines) > 1:
+        selection = (
+            "Part of the lowest-cost supplier mix satisfying timing and allocation rules."
+        )
+    else:
+        selection = (
+            "Only executable route after supplier eligibility, policy, and timing checks."
+        )
+    return f"{selection} {recovery}".strip()
+
+
+def _purchase_order_quantity_reason(plan: CandidatePlan) -> str:
+    reasons: list[str] = []
+    if plan.forced_surplus > ZERO:
+        reasons.append(
+            f"Quantity rule: supplier minimums/order increments raise the plan from "
+            f"{_number(plan.net_requirement)} to "
+            f"{_number(plan.minimum_compliant_total or ZERO)} units "
+            f"({_number(plan.forced_surplus)} surplus)."
+        )
+    if plan.discretionary_surplus > ZERO:
+        reasons.append(
+            f"Allocation rule: the plan adds {_number(plan.discretionary_surplus)} units "
+            "above the certified minimum, within the reviewed autonomy limit."
+        )
+    if plan.recovery_quantity > ZERO:
+        reasons.append(
+            f"The plan includes {_number(plan.recovery_quantity)} units of recovery supply "
+            "to offset late committed inbound."
+        )
+    return " ".join(reasons)
+
+
+def _purchase_order_sourcing_exception(line: PlanLine) -> str:
+    exception_ids = {
+        item
+        for allocation in line.bucket_allocations
+        for item in allocation.exception_ids
+    }
+    reasons: list[str] = []
+    if any(item.endswith(":condition_a") for item in exception_ids):
+        reasons.append("no domestic route meets the required timeline")
+    if any(item.endswith(":condition_b") for item in exception_ids):
+        reasons.append("the domestic price premium exceeds the applicable policy threshold")
+    if any(item.endswith(":condition_c") for item in exception_ids):
+        reasons.append("the component is unavailable from domestic sources")
+    if reasons:
+        return f"International sourcing: {_human_join(reasons)}."
+    if exception_ids:
+        return "A reviewed sourcing exception applies to this line's assigned demand."
+    return ""
+
+
+def _purchase_order_assumption_reason(
+    decision: DecisionRecord,
+    plan: CandidatePlan,
+) -> str:
+    assumptions = set(plan.assumption_codes)
+    for evidence in (*decision.evidence, *plan.evidence):
+        assumptions.update(evidence.assumption_codes)
+    explanations: list[str] = []
+    if {
+        "INFERRED_CONCEPT_MEMBERSHIP",
+        "ROBUST_BOTH_WAYS",
+    } <= assumptions:
+        explanations.append(
+            "component policy classification is inferred from master data; the plan "
+            "passes either classification"
+        )
+        assumptions.difference_update(
+            {"INFERRED_CONCEPT_MEMBERSHIP", "ROBUST_BOTH_WAYS"}
+        )
+    for code in sorted(assumptions):
+        explanation = _ASSUMPTION_EXPLANATIONS.get(
+            code,
+            "a documented planning assumption was required; its source evidence is in "
+            "the decision audit",
+        )
+        if explanation not in explanations:
+            explanations.append(explanation)
+    if not explanations:
+        return ""
+    label = "Assumption" if len(explanations) == 1 else "Assumptions"
+    return f"{label}: {'; '.join(explanations)}."
+
+
+def render_purchase_order_rationale(decision: DecisionRecord, line: PlanLine) -> str:
+    """Explain why a purchase order exists without repeating its business columns.
+
+    Quantity, component, supplier, price, order date, and delivery date already
+    have dedicated columns.  The rationale therefore carries only decision
+    context: the demand trigger, the material selection reason, non-obvious
+    quantity calibration, and plain-language assumptions.  The exhaustive
+    evidence and comparator trace remain in the decision-audit table.
     """
 
     if decision.selected_plan is None or line not in decision.selected_plan.lines:
         raise ExplanationError("line must belong to the decision's selected plan")
     plan = decision.selected_plan
-    assumptions = set(plan.assumption_codes)
-    for evidence in (*decision.evidence, *plan.evidence):
-        assumptions.update(evidence.assumption_codes)
-    assumption_text = (
-        f" Assumptions: {_list(assumptions)}."
-        if assumptions
-        else ""
-    )
-    return sanitize_control_characters(
-        f"Order {_number(line.quantity)} units of {line.component_id} from "
-        f"{line.supplier_id} at {_number(line.unit_price)} per unit "
-        f"({_number(line.line_total)} total), expected {line.expected_delivery_date.isoformat()}. "
-        f"Initial shortage: {_number(decision.initial_eventual_gap)}; plan residual: "
-        f"{_number(decision.residual_gap)}.{assumption_text}"
-    )
+    parts = [
+        _purchase_order_demand_reason(decision, line),
+        _purchase_order_selection_reason(decision, line),
+    ]
+    quantity_reason = _purchase_order_quantity_reason(plan)
+    if quantity_reason:
+        parts.append(quantity_reason)
+    sourcing_exception = _purchase_order_sourcing_exception(line)
+    if sourcing_exception:
+        parts.append(sourcing_exception)
+    assumption_reason = _purchase_order_assumption_reason(decision, plan)
+    if assumption_reason:
+        parts.append(assumption_reason)
+    return sanitize_control_characters(" ".join(parts))
 
 
 def render_legacy_v1_decision_rationale(decision: DecisionRecord) -> str:
@@ -659,15 +922,6 @@ def _concise_alert_body(category: AlertCategory, scope: str, body: str) -> str:
             "Approve or replace it in the reviewed policy pack, then rerun if it changes."
         )
 
-    if category is AlertCategory.EVIDENCE_CONTRACT and scope == "run:evidence-contract":
-        components = sorted(set(re.findall(r"CMP-[0-9]+", body)))
-        affected = ", ".join(components) if components else "one or more components"
-        return (
-            f"Required policy evidence is incomplete for {affected}. "
-            "Verify the cited source records and rerun before releasing or revising "
-            "the affected procurement actions."
-        )
-
     assumption = re.match(
         r"Component (?P<component>[^,]+), requirement [^ ]+ relied on assumption "
         r"(?P<code>[A-Z0-9_]+) under the (?P<contract>[a-z]+) evidence contract\.",
@@ -680,14 +934,29 @@ def _concise_alert_body(category: AlertCategory, scope: str, body: str) -> str:
             "Verify the missing evidence and rerun if it changes."
         )
 
-    first, separator, _remaining = body.partition(". ")
+    visible_body = re.sub(
+        r", requirement requirement:[A-Za-z0-9_.:-]+",
+        "",
+        body,
+    )
+    first, separator, _remaining = visible_body.partition(". ")
     issue = first + ("." if separator else "")
     action = ""
-    if "Human action:" in body:
-        action_tail = body.rsplit("Human action:", 1)[1].strip()
+    if "Human action:" in visible_body:
+        action_tail = visible_body.rsplit("Human action:", 1)[1].strip()
         action_text, action_separator, _after_action = action_tail.partition(". ")
         action = f" Action: {action_text}{'.' if action_separator else ''}"
     return sanitize_control_characters(issue + action)
+
+
+def _alert_lead(category: AlertCategory, body: str) -> str:
+    if category in ERROR_ALERT_CATEGORIES:
+        return "Error"
+    if category is AlertCategory.EVIDENCE_CONTRACT:
+        return "Error" if "Run-global production" in body else "Recommendation"
+    if category is AlertCategory.DATA_QUALITY and "failed the route-input contract" in body:
+        return "Error"
+    return "Recommendation"
 
 
 def make_owned_alert(
@@ -706,7 +975,8 @@ def make_owned_alert(
     _require_safe_text(scope, "scope")
     _require_safe_text(body, "body")
     concise = _concise_alert_body(category, scope, body)
-    visible = f"[{category.value}] {concise}" if visible_prefix else concise
+    category_tag = f"[{category.value}] " if visible_prefix else ""
+    visible = f"{_alert_lead(category, body)}: {category_tag}{concise}"
     key = _alert_key(category, scope, visible)
     description = (
         f"{visible} [APEX_ALERT:v{ALERT_MARKER_VERSION} key={key} "
@@ -780,6 +1050,45 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
     issue, action = _GENERIC_ACTIONS[category]
     rules = _evidence_rule_ids(decision, decision.selected_plan)
     quantified = ""
+    if decision.selected_plan is not None and category is AlertCategory.CAPACITY_UNKNOWN:
+        quantities: dict[str, Decimal] = {}
+        for line in decision.selected_plan.lines:
+            quantities[line.supplier_id] = (
+                quantities.get(line.supplier_id, ZERO) + line.quantity
+            )
+        planned = ", ".join(
+            f"{_number(quantity)} units from {supplier_id}"
+            for supplier_id, quantity in sorted(quantities.items())
+        )
+        return (
+            f"Supplier capacity is not recorded for component {decision.component_id}, "
+            f"although the selected plan orders {planned}. The scenario contains no numeric "
+            f"capacity evidence for release validation. Applicable rule IDs "
+            f"[{_list(rules)}]. Human action: confirm the planned quantities with the "
+            "suppliers before releasing the purchase orders."
+        )
+    if decision.selected_plan is not None and category is AlertCategory.COST_OPPORTUNITY:
+        lower_cost_options = tuple(
+            plan
+            for plan in decision.alternatives
+            if plan.total_cost < decision.selected_plan.total_cost
+            and plan.relaxed_rule_ids
+        )
+        if lower_cost_options:
+            option = min(
+                lower_cost_options,
+                key=lambda plan: (plan.total_cost, plan.plan_id),
+            )
+            savings = decision.selected_plan.total_cost - option.total_cost
+            return (
+                f"Component {decision.component_id} has a lower-cost sourcing option "
+                f"estimated at {_money(option.total_cost)}, saving {_money(savings)} versus "
+                f"the {_money(decision.selected_plan.total_cost)} selected plan, but the "
+                "option relaxes current supplier-allocation rules. The compliant selected "
+                f"plan remains in effect under rule IDs [{_list(rules)}]. Human action: "
+                "review whether to request a policy exception; keep the current orders "
+                "unless a fresh run authorizes a change."
+            )
     if decision.selected_plan is not None and category is AlertCategory.FORCED_SURPLUS:
         plan = decision.selected_plan
         lines = "; ".join(
@@ -788,7 +1097,10 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
             for line in plan.lines
         )
         return (
-            f"Component {decision.component_id}, requirement {decision.requirement_id}: {issue}. "
+            f"Component {decision.component_id} requires {_number(plan.net_requirement)} units, "
+            f"but supplier or whole-unit quantity rules require ordering "
+            f"{_number(plan.ordered_quantity)}, creating {_number(plan.forced_surplus)} surplus "
+            f"units with an estimated value of {_money(plan.estimated_forced_surplus_value)}. "
             f"Executed action: [{lines}], total cost {_number(plan.total_cost)}, forced "
             f"surplus {_number(plan.forced_surplus)} against net requirement "
             f"{_number(plan.net_requirement)}. The agent preserved existing commitments and "
@@ -796,7 +1108,8 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
             "no mutually exclusive sub-MOQ approval request remains live. A sub-MOQ "
             "alternative could be considered only after a future cancellation contract "
             "authorizes changing the commitment and a fresh run revalidates demand, inbound, "
-            f"policy, quantity, supplier, price, and dates. Human action: {action}."
+            f"policy, quantity, supplier, price, and dates. Human action: the order was placed "
+            f"successfully; {action}."
         )
     elif decision.selected_plan is not None and category is AlertCategory.RECOVERY_SURPLUS:
         quantified = (
@@ -813,7 +1126,7 @@ def _generic_alert(decision: DecisionRecord, category: AlertCategory) -> str:
             f"requirement date is {decision.demand_buckets[0].due_date.isoformat()}."
         )
     return (
-        f"Component {decision.component_id}, requirement {decision.requirement_id}: {issue}. "
+        f"Component {decision.component_id}: {issue}. "
         f"The agent preserved existing commitments and used only the validated disposition; "
         f"residual quantity is {_number(decision.residual_gap)}. Applicable rule IDs "
         f"[{_list(rules)}].{quantified} Human action: {action}."
@@ -874,14 +1187,38 @@ def _approval_alert(
     )
 
 
-def _decision_alert(decision: DecisionRecord, plan: CandidatePlan) -> str:
-    proposals = "; ".join(
-        f"supplier {line.supplier_id}, quantity {_number(line.quantity)}, unit price "
-        f"{_number(line.unit_price)}, line total {_number(line.line_total)}, delivery "
-        f"{line.expected_delivery_date.isoformat()}"
-        for line in plan.lines
+def _plan_option_summary(plan: CandidatePlan) -> str:
+    grouped: dict[tuple[str, Decimal, date], Decimal] = {}
+    for line in plan.lines:
+        key = (line.supplier_id, line.unit_price, line.expected_delivery_date)
+        grouped[key] = grouped.get(key, ZERO) + line.quantity
+    lines = "; ".join(
+        f"{_number(quantity)} units from {supplier_id} at {_money(unit_price)} per unit, "
+        f"delivering {delivery.isoformat()}"
+        for (supplier_id, unit_price, delivery), quantity in sorted(grouped.items())
     )
-    blocking = _contract_blocking_evidence(decision, plan)
+    return f"{lines}; estimated total {_money(plan.total_cost)}"
+
+
+def _decision_alert(
+    decision: DecisionRecord,
+    plans: Sequence[CandidatePlan],
+) -> str:
+    if not plans:
+        raise ExplanationError("a decision-required alert needs at least one option")
+    option = min(plans, key=lambda plan: (plan.total_cost, plan.plan_id))
+    proposal = _plan_option_summary(option)
+    blocking = tuple(
+        sorted(
+            {
+                item
+                for plan in plans
+                for item in _contract_blocking_evidence(decision, plan)
+            },
+            key=lambda item: item.rule_id,
+        )
+    )
+    plan_ids = _list(plan.plan_id for plan in plans)
     if blocking and decision.evidence_contract is EvidenceContract.PRODUCTION:
         missing = "; ".join(
             f"{item.rule_id}: {item.summary} "
@@ -890,23 +1227,34 @@ def _decision_alert(decision: DecisionRecord, plan: CandidatePlan) -> str:
             if item.contract_disposition is not None
         )
         return (
-            f"Decision required for component {decision.component_id}, requirement "
-            f"{decision.requirement_id}: authoritative production evidence is unavailable "
-            f"[{missing}]. A non-executable diagnostic proposes [{proposals}], but the agent "
+            f"An order for component {decision.component_id} was withheld because required "
+            f"policy evidence is unavailable; the lowest-cost available option is {proposal}. "
+            f"Internal option IDs [{plan_ids}]. Missing evidence [{missing}]. The agent "
             f"placed no line and did not classify any supplier as ineligible from the absent "
             f"facts. Residual quantity is {_number(decision.residual_gap)}. Applicable rule IDs "
             f"[{_list(item.rule_id for item in blocking)}]. Human action: "
             "supply the cited rolling-window or other authoritative contract evidence and "
             "rerun from a fresh snapshot."
         )
-    rule_ids = (*plan.relaxed_rule_ids, *_evidence_rule_ids(decision, plan))
+    rule_ids = tuple(
+        sorted(
+            {
+                rule_id
+                for plan in plans
+                for rule_id in (
+                    *plan.relaxed_rule_ids,
+                    *_evidence_rule_ids(decision, plan),
+                )
+            }
+        )
+    )
     return (
-        f"Decision required for component {decision.component_id}, requirement "
-        f"{decision.requirement_id}: alternative {plan.plan_id} proposes [{proposals}]. "
-        f"The agent did not place the alternative and left residual quantity "
+        f"An order for component {decision.component_id} was withheld because no available "
+        f"option is authorized under current policy; the lowest-cost option is {proposal}. "
+        f"Internal option IDs [{plan_ids}]. The agent did not place an alternative and left residual quantity "
         f"{_number(decision.residual_gap)}. Applicable rule IDs [{_list(rule_ids)}]. "
-        f"Human action: select an outcome and rerun from a "
-        f"fresh snapshot."
+        "Human action: review the proposed option, resolve the cited policy constraint, "
+        "and rerun from a fresh snapshot."
     )
 
 
@@ -984,12 +1332,32 @@ def _late_alert(decision: DecisionRecord, due_date: date) -> str:
     lateness = next(
         item for item in decision.deadline_lateness if item.due_date == due_date
     )
+    arrivals = tuple(
+        line.material_available_date
+        for line in (
+            decision.selected_plan.lines
+            if decision.selected_plan is not None
+            else ()
+        )
+        if any(
+            allocation.due_date == due_date and allocation.quantity > ZERO
+            for allocation in line.bucket_allocations
+        )
+    )
+    arrival = (
+        f"; planned supply for that deadline arrives as late as {max(arrivals).isoformat()}"
+        if arrivals
+        else ""
+    )
+    eventual = (
+        "All affected quantity has an eventual receipt."
+        if lateness.unresolved_quantity == ZERO
+        else f"{_number(lateness.unresolved_quantity)} units still have no eventual receipt."
+    )
     return (
-        f"Component {decision.component_id}, requirement {decision.requirement_id} misses "
-        f"the {lateness.due_date.isoformat()} material deadline by "
-        f"{_number(lateness.late_quantity)} units, representing "
-        f"{_number(lateness.unit_late_days)} unit-late-days; "
-        f"{_number(lateness.unresolved_quantity)} units have no eventual assigned receipt. "
+        f"Component {decision.component_id} will be {_number(lateness.late_quantity)} units "
+        f"short on its {lateness.due_date.isoformat()} material deadline{arrival}. "
+        f"The delay represents {_number(lateness.unit_late_days)} unit-days. {eventual} "
         "The agent preserved existing commitments and placed only the strictly improving, "
         "authorized recovery plan shown in the managed decision. Human action: review the "
         "affected production date and decide whether to expedite further or reschedule."
@@ -1079,7 +1447,7 @@ def render_alerts(
         for issue in source_issues
         for component_id in issue.affected_component_ids
     )
-    evidence_contract_requirements: list[tuple[str, str, tuple[str, ...]]] = []
+    evidence_contract_decisions: list[DecisionRecord] = []
     terminal_requirements: set[str] = set()
 
     def add(
@@ -1162,8 +1530,14 @@ def render_alerts(
 
         approval_count = 0
         decision_count = 0
+        needs_human_resolution = (
+            decision.requirement_state.resolution is ResolutionStatus.UNRESOLVED
+        )
+        decision_options: list[CandidatePlan] = []
         for plan in decision.alternatives:
             if plan.disposition is PlanDisposition.RECOMMEND_APPROVAL:
+                if not needs_human_resolution:
+                    continue
                 if not plan.unresolved_approval_ids:
                     raise ExplanationError(
                         f"approval recommendation {plan.plan_id} has no approval rule ID"
@@ -1194,14 +1568,16 @@ def render_alerts(
                 )
                 approval_count += 1
             elif plan.disposition is PlanDisposition.DECISION_REQUIRED:
-                add(
-                    AlertCategory.DECISION_REQUIRED,
-                    f"{scope}:decision:{plan.plan_id}",
-                    _decision_alert(decision, plan),
-                    decision=decision,
-                    terminal=True,
-                )
-                decision_count += 1
+                decision_options.append(plan)
+        if needs_human_resolution and decision_options:
+            add(
+                AlertCategory.DECISION_REQUIRED,
+                f"{scope}:decision",
+                _decision_alert(decision, decision_options),
+                decision=decision,
+                terminal=True,
+            )
+            decision_count = 1
 
         special = {
             AlertCategory.UNMET_DEMAND,
@@ -1232,11 +1608,19 @@ def render_alerts(
             raise ExplanationError(
                 f"requirement {decision.requirement_id} requests LATE_ARRIVAL without a deadline miss"
             )
-        if AlertCategory.APPROVAL_REQUIRED in decision.alert_categories and approval_count == 0:
+        if (
+            needs_human_resolution
+            and AlertCategory.APPROVAL_REQUIRED in decision.alert_categories
+            and approval_count == 0
+        ):
             raise ExplanationError(
                 f"requirement {decision.requirement_id} requests an approval alert without a proposal"
             )
-        if AlertCategory.DECISION_REQUIRED in decision.alert_categories and decision_count == 0:
+        if (
+            needs_human_resolution
+            and AlertCategory.DECISION_REQUIRED in decision.alert_categories
+            and decision_count == 0
+        ):
             blocking = _contract_blocking_evidence(decision)
             remediation = (
                 "supply authoritative evidence for rule IDs "
@@ -1263,20 +1647,8 @@ def render_alerts(
             AlertCategory.EVIDENCE_CONTRACT in decision.alert_categories
         ):
             special.add(AlertCategory.EVIDENCE_CONTRACT)
-            blocking = _contract_blocking_evidence(decision)
-            contract_rules = tuple(
-                sorted(
-                    {
-                        item.rule_id
-                        for item in (*decision.evidence,)
-                        if item.status is EvidenceStatus.UNKNOWN
-                    }
-                    | {item.rule_id for item in blocking}
-                )
-            )
-            evidence_contract_requirements.append(
-                (decision.component_id, decision.requirement_id, contract_rules)
-            )
+            if decision.selected_plan is not None or decision.residual_gap > ZERO:
+                evidence_contract_decisions.append(decision)
         if AlertCategory.SOLVER_UNPROVEN in decision.alert_categories:
             add(
                 AlertCategory.SOLVER_UNPROVEN,
@@ -1308,23 +1680,61 @@ def render_alerts(
             f"explanation: [{_list(unexplained)}]"
         )
 
-    if evidence_contract_requirements:
+    if evidence_contract_decisions:
         contract = records[0].evidence_contract.value if records else "none"
-        listing = "; ".join(
-            f"{component_id}/{requirement_id} rule IDs [{_list(rule_ids)}]"
-            for component_id, requirement_id, rule_ids in sorted(
-                evidence_contract_requirements
-            )
+        affected_components = tuple(
+            sorted({item.component_id for item in evidence_contract_decisions})
         )
+        po_count = sum(
+            len(item.selected_plan.lines)
+            for item in evidence_contract_decisions
+            if item.selected_plan is not None
+        )
+        evidence_listing: list[str] = []
+        for decision in sorted(
+            evidence_contract_decisions,
+            key=lambda item: (item.component_id, item.requirement_id),
+        ):
+            rule_ids = {
+                item.rule_id
+                for item in decision.evidence
+                if item.status is EvidenceStatus.UNKNOWN
+            }
+            rule_ids.update(
+                item.rule_id for item in _contract_blocking_evidence(decision)
+            )
+            evidence_listing.append(
+                f"{decision.component_id}/{decision.requirement_id} rule IDs "
+                f"[{_list(rule_ids)}]"
+            )
+        listing = "; ".join(evidence_listing)
+        component_count = len(affected_components)
+        if contract == EvidenceContract.BENCHMARK.value:
+            headline = (
+                "Twelve-month supplier allocation history is unavailable; "
+                f"{po_count} purchase order{'s' if po_count != 1 else ''} for "
+                f"{component_count} component{'s' if component_count != 1 else ''} "
+                "were created using the benchmark fallback."
+            )
+            action = (
+                "load the missing supplier history and rerun before treating these "
+                "orders as production-ready"
+            )
+        else:
+            headline = (
+                "Twelve-month supplier allocation history is unavailable, so procurement "
+                f"remains blocked for {component_count} "
+                f"component{'s' if component_count != 1 else ''}."
+            )
+            action = "load the missing supplier history and rerun the blocked requirements"
         add(
             AlertCategory.EVIDENCE_CONTRACT,
             "run:evidence-contract",
-            f"Run-global {contract} evidence-contract trace: [{listing}]. The agent "
+            f"{headline} Run-global {contract} evidence-contract trace: [{listing}]. The agent "
             "preserved every hard UNKNOWN disposition, withheld affected actions where the "
             "contract requires DECISION_REQUIRED, and did not infer zero history or supplier "
             "ineligibility. Component-specific DECISION_REQUIRED alerts state each terminal "
-            "impact. Human action: provide the cited authoritative evidence and rerun from a "
-            "fresh snapshot.",
+            f"impact. Human action: {action}.",
         )
 
     descriptions = tuple(item.description for item in rendered)

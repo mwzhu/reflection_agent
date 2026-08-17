@@ -248,7 +248,9 @@ def test_decision_required_terminal_explanation_names_withheld_action_and_rules(
     )
     parsed = parse_owned_alert(terminal.description)
     assert parsed is not None
-    assert "alternative policy-decision-alternative" in terminal.audit_description
-    assert "The agent did not place the alternative" in terminal.audit_description
+    assert "Internal option IDs [policy-decision-alternative]" in terminal.audit_description
+    assert "did not place an alternative" in terminal.audit_description
     assert "Applicable rule IDs [" in terminal.audit_description
     assert "Human action:" in terminal.audit_description
+    assert "policy-decision-alternative" not in terminal.description
+    assert "lowest-cost option" in terminal.description

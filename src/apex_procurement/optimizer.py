@@ -3151,12 +3151,20 @@ class ProcurementOptimizer:
                     )
                 )
 
-        if selected and selected.forced_surplus > ZERO:
+        if (
+            selected
+            and selected.forced_surplus > ZERO
+            and selected.estimated_forced_surplus_value
+            >= problem.autonomy.forced_surplus_review_usd
+        ):
             alerts.append(
                 OptimizerAlert(
                     AlertCategory.FORCED_SURPLUS,
                     "FORCED_SURPLUS",
-                    f"Executable policy and MOQ conditions force {selected.forced_surplus} surplus units at total cost {selected.total_cost}.",
+                    "Executable quantity conditions force "
+                    f"{selected.forced_surplus} surplus units with estimated surplus value "
+                    f"{selected.estimated_forced_surplus_value}; review threshold "
+                    f"{problem.autonomy.forced_surplus_review_usd}.",
                     problem.component_id,
                     selected,
                 )

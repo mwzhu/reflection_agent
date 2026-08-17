@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import closing
 from dataclasses import replace
 from decimal import Decimal
+import json
 from pathlib import Path
 import sqlite3
 
@@ -77,19 +78,17 @@ def test_r12_executed_moq_has_no_mutually_exclusive_live_approval(
         ("CMP-005", "SUP-101", 25.0),
     )
     assert not _live_sub_moq_alerts(fixture.scenario_path)
-    forced = next(
-        alert
+    assert not any(
+        alert.category is AlertCategory.FORCED_SURPLUS
         for alert in owned_alerts(fixture.scenario_path)
-        if alert.category is AlertCategory.FORCED_SURPLUS
     )
-    for expected in (
-        "supplier SUP-101, quantity 25.0",
-        "total cost 300.00",
-        "forced surplus 20.0 against net requirement 5.0",
-        "no mutually exclusive sub-MOQ approval request remains live",
-        "future cancellation contract",
-    ):
-        assert expected in forced.body
+    payload = json.loads(observed.stdout)
+    decision = next(
+        item for item in payload["decisions"] if item["component_id"] == "CMP-005"
+    )
+    assert decision["selected_plan"]["forced_surplus"] == "20.0"
+    assert decision["selected_plan"]["net_requirement"] == "5.0"
+    assert decision["selected_plan"]["total_cost"] == "300.00"
 
 
 def test_r12_second_run_removes_obsolete_sub_moq_approval(

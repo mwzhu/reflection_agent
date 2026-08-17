@@ -55,6 +55,39 @@ IDEMPOTENCY_SCENARIOS = (
 ALL_SCENARIOS = tuple(
     sorted((PROJECT_ROOT / "data" / "scenarios").glob("scenario_*.sqlite"))
 )
+EXPECTED_OPERATIONAL_ALERT_CATEGORIES = {
+    "scenario_01_baseline.sqlite": (
+        "CAPACITY_UNKNOWN",
+        "EVIDENCE_CONTRACT",
+        "LATE_ARRIVAL",
+    ),
+    "scenario_02_partial_procurement.sqlite": (
+        "CAPACITY_UNKNOWN",
+        "COST_OPPORTUNITY",
+        "EVIDENCE_CONTRACT",
+    ),
+    "scenario_03_tight_timeline.sqlite": (
+        "CAPACITY_UNKNOWN",
+        "EVIDENCE_CONTRACT",
+        "LATE_ARRIVAL",
+        "LATE_ARRIVAL",
+        "LATE_ARRIVAL",
+        "LATE_ARRIVAL",
+    ),
+    "scenario_04_low_inventory.sqlite": (
+        "CAPACITY_UNKNOWN",
+        "COST_OPPORTUNITY",
+        "EVIDENCE_CONTRACT",
+        "LATE_ARRIVAL",
+    ),
+    "scenario_05_competing_demand.sqlite": (
+        "CAPACITY_UNKNOWN",
+        "COST_OPPORTUNITY",
+        "EVIDENCE_CONTRACT",
+        "LATE_ARRIVAL",
+    ),
+    "scenario_06_simple.sqlite": ("EVIDENCE_CONTRACT",),
+}
 
 
 def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
@@ -346,6 +379,55 @@ class AssembledCliTests(unittest.TestCase):
             )
             self.assertFalse(audit_only)
             self.assertLessEqual(len(evidence_contract), 1)
+            self.assertEqual(
+                tuple(sorted(item.category.value for item in artifacts.outputs.alerts)),
+                EXPECTED_OPERATIONAL_ALERT_CATEGORIES[source.name],
+            )
+            self.assertTrue(
+                all(
+                    item.description.startswith(("Recommendation:", "Error:"))
+                    for item in artifacts.outputs.alerts
+                )
+            )
+            self.assertFalse(
+                any("requirement requirement:" in item.description for item in artifacts.outputs.alerts)
+            )
+            if source == SCENARIO_04:
+                self.assertFalse(
+                    any(
+                        item.category is AlertCategory.DECISION_REQUIRED
+                        for item in artifacts.outputs.alerts
+                    )
+                )
+                opportunity = next(
+                    item
+                    for item in artifacts.outputs.alerts
+                    if item.category is AlertCategory.COST_OPPORTUNITY
+                )
+                self.assertIn("$1,017.25", opportunity.description)
+                self.assertIn("saving $396.55", opportunity.description)
+                self.assertNotIn("plan-", opportunity.description)
+
+            if source.name == "scenario_01_baseline.sqlite":
+                cmp010 = next(
+                    item
+                    for item in artifacts.outputs.purchase_orders
+                    if item.component_id == "CMP-010"
+                )
+                cmp010_rationale = cmp010.rationale.split("] ", 1)[1]
+                self.assertIn(
+                    "Closes the 12.5-unit projected shortage for PO-5001 and PO-5004",
+                    cmp010_rationale,
+                )
+                self.assertIn(
+                    "preserves strategic-supplier continuity",
+                    cmp010_rationale,
+                )
+                self.assertIn(
+                    "supplier minimums/order increments raise the plan from 12.5 to 13.0 units",
+                    cmp010_rationale,
+                )
+                self.assertIn("missing 12-month supplier-allocation history", cmp010_rationale)
 
             for target in artifacts.outputs.purchase_orders:
                 decision = replace(
@@ -387,6 +469,19 @@ class AssembledCliTests(unittest.TestCase):
                 )
                 self.assertNotIn(" record=", target.rationale)
                 self.assertNotIn("deciding comparators", human_rationale)
+                self.assertIn("projected shortage", human_rationale)
+                self.assertNotIn("Initial shortage:", human_rationale)
+                self.assertNotIn("plan residual:", human_rationale)
+                self.assertNotIn(" per unit ", human_rationale)
+                self.assertNotIn("ROLLING_HISTORY_UNKNOWN", human_rationale)
+                self.assertNotIn(line.component_id, human_rationale)
+                self.assertNotIn(line.supplier_id, human_rationale)
+                if len(decision.selected_plan.lines) > 1:
+                    self.assertTrue(human_rationale.startswith("Contributes to "))
+                else:
+                    self.assertTrue(
+                        human_rationale.startswith(("Closes ", "Reduces "))
+                    )
         self.assertTrue(observed)
         self.assertIn("skipped_condition_b", stage_two_outcomes)
         self.assertIn("moot_same_domesticity", stage_two_outcomes)
@@ -637,6 +732,8 @@ class AssembledCliTests(unittest.TestCase):
                 self.assertEqual(first.returncode, 0, first.stderr)
                 payload = json.loads(first.stdout)
                 scoped_components: set[str] = set()
+                blocked_components: set[str] = set()
+                covered_components: set[str] = set()
                 for decision in payload["decisions"]:
                     rolling = tuple(
                         item
@@ -667,6 +764,7 @@ class AssembledCliTests(unittest.TestCase):
                     )
                     self.assertIsNone(decision["selected_plan"])
                     if Decimal(decision["residual_gap"]) > 0:
+                        blocked_components.add(decision["component_id"])
                         self.assertEqual(
                             decision["requirement_state"]["resolution"],
                             "UNRESOLVED",
@@ -682,6 +780,8 @@ class AssembledCliTests(unittest.TestCase):
                                 for item in decision["alternatives"]
                             )
                         )
+                    else:
+                        covered_components.add(decision["component_id"])
                 self.assertTrue(scoped_components)
 
                 rows_after_first = output_rows(scenario)
@@ -711,7 +811,7 @@ class AssembledCliTests(unittest.TestCase):
                         for item in alert_audits
                     )
                 )
-                for component_id in scoped_components:
+                for component_id in blocked_components:
                     self.assertTrue(
                         any(
                             item.category is AlertCategory.DECISION_REQUIRED
@@ -725,6 +825,14 @@ class AssembledCliTests(unittest.TestCase):
                         if item.category is AlertCategory.EVIDENCE_CONTRACT
                     )
                     self.assertIn(component_id, global_evidence.body)
+                for component_id in covered_components:
+                    self.assertFalse(
+                        any(
+                            item.category is AlertCategory.DECISION_REQUIRED
+                            and f"component {component_id}" in item.body
+                            for item in alert_audits
+                        )
+                    )
                 second = self.command(*arguments)
                 self.assertEqual(second.returncode, 0, second.stderr)
                 self.assertEqual(output_rows(scenario), rows_after_first)
@@ -1210,7 +1318,11 @@ class AssembledCliTests(unittest.TestCase):
             row for row in orders_after_first if row[1] == "CMP-016"
         )
         self.assertEqual(len(cmp016_before), 1)
-        self.assertTrue(cmp016_before[0][7].startswith("Order 15.0 units of CMP-016"))
+        self.assertTrue(
+            cmp016_before[0][7].startswith(
+                "Closes the 15.0-unit projected shortage"
+            )
+        )
         self.assertNotIn("[APEX_AGENT:", cmp016_before[0][7])
         with closing(sqlite3.connect(scenario)) as connection:
             marker = connection.execute(
@@ -1318,8 +1430,15 @@ class AssembledCliTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                row[7].startswith("Order ")
-                and "Initial shortage:" in row[7]
+                row[7].startswith(("Closes ", "Reduces ", "Contributes to "))
+                and "projected shortage" in row[7]
+                and (
+                    "Supplier choice" in row[7]
+                    or "supplier mix" in row[7]
+                    or "Only executable route" in row[7]
+                )
+                and "Initial shortage:" not in row[7]
+                and " per unit " not in row[7]
                 and "[APEX_AGENT:" not in row[7]
                 for row in after_orders
                 if row[0] in payload["commit"]["committed_po_numbers"]

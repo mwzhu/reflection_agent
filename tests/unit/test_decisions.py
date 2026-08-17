@@ -272,7 +272,16 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
         self.assertIn("[APEX_AGENT:v5 ", target.rationale)
         self.assertNotIn(" record=", target.rationale)
-        self.assertIn("Order 20 units of CMP-014 from SUP-112", target.rationale)
+        self.assertIn(
+            "Closes the 20-unit projected shortage for PO-5001 due 2025-10-15.",
+            target.rationale,
+        )
+        self.assertIn(
+            "Only executable route after supplier eligibility, policy, and timing checks",
+            target.rationale,
+        )
+        self.assertNotIn("SUP-112", target.rationale.split("] ", 1)[1])
+        self.assertNotIn("32 per unit", target.rationale)
         self.assertNotIn("deciding comparators", target.rationale)
 
     def test_pre_r03_v2_record_without_line_approvals_remains_parseable(self) -> None:
@@ -508,6 +517,24 @@ class IdentityAndRenderingTests(unittest.TestCase):
             categories & {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
         )
         self.assertTrue(all("[APEX_ALERT:v2" in item.description for item in alerts))
+
+    def test_resolved_counterfactual_is_audit_only_not_decision_required(self) -> None:
+        counterfactual = make_plan(
+            disposition=PlanDisposition.DECISION_REQUIRED,
+            plan_id="counterfactual-plan-id",
+        )
+        decision = make_decision(
+            alternatives=(counterfactual,),
+            residual=Decimal("0"),
+            resolution=ResolutionStatus.RESOLVED,
+        )
+
+        alerts = render_alerts((decision,))
+
+        self.assertFalse(
+            any(item.category is AlertCategory.DECISION_REQUIRED for item in alerts)
+        )
+        self.assertFalse(any("counterfactual-plan-id" in item.description for item in alerts))
 
     def test_approval_alert_is_a_complete_proposal_from_policy_facts(self) -> None:
         proposal = make_plan(

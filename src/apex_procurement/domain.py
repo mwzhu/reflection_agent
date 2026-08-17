@@ -1179,6 +1179,18 @@ class CandidatePlan:
     assumption_codes: tuple[str, ...] = ()
     summary: str = "Candidate plan"
 
+    @property
+    def ordered_quantity(self) -> Decimal:
+        return sum((line.quantity for line in self.lines), ZERO)
+
+    @property
+    def estimated_forced_surplus_value(self) -> Decimal:
+        """Value forced surplus at the plan's exact blended unit price."""
+
+        if self.forced_surplus == ZERO:
+            return ZERO
+        return self.forced_surplus * self.total_cost / self.ordered_quantity
+
     def __post_init__(self) -> None:
         _require_text(self.plan_id, "plan_id")
         _require_text(self.component_id, "component_id")
