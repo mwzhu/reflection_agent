@@ -457,6 +457,11 @@ _ASSUMPTION_EXPLANATIONS = {
     "ROBUST_BOTH_WAYS": (
         "the plan passes both possible policy classifications"
     ),
+    "MODEL_RESIDUAL_CLASSIFICATION": (
+        "a high-confidence optional model classification resolved otherwise "
+        "unknown policy-concept membership; its evidence hashes are retained "
+        "in the decision audit"
+    ),
     "PCB_INCUMBENCY_INFERRED": (
         "prior orders establish PCB supplier incumbency because accepted-receipt "
         "history is missing"

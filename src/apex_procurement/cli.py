@@ -88,9 +88,28 @@ from .optimizer import (
     SolverLimits,
 )
 from .policy.entity_resolution import EntityResolver
-from .policy.evaluator import EvaluationBatch, EvaluationContext, PolicyEvaluator
+from .policy.evaluator import (
+    EvaluationAlert,
+    EvaluationBatch,
+    EvaluationContext,
+    PolicyEvaluator,
+    RuleEvaluation,
+)
+from .policy.model_adapter import (
+    ModelAdapter,
+    ModelAdapterError,
+    ModelConfigurationError,
+)
 from .policy.parameters import ApplicablePolicyParameters
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
+from .policy.runtime_model import (
+    MODEL_ASSUMPTION_CODE,
+    ModelRuntimeState,
+    build_model_runtime,
+    disabled_model_runtime,
+    model_evidence_for_component,
+    safe_model_failure_message,
+)
 from .policy.schema import PolicyValidationError
 from .repository import (
     RepositoryLoadError,
@@ -136,6 +155,7 @@ class RunArtifacts:
     validation: ValidationResult
     outputs: DecisionOutputs
     commit: CommitResult
+    model_runtime: ModelRuntimeState
     audit_json_lines: tuple[str, ...] = ()
     internal_failure_exclusions: tuple[InternalFailureExclusion, ...] = ()
     validation_pass_count: int = 1
@@ -168,7 +188,9 @@ def build_parser() -> argparse.ArgumentParser:
             "validator 5; concurrency 6; atomic commit 7. Non-strict partial "
             "survivors require a second independent validation; --strict is "
             "all-or-nothing. JSON and audit output report contract, model_mode, "
-            "model_status, commit accounting, and any partial-run exclusions."
+            "model_status, accepted residual classifications, commit accounting, "
+            "and any partial-run exclusions. Model evidence is an explicit "
+            "benchmark assumption and remains decision-gated in production."
         ),
     )
     parser.add_argument(
@@ -189,10 +211,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(item.value for item in ModelMode),
         default=ModelMode.OFF.value,
         help=(
-            "optional non-load-bearing model seam: off is deterministic; auto "
-            "uses the same deterministic offline plan and reports "
-            "unavailable_deterministic_fallback because no live provider is "
-            "configured; required exits 4 (default: off)"
+            "optional residual concept classifier: off is deterministic; auto "
+            "uses LLM_BASE_URL/LLM_MODEL when configured and otherwise falls "
+            "back deterministically; required exits 4 unless every required "
+            "model call returns an accepted response (default: off)"
         ),
     )
     parser.add_argument(
@@ -254,20 +276,58 @@ def _component_evaluations(
     registry: PolicyRegistry,
     contract: EvidenceContract,
     ledgers: LedgerBuildResult,
+    resolver: EntityResolver | None = None,
+    model_runtime: ModelRuntimeState | None = None,
 ) -> dict[str, EvaluationBatch]:
-    evaluator = PolicyEvaluator(registry, contract)
+    resolver = resolver or EntityResolver(registry)
+    model_runtime = model_runtime or disabled_model_runtime()
+    evaluator = PolicyEvaluator(registry, contract, resolver=resolver)
     components = {item.component_id: item for item in snapshot.components}
-    return {
-        ledger.component_id: evaluator.evaluate(
+    result: dict[str, EvaluationBatch] = {}
+    for ledger in ledgers.supply_ledgers:
+        component_id = ledger.component_id
+        batch = evaluator.evaluate(
             EvaluationContext(
                 scenario_date=snapshot.configuration.current_date,
                 suppliers=snapshot.suppliers,
-                component=components[ledger.component_id],
+                component=components[component_id],
                 purchase_orders=snapshot.purchase_orders,
             )
         )
-        for ledger in ledgers.supply_ledgers
-    }
+        model_evidence = model_evidence_for_component(
+            model_runtime, component_id, contract
+        )
+        model_rows = tuple(
+            RuleEvaluation(
+                evidence.rule_id,
+                "MODEL_RUNTIME",
+                "model_residual_classification",
+                True,
+                True,
+                EvidenceStatus.PASS,
+                evidence,
+                (
+                    EvaluationAlert(
+                        (
+                            AlertCategory.ASSUMPTION
+                            if contract is EvidenceContract.BENCHMARK
+                            else AlertCategory.DECISION_REQUIRED
+                        ),
+                        MODEL_ASSUMPTION_CODE,
+                        evidence.summary,
+                        evidence.rule_id,
+                        component_id,
+                    ),
+                ),
+            )
+            for evidence in model_evidence
+        )
+        result[component_id] = EvaluationBatch(
+            batch.scenario_date,
+            batch.contract,
+            tuple((*batch.evaluations, *model_rows)),
+        )
+    return result
 
 
 def _route_aware_ledgers(
@@ -387,11 +447,12 @@ def _optimizer_problem(
     evaluations: Mapping[str, EvaluationBatch],
     component_id: str,
     policy_parameters: ApplicablePolicyParameters,
+    resolver: EntityResolver | None = None,
 ) -> OptimizerProblem:
+    resolver = resolver or EntityResolver(registry)
     component = next(item for item in snapshot.components if item.component_id == component_id)
     ledger = ledgers.ledger_for(component_id)
     applicable = _applicable_rule_ids(evaluations[component_id])
-    resolver = EntityResolver(registry)
     minimum_secondary_fraction: Decimal | None = None
     minimum_secondary_rule_id: str | None = None
     named_primary_supplier_id: str | None = None
@@ -475,6 +536,8 @@ def _below_b_no_alternative_proofs(
     candidates: CandidateBuildResult,
     evaluations: Mapping[str, EvaluationBatch],
     policy_parameters: ApplicablePolicyParameters,
+    resolver: EntityResolver,
+    model_runtime: ModelRuntimeState,
 ) -> tuple[NoAlternativeProof, ...]:
     """Run the planner/validator predicate pair required by the below-B gate."""
 
@@ -497,7 +560,16 @@ def _below_b_no_alternative_proofs(
     components = {item.component_id: item for item in snapshot.components}
     solver = IntegerScaledSolver()
     validator = IndependentPlanValidator(
-        registry, policy_parameters=policy_parameters
+        registry,
+        policy_parameters=policy_parameters,
+        model_resolutions=model_runtime.classification_map,
+        model_fingerprints=model_runtime.fingerprint_map,
+        model_evidence_by_component={
+            component_id: model_evidence_for_component(
+                model_runtime, component_id, contract
+            )
+            for component_id in demanded_components
+        },
     )
     proofs: list[NoAlternativeProof] = []
     for component_id in sorted(pending):
@@ -509,6 +581,7 @@ def _below_b_no_alternative_proofs(
             evaluations,
             component_id,
             policy_parameters,
+            resolver,
         )
         # Named-primary is shaping, not evidence that a B-or-better
         # alternative is absent.  All hard gates and per-order allocation
@@ -618,8 +691,10 @@ def _decision_categories(
     component_id: str,
     outcome: object | None,
     *,
+    resolver: EntityResolver | None = None,
     applicable_alternatives: Sequence[CandidatePlan] | None = None,
 ) -> tuple[AlertCategory, ...]:
+    resolver = resolver or EntityResolver(registry)
     categories = {
         item.category
         for item in ledgers.alerts
@@ -703,7 +778,9 @@ def _decision_categories(
         component = next(
             item for item in snapshot.components if item.component_id == component_id
         )
-        final_batch = PolicyEvaluator(registry, contract).evaluate(
+        final_batch = PolicyEvaluator(
+            registry, contract, resolver=resolver
+        ).evaluate(
             EvaluationContext(
                 scenario_date=snapshot.configuration.current_date,
                 suppliers=snapshot.suppliers,
@@ -758,8 +835,10 @@ def _closed_decision(
     registry: PolicyRegistry,
     component_id: str,
     *,
+    resolver: EntityResolver | None = None,
     source_fingerprint: str | None = None,
 ) -> DecisionRecord:
+    resolver = resolver or EntityResolver(registry)
     ledger = ledgers.ledger_for(component_id)
     categories = _decision_categories(
         snapshot,
@@ -770,6 +849,7 @@ def _closed_decision(
         batch,
         component_id,
         None,
+        resolver=resolver,
     )
     decision = DecisionRecord(
         requirement_id=f"requirement:{component_id}",
@@ -812,8 +892,10 @@ def _planned_decision(
     outcome: object,
     component_id: str,
     *,
+    resolver: EntityResolver | None = None,
     source_fingerprint: str | None = None,
 ) -> DecisionRecord:
+    resolver = resolver or EntityResolver(registry)
     ledger = ledgers.ledger_for(component_id)
     selected = getattr(outcome, "selected_plan")
     sub_moq_approval_rule_ids = frozenset(
@@ -841,6 +923,7 @@ def _planned_decision(
         candidates,
         selected,
         component_id,
+        resolver,
     )
     decision = DecisionRecord(
         requirement_id=f"requirement:{component_id}",
@@ -865,6 +948,7 @@ def _planned_decision(
             batch,
             component_id,
             outcome,
+            resolver=resolver,
             applicable_alternatives=alternatives,
         ),
         rationale="Pending deterministic rendering.",
@@ -907,9 +991,11 @@ def _structured_rationale_facts(
     candidates: CandidateBuildResult,
     selected: CandidatePlan | None,
     component_id: str,
+    resolver: EntityResolver | None = None,
 ) -> tuple[tuple[DecisionComparatorFact, ...], tuple[MaterialRouteRejection, ...]]:
     """Carry a compact, deterministic explanation boundary into decisions."""
 
+    resolver = resolver or EntityResolver(registry)
     if selected is None:
         return (), ()
     selected_route_ids = tuple(line.route_id for line in selected.lines)
@@ -986,7 +1072,6 @@ def _structured_rationale_facts(
 
     material: list[MaterialRouteRejection] = []
     suppliers = {item.supplier_id: item for item in snapshot.suppliers}
-    resolver = EntityResolver(registry)
     rejection_priority = {
         "EVIDENCE_CONTRACT_BLOCKED": 0,
         "POLICY_GATE_FAILED": 1,
@@ -1398,6 +1483,7 @@ def _successful_audit_line(
     active_directives: tuple[str, ...],
     inactive_directives: tuple[str, ...],
     timings_us: Mapping[str, int],
+    model_runtime: ModelRuntimeState,
     internal_failure_exclusions: tuple[InternalFailureExclusion, ...] = (),
     validation_pass_count: int = 1,
 ) -> str:
@@ -1416,7 +1502,35 @@ def _successful_audit_line(
         "replan_count": attempt,
         "contract": config.contract.value,
         "model_mode": config.model_mode.value,
-        "model_status": _model_status(config.model_mode),
+        "model_status": model_runtime.status,
+        "model_resolution": {
+            "model_identifier": model_runtime.model_identifier,
+            "attempted_count": model_runtime.attempted_count,
+            "accepted_count": len(model_runtime.resolutions),
+            "low_confidence_count": model_runtime.low_confidence_count,
+            "failure_count": len(model_runtime.failures),
+            "classifications": tuple(
+                {
+                    "concept_id": item.concept_id,
+                    "entity_id": item.entity_id,
+                    "member": item.result.classification.member,
+                    "confidence": item.result.classification.confidence,
+                    "reason": item.result.classification.reason,
+                    "cache_hit": item.result.trace.cache_hit,
+                    "input_hash": item.result.trace.input_hash,
+                    "output_hash": item.result.trace.output_hash,
+                }
+                for item in model_runtime.resolutions
+            ),
+            "failures": tuple(
+                {
+                    "concept_id": item.concept_id,
+                    "entity_id": item.entity_id,
+                    "error_type": item.error_type,
+                }
+                for item in model_runtime.failures
+            ),
+        },
         "hashes": {
             "scenario_file": input_hash,
             "snapshot": f"sha256:{snapshot.state_digest}",
@@ -1549,25 +1663,32 @@ def _build_planning_inputs(
     registry: PolicyRegistry,
     contract: EvidenceContract,
     policy_parameters: ApplicablePolicyParameters,
+    resolver: EntityResolver,
+    model_runtime: ModelRuntimeState,
 ) -> tuple[
     LedgerBuildResult,
     dict[str, EvaluationBatch],
     CandidateBuildResult,
 ]:
     ledgers = build_ledgers(snapshot)
-    evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+    evaluations = _component_evaluations(
+        snapshot, registry, contract, ledgers, resolver, model_runtime
+    )
     candidates = _merge_component_rule_evidence(
         build_candidate_routes(
             snapshot,
             ledgers,
             registry=registry,
             contract=contract,
+            resolver=resolver,
             policy_parameters=policy_parameters,
         ),
         evaluations,
     )
     ledgers = _route_aware_ledgers(snapshot, candidates)
-    evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+    evaluations = _component_evaluations(
+        snapshot, registry, contract, ledgers, resolver, model_runtime
+    )
     candidates = _merge_component_rule_evidence(candidates, evaluations)
     no_alternative_proofs = _below_b_no_alternative_proofs(
         snapshot,
@@ -1577,6 +1698,8 @@ def _build_planning_inputs(
         candidates,
         evaluations,
         policy_parameters,
+        resolver,
+        model_runtime,
     )
     if no_alternative_proofs:
         candidates = _merge_component_rule_evidence(
@@ -1585,13 +1708,16 @@ def _build_planning_inputs(
                 ledgers,
                 registry=registry,
                 contract=contract,
+                resolver=resolver,
                 no_alternative_proofs=no_alternative_proofs,
                 policy_parameters=policy_parameters,
             ),
             evaluations,
         )
         ledgers = _route_aware_ledgers(snapshot, candidates)
-        evaluations = _component_evaluations(snapshot, registry, contract, ledgers)
+        evaluations = _component_evaluations(
+            snapshot, registry, contract, ledgers, resolver, model_runtime
+        )
         candidates = _merge_component_rule_evidence(candidates, evaluations)
     return ledgers, evaluations, candidates
 
@@ -1674,6 +1800,7 @@ def _run_once(
     *,
     attempt: int,
     _test_validation_issue_injector: TestValidationIssueInjector | None = None,
+    _test_model_adapter: ModelAdapter | None = None,
 ) -> RunArtifacts:
     """Plan, validate, and commit one optimistic-concurrency attempt."""
 
@@ -1691,12 +1818,39 @@ def _run_once(
     timings_us["policy_load"] = (perf_counter_ns() - phase_started) // 1_000
 
     phase_started = perf_counter_ns()
+    initial_ledgers = build_ledgers(snapshot)
+    try:
+        model_runtime = build_model_runtime(
+            mode=config.model_mode,
+            snapshot=snapshot,
+            registry=registry,
+            demanded_component_ids=tuple(
+                item.component_id for item in initial_ledgers.supply_ledgers
+            ),
+            adapter=_test_model_adapter,
+        )
+    except (ModelAdapterError, ModelConfigurationError, TypeError, ValueError) as error:
+        raise OptionalModelUnavailable(
+            "optional residual model resolution could not complete: "
+            + safe_model_failure_message(error)
+        ) from error
+    resolver = EntityResolver(
+        registry,
+        residual_results=model_runtime.classification_map,
+    )
+    timings_us["model_resolution"] = (
+        perf_counter_ns() - phase_started
+    ) // 1_000
+
+    phase_started = perf_counter_ns()
     ownership_snapshot = _snapshot_without_managed_outputs(snapshot)
     ownership_ledgers, ownership_evaluations, ownership_candidates = _build_planning_inputs(
         ownership_snapshot,
         registry,
         config.contract,
         policy_parameters,
+        resolver,
+        model_runtime,
     )
     if ownership_snapshot is snapshot:
         current_ledgers, current_evaluations, current_candidates = (
@@ -1710,6 +1864,8 @@ def _run_once(
             registry,
             config.contract,
             policy_parameters,
+            resolver,
+            model_runtime,
         )
     planning_snapshot = _snapshot_for_current_reconstruction(
         snapshot,
@@ -1731,6 +1887,8 @@ def _run_once(
             registry,
             config.contract,
             policy_parameters,
+            resolver,
+            model_runtime,
         )
     timings_us["ledger_build"] = (perf_counter_ns() - phase_started) // 1_000
     timings_us["candidate_build"] = (perf_counter_ns() - phase_started) // 1_000
@@ -1765,6 +1923,7 @@ def _run_once(
                     candidates,
                     registry,
                     component_id,
+                    resolver=resolver,
                 )
             )
             continue
@@ -1776,6 +1935,7 @@ def _run_once(
             evaluations,
             component_id,
             policy_parameters,
+            resolver,
         )
         outcome = optimizer.optimize(problem)
         ownership_source_fingerprint = (
@@ -1804,6 +1964,7 @@ def _run_once(
                 batch,
                 outcome,
                 component_id,
+                resolver=resolver,
                 source_fingerprint=ownership_source_fingerprint,
             )
         )
@@ -1815,6 +1976,14 @@ def _run_once(
     validator = IndependentPlanValidator(
         registry,
         policy_parameters=policy_parameters,
+        model_resolutions=model_runtime.classification_map,
+        model_fingerprints=model_runtime.fingerprint_map,
+        model_evidence_by_component={
+            component_id: model_evidence_for_component(
+                model_runtime, component_id, config.contract
+            )
+            for component_id in component_ids
+        },
         validation_pass=1,
         test_issue_injector=_test_validation_issue_injector,
     )
@@ -1890,6 +2059,14 @@ def _run_once(
         survivor_validator = IndependentPlanValidator(
             registry,
             policy_parameters=policy_parameters,
+            model_resolutions=model_runtime.classification_map,
+            model_fingerprints=model_runtime.fingerprint_map,
+            model_evidence_by_component={
+                component_id: model_evidence_for_component(
+                    model_runtime, component_id, config.contract
+                )
+                for component_id in component_ids
+            },
             validation_pass=2,
             test_issue_injector=_test_validation_issue_injector,
         )
@@ -1965,6 +2142,7 @@ def _run_once(
         timings_us=timings_us,
         internal_failure_exclusions=internal_failure_exclusions,
         validation_pass_count=validation_pass_count,
+        model_runtime=model_runtime,
     )
     return RunArtifacts(
         snapshot=snapshot,
@@ -1976,6 +2154,7 @@ def _run_once(
         validation=validation,
         outputs=outputs,
         commit=commit,
+        model_runtime=model_runtime,
         audit_json_lines=(audit_line,),
         internal_failure_exclusions=internal_failure_exclusions,
         validation_pass_count=validation_pass_count,
@@ -1986,14 +2165,9 @@ def run(
     config: RuntimeConfig,
     *,
     _test_validation_issue_injector: TestValidationIssueInjector | None = None,
+    _test_model_adapter: ModelAdapter | None = None,
 ) -> RunArtifacts:
     """Execute one deterministic run, replanning once on a stale snapshot."""
-
-    if config.model_mode is ModelMode.REQUIRED:
-        raise OptionalModelUnavailable(
-            "--llm=required is unavailable because no optional model adapter is configured "
-            "for live planning"
-        )
 
     scenario_path = resolve_scenario_path(config.scenario_path)
     for attempt in range(2):
@@ -2003,6 +2177,7 @@ def run(
                 scenario_path,
                 attempt=attempt,
                 _test_validation_issue_injector=_test_validation_issue_injector,
+                _test_model_adapter=_test_model_adapter,
             )
         except ConcurrentModificationError as error:
             if attempt == 1:
@@ -2046,7 +2221,24 @@ def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str,
         ),
         "contract": config.contract,
         "model_mode": config.model_mode,
-        "model_status": _model_status(config.model_mode),
+        "model_status": artifacts.model_runtime.status,
+        "model_resolution": {
+            "model_identifier": artifacts.model_runtime.model_identifier,
+            "attempted_count": artifacts.model_runtime.attempted_count,
+            "accepted_count": len(artifacts.model_runtime.resolutions),
+            "low_confidence_count": artifacts.model_runtime.low_confidence_count,
+            "failure_count": len(artifacts.model_runtime.failures),
+            "classifications": tuple(
+                {
+                    "concept_id": item.concept_id,
+                    "entity_id": item.entity_id,
+                    "member": item.result.classification.member,
+                    "confidence": item.result.classification.confidence,
+                    "reason": item.result.classification.reason,
+                }
+                for item in artifacts.model_runtime.resolutions
+            ),
+        },
         "policy_pack_id": artifacts.registry.pack_id,
         "policy_pack_hash": artifacts.registry.content_hash,
         "snapshot_digest": artifacts.snapshot.state_digest,
@@ -2087,7 +2279,7 @@ def render_result(config: RuntimeConfig, artifacts: RunArtifacts) -> str:
         f"contract={config.contract.value}; decisions={len(artifacts.decisions)}; "
         f"purchase_orders={len(artifacts.outputs.purchase_orders)}; "
         f"alerts={len(artifacts.outputs.alerts)}; "
-        f"model_status={_model_status(config.model_mode)}; "
+        f"model_status={artifacts.model_runtime.status}; "
         f"status={status}."
     ]
     if partial:

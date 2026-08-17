@@ -65,6 +65,7 @@ from .isolation import (
     reviewed_validation_failure_scope,
 )
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
+from .policy.model_adapter import ResidualEntityResult
 from .policy.parameters import (
     ApplicablePolicyParameters,
     EconomicAutonomyParameters,
@@ -88,6 +89,7 @@ _TERMINAL_ALERTS = frozenset(
 _SYNTHETIC_RULE_PREFIXES = (
     "MASTER-DATA.",
     "DATA-QUALITY.",
+    "MODEL.",
     "VALIDATOR.",
 )
 _EXECUTABLE_OBJECTIVE_SUFFIX = (
@@ -571,6 +573,13 @@ class IndependentPlanValidator:
         registry: PolicyRegistry | None = None,
         *,
         policy_parameters: ApplicablePolicyParameters | None = None,
+        model_resolutions: Mapping[
+            tuple[str, str], ResidualEntityResult
+        ] | None = None,
+        model_fingerprints: Mapping[tuple[str, str], str] | None = None,
+        model_evidence_by_component: Mapping[
+            str, Sequence[EvidenceResult]
+        ] | None = None,
         autonomy: EconomicAutonomyParameters | None = None,
         receiving_buffer_days: int = 0,
         accepted_shipment_pairs: Iterable[tuple[str, str]] = (),
@@ -627,6 +636,48 @@ class IndependentPlanValidator:
         if test_issue_injector is not None and not callable(test_issue_injector):
             raise TypeError("test_issue_injector must be callable or None")
         self.policy_parameters = policy_parameters
+        supplied_model_resolutions = dict(model_resolutions or {})
+        if any(
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not all(isinstance(item, str) and item for item in key)
+            or not isinstance(value, ResidualEntityResult)
+            for key, value in supplied_model_resolutions.items()
+        ):
+            raise TypeError(
+                "model_resolutions must map (concept_id, entity_id) to ResidualEntityResult"
+            )
+        self.model_resolutions = supplied_model_resolutions
+        supplied_model_fingerprints = dict(model_fingerprints or {})
+        if any(
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not all(isinstance(item, str) and item for item in key)
+            or not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for key, value in supplied_model_fingerprints.items()
+        ):
+            raise TypeError(
+                "model_fingerprints must map (concept_id, entity_id) to SHA-256 digests"
+            )
+        if set(supplied_model_fingerprints) != set(supplied_model_resolutions):
+            raise ValueError(
+                "model_fingerprints and model_resolutions must contain identical keys"
+            )
+        self.model_fingerprints = supplied_model_fingerprints
+        supplied_model_evidence = {
+            str(component_id): tuple(items)
+            for component_id, items in (model_evidence_by_component or {}).items()
+        }
+        if any(
+            not component_id
+            or any(not isinstance(item, EvidenceResult) for item in items)
+            for component_id, items in supplied_model_evidence.items()
+        ):
+            raise TypeError(
+                "model_evidence_by_component must map component IDs to EvidenceResult values"
+            )
+        self.model_evidence_by_component = supplied_model_evidence
         self.autonomy = autonomy or (
             policy_parameters.economic_autonomy
             if policy_parameters is not None
@@ -717,6 +768,30 @@ class IndependentPlanValidator:
         )
 
     def _concept(self, concept_id: str, entity: Component | Supplier) -> EvidenceStatus:
+        """Recompute deterministic status, then apply fingerprint-bound model evidence."""
+
+        deterministic = self._concept_deterministic(concept_id, entity)
+        if deterministic is not EvidenceStatus.UNKNOWN:
+            return deterministic
+        entity_id = (
+            entity.component_id if isinstance(entity, Component) else entity.supplier_id
+        )
+        residual = self.model_resolutions.get((concept_id, entity_id))
+        if residual is None:
+            return deterministic
+        if isinstance(entity, Component) and self.model_fingerprints.get(
+            (concept_id, entity_id)
+        ) != _component_fingerprint(entity):
+            return deterministic
+        return (
+            EvidenceStatus.PASS
+            if residual.classification.member
+            else EvidenceStatus.FAIL
+        )
+
+    def _concept_deterministic(
+        self, concept_id: str, entity: Component | Supplier
+    ) -> EvidenceStatus:
         concept = self._concepts[concept_id]
         if concept["entity_kind"] == "supplier":
             if not isinstance(entity, Supplier):
@@ -1069,6 +1144,16 @@ class IndependentPlanValidator:
         keys = set(
             self._rolling_review_keys(snapshot, requirement.component, contract)
         )
+        if contract is EvidenceContract.BENCHMARK:
+            for evidence in self.model_evidence_by_component.get(
+                requirement.component.component_id, ()
+            ):
+                if (
+                    evidence.status is EvidenceStatus.UNKNOWN
+                    and evidence.contract_disposition
+                    is PlanDisposition.EXECUTE_WITH_ASSUMPTION
+                ):
+                    keys.update(evidence.assumption_codes)
         if (
             contract is EvidenceContract.BENCHMARK
             and self._concept("domestic_supplier", supplier)
@@ -5505,6 +5590,26 @@ class IndependentPlanValidator:
             for item in decision.evidence
             if item.basis is EvidenceBasis.ROLLING_WINDOW
         }
+        expected_model = {
+            item.rule_id: item
+            for item in self.model_evidence_by_component.get(
+                decision.component_id, ()
+            )
+        }
+        actual_model = {
+            item.rule_id: item
+            for item in decision.evidence
+            if item.rule_id.startswith("MODEL.")
+        }
+        if actual_model != expected_model:
+            sink.error(
+                "MODEL_EVIDENCE_PROPAGATION",
+                "Requirement evidence does not preserve every accepted runtime model classification.",
+                component_id=decision.component_id,
+                rule_ids=tuple(
+                    sorted(set(actual_model) ^ set(expected_model))
+                ),
+            )
         if (
             decision.evidence_contract is EvidenceContract.PRODUCTION
             or actual_rolling
@@ -5520,6 +5625,17 @@ class IndependentPlanValidator:
             if decision.evidence_contract is EvidenceContract.PRODUCTION
             else PlanDisposition.EXECUTE_WITH_ASSUMPTION
         )
+        for evidence in actual_model.values():
+            if (
+                evidence.status is not EvidenceStatus.UNKNOWN
+                or evidence.contract_disposition is not expected_disposition
+            ):
+                sink.error(
+                    "MODEL_EVIDENCE_CONTRACT_DISPOSITION",
+                    "Runtime model evidence does not carry the active contract's required disposition.",
+                    component_id=decision.component_id,
+                    rule_ids=(evidence.rule_id,),
+                )
         for evidence in actual_rolling.values():
             if (
                 evidence.status is not EvidenceStatus.UNKNOWN

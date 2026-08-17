@@ -37,7 +37,7 @@ class CliContractTests(unittest.TestCase):
         self.assertNotIn("--recompile-policy", completed.stdout)
         self.assertIn("{benchmark,production}", completed.stdout)
         self.assertIn("{off,auto,required}", completed.stdout)
-        self.assertIn("unavailable_deterministic_fallback", completed.stdout)
+        self.assertIn("LLM_BASE_URL/LLM_MODEL", completed.stdout)
         self.assertIn("required exits 4", completed.stdout)
         self.assertIn("partial-survivor", completed.stdout)
         self.assertIn("production withholds", completed.stdout)
@@ -93,8 +93,9 @@ class CliContractTests(unittest.TestCase):
             "benchmark",
             "production",
             "deterministic and offline",
-            "model_status=unavailable_deterministic_fallback",
-            "same deterministic plan and business rows",
+            "MODEL_RESIDUAL_CLASSIFICATION",
+            "LLM_BASE_URL",
+            "LLM_API_KEY",
             "partial result",
             "compiled_policy.json",
             "Monday–Friday",

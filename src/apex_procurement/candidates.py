@@ -583,6 +583,7 @@ class CandidateBuilder:
         registry: PolicyRegistry | None = None,
         contract: EvidenceContract = EvidenceContract.BENCHMARK,
         *,
+        resolver: EntityResolver | None = None,
         receiving_buffer_days: int = 0,
         accepted_shipment_pairs: Iterable[tuple[str, str]] = (),
         no_alternative_proofs: Iterable[NoAlternativeProof] = (),
@@ -629,7 +630,9 @@ class CandidateBuilder:
         ):
             raise TypeError("policy_parameters must be ApplicablePolicyParameters or None")
         self.policy_parameters = policy_parameters
-        self.resolver = EntityResolver(self.registry)
+        if resolver is not None and not isinstance(resolver, EntityResolver):
+            raise TypeError("resolver must be EntityResolver or None")
+        self.resolver = resolver or EntityResolver(self.registry)
 
     def _parameters(self, scenario_date: date) -> ApplicablePolicyParameters:
         parameters = self.policy_parameters or self.registry.parameters_for(scenario_date)
@@ -2164,6 +2167,7 @@ def build_candidate_routes(
     *,
     registry: PolicyRegistry | None = None,
     contract: EvidenceContract = EvidenceContract.BENCHMARK,
+    resolver: EntityResolver | None = None,
     receiving_buffer_days: int = 0,
     accepted_shipment_pairs: Iterable[tuple[str, str]] = (),
     no_alternative_proofs: Iterable[NoAlternativeProof] = (),
@@ -2177,6 +2181,7 @@ def build_candidate_routes(
     return CandidateBuilder(
         registry,
         contract,
+        resolver=resolver,
         receiving_buffer_days=receiving_buffer_days,
         accepted_shipment_pairs=accepted_shipment_pairs,
         no_alternative_proofs=no_alternative_proofs,

@@ -15,7 +15,7 @@ class EvidenceContract(str, Enum):
 
 
 class ModelMode(str, Enum):
-    """Whether optional, non-load-bearing model calls may be attempted."""
+    """Whether bounded residual-classification model calls may be attempted."""
 
     OFF = "off"
     AUTO = "auto"

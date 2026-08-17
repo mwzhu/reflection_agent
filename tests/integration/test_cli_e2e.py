@@ -1911,7 +1911,7 @@ class AssembledCliTests(unittest.TestCase):
             "--scenario", str(self.path), "--llm", "required"
         )
         self.assertEqual(required.returncode, 4)
-        self.assertIn("no optional model adapter", required.stderr)
+        self.assertIn("LLM_BASE_URL and LLM_MODEL", required.stderr)
 
         recompile = self.command(
             "--scenario", str(self.path), "--recompile-policy"

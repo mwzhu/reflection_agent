@@ -1,10 +1,10 @@
 """Deterministic runtime entity resolution for compiled policy concepts.
 
 The policy pack contains the vocabulary; this module contains only the
-resolution mechanics.  Resolution is deliberately offline.  A future model
-adapter may add evidence for residuals, but model output is never consulted by
-the default evaluator and cannot turn an unresolved classification into an
-asserted fact here.
+resolution mechanics. Resolution is offline by default. An explicitly enabled
+runtime may supply schema-validated, fingerprint-bound classifications for
+facts that deterministic resolution leaves ``UNKNOWN``; those classifications
+remain evidence-contract assumptions rather than authoritative source data.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import unicodedata
 from typing import Any, Mapping, Sequence
 
 from ..domain import AlertCategory, Component, EvidenceStatus, Supplier
+from .model_adapter import ResidualEntityResult
 from .registry import PolicyRegistry
 
 
@@ -94,7 +95,14 @@ class NamedEntityResolution:
 class EntityResolver:
     """Resolve concepts and source-named suppliers against arbitrary entities."""
 
-    def __init__(self, registry: PolicyRegistry) -> None:
+    def __init__(
+        self,
+        registry: PolicyRegistry,
+        *,
+        residual_results: Mapping[
+            tuple[str, str], ResidualEntityResult
+        ] | None = None,
+    ) -> None:
         if not isinstance(registry, PolicyRegistry):
             raise TypeError("registry must be PolicyRegistry")
         self.registry = registry
@@ -103,6 +111,18 @@ class EntityResolver:
         )
         self._country_aliases = self._build_country_aliases()
         self._aggregate_members = self._build_aggregate_members()
+        supplied_results = dict(residual_results or {})
+        if any(
+            not isinstance(key, tuple)
+            or len(key) != 2
+            or not all(isinstance(item, str) and item for item in key)
+            or not isinstance(value, ResidualEntityResult)
+            for key, value in supplied_results.items()
+        ):
+            raise TypeError(
+                "residual_results must map (concept_id, entity_id) to ResidualEntityResult"
+            )
+        self._residual_results = MappingProxyType(supplied_results)
 
     def _build_country_aliases(self) -> Mapping[tuple[str, ...], str]:
         aliases: dict[tuple[str, ...], str] = {}
@@ -150,16 +170,66 @@ class EntityResolver:
         if entity_kind == "component":
             if not isinstance(entity, Component):
                 raise TypeError(f"concept {concept_id!r} requires a Component")
-            return self._resolve_component(concept_id, concept, entity)
+            deterministic = self._resolve_component(concept_id, concept, entity)
+            return self._apply_residual_result(deterministic)
         if entity_kind == "supplier":
             if not isinstance(entity, Supplier):
                 raise TypeError(f"concept {concept_id!r} requires a Supplier")
-            return self._resolve_supplier(concept_id, concept, entity)
+            deterministic = self._resolve_supplier(concept_id, concept, entity)
+            return self._apply_residual_result(deterministic)
         if entity_kind == "demand":
             if not isinstance(entity, Mapping):
                 raise TypeError(f"concept {concept_id!r} requires demand facts")
             return self._resolve_demand(concept_id, concept, entity)
         raise ValueError(f"unsupported concept entity kind {entity_kind!r}")
+
+    def _apply_residual_result(
+        self,
+        deterministic: ConceptResolution,
+    ) -> ConceptResolution:
+        """Use accepted model evidence only after deterministic ``UNKNOWN``."""
+
+        if deterministic.status is not EvidenceStatus.UNKNOWN:
+            return deterministic
+        residual = self._residual_results.get(
+            (deterministic.concept_id, deterministic.entity_id)
+        )
+        if residual is None:
+            return deterministic
+        classification = residual.classification
+        trace = residual.trace
+        alert = ResolutionAlert(
+            AlertCategory.ASSUMPTION,
+            "MODEL_RESIDUAL_CLASSIFICATION",
+            (
+                f"Optional model evidence classified {deterministic.entity_id!r} as "
+                f"{'a member' if classification.member else 'a non-member'} of "
+                f"{deterministic.concept_id!r} with confidence "
+                f"{classification.confidence}; this remains an audited assumption"
+            ),
+        )
+        return ConceptResolution(
+            deterministic.concept_id,
+            deterministic.entity_id,
+            (
+                EvidenceStatus.PASS
+                if classification.member
+                else EvidenceStatus.FAIL
+            ),
+            "model-assisted-residual",
+            tuple(
+                sorted(
+                    set(deterministic.evidence)
+                    | {
+                        f"model_confidence={classification.confidence}",
+                        f"model_input={trace.input_hash}",
+                        f"model_output={trace.output_hash}",
+                    }
+                )
+            ),
+            (alert,),
+            ("MODEL_RESIDUAL_CLASSIFICATION",),
+        )
 
     def _resolve_component(
         self,
