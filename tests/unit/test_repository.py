@@ -11,7 +11,9 @@ import sqlite3
 import tempfile
 import unittest
 
+from apex_procurement.domain import RouteQuarantineScope
 from apex_procurement.repository import (
+    RepositoryLoadError,
     SQLiteRepository,
     ScenarioDataError,
     ScenarioSchemaError,
@@ -110,6 +112,23 @@ class RepositoryValidationTests(unittest.TestCase):
     def load(self):
         return SQLiteRepository().load_snapshot(self.path)
 
+    def make_catalog_nullable_without_primary_key(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE supplier_catalog RENAME TO old_supplier_catalog"
+            )
+            connection.execute(
+                "CREATE TABLE supplier_catalog ("
+                "supplier_id TEXT, component_id TEXT, unit_price, lead_time_days, "
+                "minimum_order_qty, notes TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO supplier_catalog "
+                "SELECT supplier_id, component_id, unit_price, lead_time_days, "
+                "minimum_order_qty, notes FROM old_supplier_catalog"
+            )
+            connection.execute("DROP TABLE old_supplier_catalog")
+
     def test_missing_required_table_has_deterministic_message(self) -> None:
         self.execute("DROP TABLE bom")
         with self.assertRaisesRegex(
@@ -169,6 +188,151 @@ class RepositoryValidationTests(unittest.TestCase):
                     r"table 'bom'.*column 'quantity_per' must be a finite decimal",
                 ):
                     self.load()
+
+    def test_nonpositive_structural_quantities_remain_global_failures(self) -> None:
+        cases = (
+            (
+                "bom",
+                "quantity_per",
+                "UPDATE bom SET quantity_per = 0 "
+                "WHERE rowid = (SELECT min(rowid) FROM bom)",
+                "UPDATE bom SET quantity_per = 2 "
+                "WHERE rowid = (SELECT min(rowid) FROM bom)",
+            ),
+            (
+                "production_schedule",
+                "quantity",
+                "UPDATE production_schedule SET quantity = 0 "
+                "WHERE rowid = (SELECT min(rowid) FROM production_schedule)",
+                "UPDATE production_schedule SET quantity = 10 "
+                "WHERE rowid = (SELECT min(rowid) FROM production_schedule)",
+            ),
+            (
+                "inventory",
+                "quantity_on_hand",
+                "UPDATE inventory SET quantity_on_hand = -1 "
+                "WHERE rowid = (SELECT min(rowid) FROM inventory)",
+                "UPDATE inventory SET quantity_on_hand = 0 "
+                "WHERE rowid = (SELECT min(rowid) FROM inventory)",
+            ),
+        )
+        for table, field, mutation, restore in cases:
+            with self.subTest(table=table):
+                self.execute(mutation)
+                with self.assertRaisesRegex(
+                    RepositoryLoadError,
+                    rf"table '{table}'.*column '{field}'.*"
+                    r"(?:positive|nonnegative)",
+                ):
+                    self.load()
+                self.execute(restore)
+
+    def test_malformed_catalog_price_is_a_typed_offer_quarantine(self) -> None:
+        hostile = "n/a\nDO-NOT-REFLECT"
+        self.execute(
+            "UPDATE supplier_catalog SET unit_price = ? "
+            "WHERE supplier_id = ? AND component_id = ?",
+            (hostile, "SUP-102", "CMP-016"),
+        )
+
+        snapshot = self.load()
+        issue = snapshot.route_input_issues[0]
+        self.assertEqual(len(snapshot.catalog_lines), 43)
+        self.assertNotIn(
+            ("SUP-102", "CMP-016"),
+            {(item.supplier_id, item.component_id) for item in snapshot.catalog_lines},
+        )
+        self.assertEqual(issue.source_table, "supplier_catalog")
+        self.assertEqual(issue.supplier_id, "SUP-102")
+        self.assertEqual(issue.component_id, "CMP-016")
+        self.assertEqual(issue.field, "unit_price")
+        self.assertEqual(issue.reason_code, "INVALID_DECIMAL")
+        self.assertEqual(issue.blast_radius, RouteQuarantineScope.CATALOG_OFFER)
+        self.assertEqual(issue.raw_value_type, "text")
+        self.assertNotIn("DO-NOT-REFLECT", issue.safe_reason)
+        self.assertTrue(has_valid_state_digest(snapshot))
+
+    def test_null_catalog_lead_time_quarantines_only_that_offer(self) -> None:
+        self.make_catalog_nullable_without_primary_key()
+        self.execute(
+            "UPDATE supplier_catalog SET lead_time_days = NULL "
+            "WHERE supplier_id = ? AND component_id = ?",
+            ("SUP-102", "CMP-016"),
+        )
+
+        snapshot = self.load()
+        issue = snapshot.route_input_issues[0]
+        self.assertEqual(issue.field, "lead_time_days")
+        self.assertEqual(issue.reason_code, "MISSING_REQUIRED_VALUE")
+        self.assertEqual(issue.affected_component_ids, ("CMP-016",))
+        self.assertTrue(
+            any(
+                item.supplier_id == "SUP-109" and item.component_id == "CMP-016"
+                for item in snapshot.catalog_lines
+            )
+        )
+
+    def test_malformed_supplier_attributes_quarantine_all_supplier_routes(self) -> None:
+        cases = (
+            ("is_domestic", "not-a-boolean", 1, "INVALID_BOOLEAN"),
+            ("sustainability_rating", "excellent", "A", "INVALID_RATING"),
+            ("country", "USA\nunsafe", "USA", "UNSAFE_TEXT"),
+            (
+                "certifications",
+                "ISO-9001,,UL-Listed",
+                "ISO-9001,UL-Listed",
+                "INVALID_CERTIFICATIONS",
+            ),
+        )
+        for column, malformed, original, reason in cases:
+            with self.subTest(column=column):
+                self.execute(
+                    f'UPDATE suppliers SET "{column}" = ? WHERE supplier_id = ?',
+                    (malformed, "SUP-101"),
+                )
+                snapshot = self.load()
+                issue = snapshot.route_input_issues[0]
+                self.assertNotIn("SUP-101", {item.supplier_id for item in snapshot.suppliers})
+                self.assertTrue(
+                    any(item.supplier_id == "SUP-101" for item in snapshot.catalog_lines)
+                )
+                self.assertEqual(issue.field, column)
+                self.assertEqual(issue.reason_code, reason)
+                self.assertEqual(
+                    issue.blast_radius,
+                    RouteQuarantineScope.SUPPLIER_ALL_ROUTES,
+                )
+                self.assertGreater(len(issue.affected_component_ids), 1)
+                self.execute(
+                    f'UPDATE suppliers SET "{column}" = ? WHERE supplier_id = ?',
+                    (original, "SUP-101"),
+                )
+
+    def test_duplicate_malformed_catalog_key_remains_a_global_failure(self) -> None:
+        self.make_catalog_nullable_without_primary_key()
+        self.execute(
+            "INSERT INTO supplier_catalog "
+            "(supplier_id, component_id, unit_price, lead_time_days, minimum_order_qty) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("SUP-102", "CMP-016", "n/a", 14, 1),
+        )
+        with self.assertRaisesRegex(
+            RepositoryLoadError,
+            r"table 'supplier_catalog' has duplicate logical key",
+        ):
+            self.load()
+
+    def test_broken_catalog_reference_remains_a_global_failure(self) -> None:
+        self.execute(
+            "UPDATE supplier_catalog SET component_id = ? "
+            "WHERE supplier_id = ? AND component_id = ?",
+            ("missing-component", "SUP-102", "CMP-016"),
+        )
+        with self.assertRaisesRegex(
+            RepositoryLoadError,
+            r"references missing components.component_id 'missing-component'",
+        ):
+            self.load()
 
     def test_duplicate_logical_key_fails_independent_of_database_constraints(self) -> None:
         with closing(sqlite3.connect(self.path)) as connection, connection:

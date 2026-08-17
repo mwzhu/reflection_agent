@@ -140,6 +140,39 @@ class AssembledCliTests(unittest.TestCase):
             connection.commit()
         return scenario
 
+    def source_scenario(self, name: str) -> Path:
+        scenario = Path(self.temporary_directory.name) / name
+        shutil.copy2(SOURCE, scenario)
+        return scenario
+
+    def make_catalog_fields_nullable(self, scenario: Path) -> None:
+        with closing(sqlite3.connect(scenario)) as connection, connection:
+            connection.execute(
+                "ALTER TABLE supplier_catalog RENAME TO old_supplier_catalog"
+            )
+            connection.execute(
+                "CREATE TABLE supplier_catalog ("
+                "supplier_id TEXT, component_id TEXT, unit_price, lead_time_days, "
+                "minimum_order_qty, notes TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO supplier_catalog "
+                "SELECT supplier_id, component_id, unit_price, lead_time_days, "
+                "minimum_order_qty, notes FROM old_supplier_catalog"
+            )
+            connection.execute("DROP TABLE old_supplier_catalog")
+
+    def source_data_quality_alerts(self, scenario: Path) -> tuple[str, ...]:
+        with closing(sqlite3.connect(scenario)) as connection:
+            return tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT description FROM alerts "
+                    "WHERE description LIKE '%category=DATA_QUALITY%' "
+                    "AND description LIKE '%Source table %' ORDER BY description"
+                )
+            )
+
     def test_dry_run_is_offline_deterministic_and_writes_nothing(self) -> None:
         before = output_rows(self.path)
         arguments = ["--scenario", str(self.path), "--dry-run", "--json"]
@@ -414,6 +447,254 @@ class AssembledCliTests(unittest.TestCase):
                 "no_op": True,
             },
         )
+
+    def test_malformed_catalog_price_uses_valid_route_and_reruns_no_op(self) -> None:
+        scenario = self.source_scenario("catalog-price-quarantine.sqlite")
+        hostile = "n/a\nHOSTILE-CONTROL-\x01"
+        with closing(sqlite3.connect(scenario)) as connection, connection:
+            connection.execute(
+                "UPDATE supplier_catalog SET unit_price = ? "
+                "WHERE supplier_id = ? AND component_id = ?",
+                (hostile, "SUP-102", "CMP-016"),
+            )
+        arguments = (
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        first = self.command(*arguments)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        with closing(sqlite3.connect(scenario)) as connection:
+            managed_routes = tuple(
+                connection.execute(
+                    "SELECT supplier_id, unit_price FROM purchase_orders "
+                    "WHERE component_id = 'CMP-016' "
+                    "AND rationale LIKE '[APEX_AGENT:%' ORDER BY supplier_id"
+                )
+            )
+        self.assertEqual(managed_routes, (("SUP-109", 22.0),))
+        alerts = self.source_data_quality_alerts(scenario)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Source table supplier_catalog", alerts[0])
+        self.assertIn("supplier_id=SUP-102, component_id=CMP-016", alerts[0])
+        self.assertIn("field unit_price", alerts[0])
+        self.assertIn(
+            "Blast radius: only this supplier/component catalog offer",
+            alerts[0],
+        )
+        self.assertIn(
+            "without substituting price, lead time, quantity, or dates",
+            alerts[0],
+        )
+        self.assertIn("Human remediation:", alerts[0])
+        self.assertNotIn("HOSTILE", alerts[0])
+        self.assertNotIn("\x01", alerts[0])
+        self.assertNotIn("HOSTILE", first.stdout + first.stderr)
+
+        rows_after_first = output_rows(scenario)
+        second = self.command(*arguments)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(output_rows(scenario), rows_after_first)
+        self.assertEqual(
+            json.loads(second.stdout)["commit"],
+            {
+                "committed_po_numbers": [],
+                "deleted_alert_count": 0,
+                "inserted_alert_count": 0,
+                "no_op": True,
+            },
+        )
+
+    def test_null_price_and_bad_catalog_lead_time_quarantine_only_offer(self) -> None:
+        cases = (
+            ("unit_price", None, "price-null"),
+            ("lead_time_days", None, "lead-null"),
+            ("lead_time_days", "soon\nHOSTILE-LEAD-\x02", "lead-text"),
+        )
+        for field, malformed, label in cases:
+            with self.subTest(kind=label):
+                scenario = self.source_scenario(f"catalog-lead-{label}.sqlite")
+                if malformed is None:
+                    self.make_catalog_fields_nullable(scenario)
+                with closing(sqlite3.connect(scenario)) as connection, connection:
+                    connection.execute(
+                        f'UPDATE supplier_catalog SET "{field}" = ? '
+                        "WHERE supplier_id = ? AND component_id = ?",
+                        (malformed, "SUP-102", "CMP-016"),
+                    )
+                completed = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                with closing(sqlite3.connect(scenario)) as connection:
+                    managed_suppliers = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT supplier_id FROM purchase_orders "
+                            "WHERE component_id = 'CMP-016' "
+                            "AND rationale LIKE '[APEX_AGENT:%' ORDER BY supplier_id"
+                        )
+                    )
+                self.assertEqual(managed_suppliers, ("SUP-109",))
+                alerts = self.source_data_quality_alerts(scenario)
+                self.assertEqual(len(alerts), 1)
+                self.assertIn(f"field {field}", alerts[0])
+                self.assertIn(
+                    "without substituting price, lead time, quantity, or dates",
+                    alerts[0],
+                )
+                self.assertNotIn("HOSTILE-LEAD", alerts[0])
+                self.assertNotIn("HOSTILE-LEAD", completed.stdout + completed.stderr)
+
+                rows_after_first = output_rows(scenario)
+                second = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+                self.assertEqual(second.returncode, 0, second.stderr)
+                self.assertEqual(output_rows(scenario), rows_after_first)
+                self.assertTrue(json.loads(second.stdout)["commit"]["no_op"])
+
+    def test_malformed_supplier_attribute_quarantines_only_that_supplier(self) -> None:
+        scenario = self.source_scenario("supplier-wide-quarantine.sqlite")
+        hostile = "not-a-boolean\nHOSTILE-SUPPLIER-\x03"
+        with closing(sqlite3.connect(scenario)) as connection, connection:
+            connection.execute(
+                "UPDATE suppliers SET is_domestic = ? WHERE supplier_id = ?",
+                (hostile, "SUP-102"),
+            )
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        selected_lines = tuple(
+            line
+            for decision in payload["decisions"]
+            if decision["selected_plan"] is not None
+            for line in decision["selected_plan"]["lines"]
+        )
+        self.assertTrue(selected_lines)
+        self.assertFalse(
+            any(line["supplier_id"] == "SUP-102" for line in selected_lines)
+        )
+        self.assertTrue(
+            any(
+                line["supplier_id"] == "SUP-109"
+                and line["component_id"] == "CMP-016"
+                for line in selected_lines
+            )
+        )
+        self.assertTrue(
+            any(line["component_id"] != "CMP-016" for line in selected_lines)
+        )
+        alerts = self.source_data_quality_alerts(scenario)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Source table suppliers", alerts[0])
+        self.assertIn("logical key (supplier_id=SUP-102)", alerts[0])
+        self.assertIn("field is_domestic", alerts[0])
+        self.assertIn("Blast radius: all catalog routes for this supplier", alerts[0])
+        self.assertNotIn("HOSTILE-SUPPLIER", alerts[0])
+        self.assertNotIn("HOSTILE-SUPPLIER", completed.stdout + completed.stderr)
+
+    def test_quarantine_only_gap_is_data_quality_unresolved_not_no_eligible(self) -> None:
+        scenario = self.source_scenario("quarantine-terminal.sqlite")
+        with closing(sqlite3.connect(scenario)) as connection, connection:
+            connection.execute(
+                "UPDATE supplier_catalog SET unit_price = 'n/a' "
+                "WHERE component_id = 'CMP-016'"
+            )
+        completed = self.command(
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        payload = json.loads(completed.stdout)
+        decision = next(
+            item for item in payload["decisions"] if item["component_id"] == "CMP-016"
+        )
+        self.assertIsNone(decision["selected_plan"])
+        self.assertGreater(Decimal(decision["residual_gap"]), 0)
+        self.assertEqual(decision["requirement_state"]["resolution"], "UNRESOLVED")
+        self.assertIn("DATA_QUALITY", decision["alert_categories"])
+        self.assertIn("UNMET_DEMAND", decision["alert_categories"])
+        self.assertNotIn("NO_ELIGIBLE_SUPPLIER", decision["alert_categories"])
+        with closing(sqlite3.connect(scenario)) as connection:
+            component_orders = connection.execute(
+                "SELECT COUNT(*) FROM purchase_orders "
+                "WHERE component_id = 'CMP-016' AND rationale LIKE '[APEX_AGENT:%'"
+            ).fetchone()[0]
+            descriptions = tuple(
+                row[0] for row in connection.execute("SELECT description FROM alerts")
+            )
+        self.assertEqual(component_orders, 0)
+        self.assertTrue(any("category=DATA_QUALITY" in item for item in descriptions))
+        self.assertTrue(any("category=UNMET_DEMAND" in item for item in descriptions))
+        self.assertFalse(
+            any("category=NO_ELIGIBLE_SUPPLIER" in item for item in descriptions)
+        )
+
+    def test_structural_input_corruption_exits_three_without_any_write(self) -> None:
+        cases = (
+            (
+                "bom",
+                "UPDATE bom SET quantity_per = 'n/a' "
+                "WHERE rowid = (SELECT min(rowid) FROM bom)",
+            ),
+            (
+                "schedule",
+                "UPDATE production_schedule SET quantity = 'n/a' "
+                "WHERE rowid = (SELECT min(rowid) FROM production_schedule)",
+            ),
+            (
+                "inventory",
+                "UPDATE inventory SET quantity_on_hand = 'n/a' "
+                "WHERE rowid = (SELECT min(rowid) FROM inventory)",
+            ),
+            (
+                "configuration",
+                "UPDATE scenario_config SET current_date = 'not-a-date'",
+            ),
+        )
+        for label, mutation in cases:
+            with self.subTest(table=label):
+                scenario = self.source_scenario(f"structural-{label}.sqlite")
+                with closing(sqlite3.connect(scenario)) as connection, connection:
+                    connection.execute(mutation)
+                rows_before = output_rows(scenario)
+                bytes_before = scenario.read_bytes()
+
+                completed = self.command(
+                    "--scenario",
+                    str(scenario),
+                    "--contract=benchmark",
+                    "--llm=off",
+                    "--json",
+                )
+
+                self.assertEqual(completed.returncode, 3, completed.stderr)
+                self.assertEqual(output_rows(scenario), rows_before)
+                self.assertEqual(scenario.read_bytes(), bytes_before)
 
     def test_equal_or_later_route_does_not_create_recovery_order(self) -> None:
         for lead_days in (54, 60):

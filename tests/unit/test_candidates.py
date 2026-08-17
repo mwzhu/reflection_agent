@@ -4,6 +4,9 @@ from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+import shutil
+import sqlite3
+import tempfile
 import unittest
 
 from apex_procurement.candidates import (
@@ -167,6 +170,41 @@ class SuppliedScenarioCandidateTests(unittest.TestCase):
 
     def component(self, prefix: str) -> Component:
         return next(item for item in self.baseline.components if item.name.startswith(prefix))
+
+    def test_malformed_offer_is_absent_from_routes_and_has_a_typed_rejection(self) -> None:
+        source = SCENARIOS / "scenario_06_simple.sqlite"
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / source.name
+            shutil.copy2(source, target)
+            with sqlite3.connect(target) as connection, connection:
+                connection.execute(
+                    "UPDATE supplier_catalog SET unit_price = ? "
+                    "WHERE supplier_id = ? AND component_id = ?",
+                    ("n/a", "SUP-102", "CMP-016"),
+                )
+            snapshot = load_snapshot(target)
+            result = build_candidate_routes(snapshot, build_ledgers(snapshot))
+
+        self.assertFalse(
+            any(
+                item.supplier_id == "SUP-102" and item.component_id == "CMP-016"
+                for item in result.routes
+            )
+        )
+        self.assertTrue(
+            any(
+                item.supplier_id == "SUP-109" and item.component_id == "CMP-016"
+                for item in result.routes
+            )
+        )
+        quarantine = tuple(
+            item
+            for item in result.rejections
+            if item.code == "DATA_QUARANTINED"
+        )
+        self.assertEqual(len(quarantine), 1)
+        self.assertEqual(quarantine[0].supplier_id, "SUP-102")
+        self.assertEqual(quarantine[0].component_id, "CMP-016")
 
     def routes(self, component_prefix: str, supplier_prefix: str):
         component = self.component(component_prefix)

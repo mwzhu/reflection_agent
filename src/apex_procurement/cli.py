@@ -79,11 +79,9 @@ from .policy.parameters import ApplicablePolicyParameters
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
 from .policy.schema import PolicyValidationError
 from .repository import (
+    RepositoryLoadError,
     SQLiteRepository,
-    ScenarioDataError,
-    ScenarioLoadError,
     ScenarioPathError,
-    ScenarioSchemaError,
     resolve_scenario_path,
 )
 from .serialization import canonical_dumps, sanitize_control_characters
@@ -560,6 +558,16 @@ def _plan_allocations(plans: Sequence[CandidatePlan]) -> dict[str, Decimal]:
     return allocations
 
 
+def _quarantine_affects_component(
+    snapshot: ScenarioSnapshot,
+    component_id: str,
+) -> bool:
+    return any(
+        component_id in issue.affected_component_ids
+        for issue in snapshot.route_input_issues
+    )
+
+
 def _decision_categories(
     snapshot: ScenarioSnapshot,
     registry: PolicyRegistry,
@@ -587,6 +595,9 @@ def _decision_categories(
         for item in batch.alerts
         if item.entity_id in {None, component_id}
     )
+    quarantine_affected = _quarantine_affects_component(snapshot, component_id)
+    if quarantine_affected:
+        categories.add(AlertCategory.DATA_QUALITY)
     contract_blockers = _contract_blocking_evidence(batch)
     evidence_blocked = bool(contract_blockers) and any(
         route.is_evidence_blocked
@@ -616,11 +627,20 @@ def _decision_categories(
     residual = getattr(outcome, "residual_gap")
     if residual > ZERO:
         categories.add(AlertCategory.UNMET_DEMAND)
-    if not evidence_blocked and selected is None and not any(
-        route.may_enter_executable_model and route.feasible_deadlines
-        for route in candidates.routes_for(component_id)
+    if (
+        not evidence_blocked
+        and not quarantine_affected
+        and selected is None
+        and not any(
+            route.may_enter_executable_model and route.feasible_deadlines
+            for route in candidates.routes_for(component_id)
+        )
     ):
         categories.add(AlertCategory.NO_ELIGIBLE_SUPPLIER)
+    if quarantine_affected and residual > ZERO:
+        # The excluded source route prevents a complete eligibility or
+        # infeasibility proof.  DATA_QUALITY is the terminal explanation.
+        categories.discard(AlertCategory.NO_ELIGIBLE_SUPPLIER)
     if (
         selected is not None
         and selected.disposition is PlanDisposition.EXECUTE_WITH_ASSUMPTION
@@ -719,6 +739,12 @@ def _planned_decision(
     planned_coverage = selected.eventual_covered_quantity if selected is not None else ZERO
     existing_coverage = min(ledger.total_demand, ledger.eventual_supply)
     residual = getattr(outcome, "residual_gap")
+    requirement_state = getattr(outcome, "requirement_state")
+    if residual > ZERO and _quarantine_affects_component(snapshot, component_id):
+        requirement_state = RequirementState(
+            requirement_state.fulfillment,
+            ResolutionStatus.UNRESOLVED,
+        )
     decision = DecisionRecord(
         requirement_id=f"requirement:{component_id}",
         component_id=component_id,
@@ -729,7 +755,7 @@ def _planned_decision(
         initial_eventual_gap=ledger.eventual_gap,
         covered_quantity=existing_coverage + planned_coverage,
         residual_gap=residual,
-        requirement_state=getattr(outcome, "requirement_state"),
+        requirement_state=requirement_state,
         selected_plan=selected,
         alternatives=alternatives,
         evidence=_component_rule_evidence(batch),
@@ -1122,6 +1148,7 @@ def _run_once(
         active_directives=active,
         inactive_directives=inactive,
         visible_alert_prefixes=config.alert_prefixes,
+        route_input_issues=snapshot.route_input_issues,
     )
     phase_started = perf_counter_ns()
     commit = commit_decisions(
@@ -1257,7 +1284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = ExitCode.CLI_OR_PATH
         message = str(error)
         error_type = type(error).__name__
-    except (ScenarioDataError, ScenarioSchemaError, ScenarioLoadError) as error:
+    except RepositoryLoadError as error:
         code = ExitCode.INVALID_SCENARIO
         message = str(error)
         error_type = type(error).__name__

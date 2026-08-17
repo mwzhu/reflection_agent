@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from hashlib import sha256
 from typing import Iterable
 
 from .config import EvidenceContract
@@ -175,6 +176,13 @@ class AlertCategory(str, Enum):
     FORCED_SURPLUS = "FORCED_SURPLUS"
     SOLVER_UNPROVEN = "SOLVER_UNPROVEN"
     RUN_ACCOUNTING = "RUN_ACCOUNTING"
+
+
+class RouteQuarantineScope(str, Enum):
+    """The largest commercial route set invalidated by one source issue."""
+
+    CATALOG_OFFER = "catalog_offer"
+    SUPPLIER_ALL_ROUTES = "supplier_all_routes"
 
 
 VALID_REQUIREMENT_STATES = frozenset(
@@ -386,6 +394,96 @@ class ExistingAlert:
 
 
 @dataclass(frozen=True, slots=True)
+class RouteInputIssue:
+    """Typed provenance for a malformed supplier or catalog source value.
+
+    Unsafe raw values never enter explanations.  Their SQLite storage class
+    and digest remain in the immutable snapshot so the quarantine is tied to
+    the exact source state without reflecting hostile text into output rows.
+    """
+
+    source_table: str
+    supplier_id: str
+    component_id: str | None
+    affected_component_ids: tuple[str, ...]
+    field: str
+    reason_code: str
+    safe_reason: str
+    blast_radius: RouteQuarantineScope
+    action: str
+    remediation: str
+    raw_value_type: str
+    raw_value_sha256: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_table",
+            "supplier_id",
+            "field",
+            "reason_code",
+            "safe_reason",
+            "action",
+            "remediation",
+            "raw_value_type",
+        ):
+            _require_text(getattr(self, name), name)
+        _require_optional_text(self.component_id, "component_id")
+        components = _text_tuple(
+            self.affected_component_ids,
+            "affected_component_ids",
+        )
+        _require_unique(components, "affected_component_ids")
+        object.__setattr__(self, "affected_component_ids", components)
+        if not isinstance(self.blast_radius, RouteQuarantineScope):
+            raise TypeError("blast_radius must be RouteQuarantineScope")
+        if self.source_table == "supplier_catalog":
+            if (
+                self.blast_radius is not RouteQuarantineScope.CATALOG_OFFER
+                or self.component_id is None
+                or components != (self.component_id,)
+            ):
+                raise ValueError(
+                    "catalog issues must quarantine exactly their supplier/component offer"
+                )
+        elif self.source_table == "suppliers":
+            if (
+                self.blast_radius is not RouteQuarantineScope.SUPPLIER_ALL_ROUTES
+                or self.component_id is not None
+            ):
+                raise ValueError(
+                    "supplier issues must quarantine every route for that supplier"
+                )
+        else:
+            raise ValueError("route input issues may originate only from supplier route tables")
+        if len(self.raw_value_sha256) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.raw_value_sha256
+        ):
+            raise ValueError("raw_value_sha256 must be a lowercase SHA-256 digest")
+
+    @property
+    def issue_id(self) -> str:
+        """Stable current-state identity without exposing the unsafe raw value."""
+
+        parts = (
+            self.source_table,
+            self.supplier_id,
+            self.component_id or "",
+            ",".join(self.affected_component_ids),
+            self.field,
+            self.reason_code,
+            self.blast_radius.value,
+            self.raw_value_type,
+            self.raw_value_sha256,
+        )
+        payload = b"".join(
+            len(part.encode("utf-8")).to_bytes(8, "big") + part.encode("utf-8")
+            for part in parts
+        )
+        return sha256(payload).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class ScenarioSnapshot:
     configuration: ScenarioConfiguration
     products: tuple[Product, ...]
@@ -398,6 +496,7 @@ class ScenarioSnapshot:
     purchase_orders: tuple[ExistingPurchaseOrder, ...]
     alerts: tuple[ExistingAlert, ...]
     state_digest: str
+    route_input_issues: tuple[RouteInputIssue, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.configuration, ScenarioConfiguration):
@@ -432,6 +531,11 @@ class ScenarioSnapshot:
                 lambda item: item.po_number,
             ),
             "alerts": (self.alerts, ExistingAlert, lambda item: item.alert_id),
+            "route_input_issues": (
+                self.route_input_issues,
+                RouteInputIssue,
+                lambda item: item.issue_id,
+            ),
         }
         for name, (raw_items, item_type, key) in collections.items():
             items = _tuple(raw_items, name)
@@ -1382,6 +1486,8 @@ __all__ = [
     "ProductionOrder",
     "RequirementState",
     "ResolutionStatus",
+    "RouteInputIssue",
+    "RouteQuarantineScope",
     "RuleSeverity",
     "ScenarioConfiguration",
     "ScenarioSnapshot",

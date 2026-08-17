@@ -164,8 +164,8 @@ class OperationalHardeningTests(unittest.TestCase):
         mutations = (
             (
                 "control",
-                "UPDATE suppliers SET notes = ? WHERE rowid = "
-                "(SELECT min(rowid) FROM suppliers)",
+                "UPDATE components SET description = ? WHERE rowid = "
+                "(SELECT min(rowid) FROM components)",
                 ("terminal\x1bcontrol",),
             ),
             (

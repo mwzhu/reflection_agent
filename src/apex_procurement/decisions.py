@@ -20,6 +20,7 @@ from .domain import (
     DecisionRecord,
     ExistingPurchaseOrder,
     PlanLine,
+    RouteInputIssue,
     ScenarioSnapshot,
     ValidationResult,
 )
@@ -442,6 +443,7 @@ def build_decision_outputs(
     active_directives: Sequence[str] = (),
     inactive_directives: Sequence[str] = (),
     visible_alert_prefixes: bool = False,
+    route_input_issues: Sequence[RouteInputIssue] = (),
 ) -> DecisionOutputs:
     """Normalize records and construct the exact PO and owned-alert target rows."""
 
@@ -477,6 +479,7 @@ def build_decision_outputs(
         active_directives=active_directives,
         inactive_directives=inactive_directives,
         visible_prefixes=visible_alert_prefixes,
+        route_input_issues=route_input_issues,
     )
     return DecisionOutputs(
         decisions=records,
@@ -818,6 +821,7 @@ class AtomicDecisionWriter:
             active_directives=self._active_directives,
             inactive_directives=self._inactive_directives,
             visible_alert_prefixes=self._visible_alert_prefixes,
+            route_input_issues=snapshot.route_input_issues,
         )
         try:
             resolved = resolve_scenario_path(self._scenario_path)

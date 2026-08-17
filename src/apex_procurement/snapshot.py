@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum
 from hashlib import sha256
 import json
 from typing import Any
@@ -24,6 +25,7 @@ from .domain import (
     InventoryPosition,
     Product,
     ProductionOrder,
+    RouteInputIssue,
     ScenarioConfiguration,
     ScenarioSnapshot,
     Supplier,
@@ -61,6 +63,8 @@ def _canonical_value(value: object) -> object:
         raise TypeError("datetime is not part of a scenario snapshot")
     if isinstance(value, date):
         return {"date": value.isoformat()}
+    if isinstance(value, Enum):
+        return {"enum": value.value}
     if is_dataclass(value) and not isinstance(value, type):
         return {
             field.name: _canonical_value(getattr(value, field.name))
@@ -110,6 +114,7 @@ def build_snapshot(
     inventory: tuple[InventoryPosition, ...],
     purchase_orders: tuple[ExistingPurchaseOrder, ...],
     alerts: tuple[ExistingAlert, ...],
+    route_input_issues: tuple[RouteInputIssue, ...] = (),
 ) -> ScenarioSnapshot:
     """Construct, sort, validate, and digest an immutable scenario snapshot."""
 
@@ -125,6 +130,7 @@ def build_snapshot(
         purchase_orders=purchase_orders,
         alerts=alerts,
         state_digest=_PENDING_DIGEST,
+        route_input_issues=route_input_issues,
     )
     return replace(draft, state_digest=compute_state_digest(draft))
 
