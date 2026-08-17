@@ -29,6 +29,7 @@ from .domain import (
     AlertCategory,
     CandidatePlan,
     Component,
+    DecisionComparatorFact,
     DeadlineLateness,
     DecisionRecord,
     EvidenceBasis,
@@ -36,6 +37,7 @@ from .domain import (
     EvidenceScope,
     EvidenceStatus,
     FulfillmentStatus,
+    MaterialRouteRejection,
     PlanDisposition,
     PlanLine,
     ResolutionStatus,
@@ -300,6 +302,7 @@ class _Offer:
     upper_bound: Decimal
     supplier_fingerprint: str
     route_fingerprint: str
+    route_id: str
 
     def condition_for(self, due: date) -> str | None:
         return dict(self.gate_conditions).get(due)
@@ -455,6 +458,31 @@ def _route_fingerprint(
             "catalog_notes": _normal_text(catalog.notes),
         }
     )
+
+
+def _independent_route_id(
+    supplier_fingerprint: str,
+    route_fingerprint: str,
+    exception_codes: Iterable[str],
+    feasible_deadlines: Iterable[date],
+    exception_scope_deadlines: Iterable[date],
+) -> str:
+    """Reproduce the public route identity without importing candidate code."""
+
+    digest = _canonical_hash(
+        {
+            "supplier_fingerprint": supplier_fingerprint,
+            "route_fingerprint": route_fingerprint,
+            "exceptions": sorted(exception_codes),
+            "feasible_deadlines": sorted(
+                item.isoformat() for item in feasible_deadlines
+            ),
+            "exception_scope_deadlines": sorted(
+                item.isoformat() for item in exception_scope_deadlines
+            ),
+        }
+    )
+    return f"route-{digest}"
 
 
 def _holds(supplier: Supplier, required: str) -> bool:
@@ -1275,6 +1303,17 @@ class IndependentPlanValidator:
             tuple(catalog for _supplier, catalog, _assumption in eligible),
             self._minimum_secondary(snapshot, requirement.component),
         )
+        critical = self._concept("critical_component", requirement.component)
+        critical_status = (
+            True
+            if critical is EvidenceStatus.PASS
+            else False
+            if critical is EvidenceStatus.FAIL
+            else None
+        )
+        premium_rule_id = self._parameters(
+            snapshot.configuration.current_date
+        ).domestic_premiums.for_critical_status(critical_status).rule_id
         result: list[_Offer] = []
         for supplier, catalog, _assumption in eligible:
             international = self._concept("international_supplier", supplier) is EvidenceStatus.PASS
@@ -1310,6 +1349,17 @@ class IndependentPlanValidator:
                 }
             for _condition, scoped_buckets in sorted(standard_groups.items()):
                 allowed_buckets = tuple(scoped_buckets)
+                feasible_deadlines = tuple(
+                    due for due in allowed_buckets if material <= due
+                )
+                exception_codes = (
+                    (f"{premium_rule_id}:condition_{_condition}",)
+                    if international
+                    else ()
+                )
+                exception_scope_deadlines = (
+                    allowed_buckets if international else ()
+                )
                 bound = upper[catalog.supplier_id]
                 if international:
                     allowance = sum(
@@ -1340,6 +1390,13 @@ class IndependentPlanValidator:
                         bound,
                         supplier_hash,
                         route_hash,
+                        _independent_route_id(
+                            supplier_hash,
+                            route_hash,
+                            exception_codes,
+                            feasible_deadlines,
+                            exception_scope_deadlines,
+                        ),
                     )
                 )
             air_rules = self._rules(snapshot.configuration.current_date, "air_freight_authorization")
@@ -1402,6 +1459,16 @@ class IndependentPlanValidator:
                         air_bound,
                         supplier_hash,
                         air_route_hash,
+                        _independent_route_id(
+                            supplier_hash,
+                            air_route_hash,
+                            (
+                                f"{premium_rule_id}:condition_{_condition}",
+                                air_rule.rule_id,
+                            ),
+                            air_allowed,
+                            air_allowed,
+                        ),
                     )
                 )
         return tuple(
@@ -1650,6 +1717,806 @@ class IndependentPlanValidator:
             weighted_lead,
             Decimal(len(plan.lines)),
         )
+
+    def _structured_route_stage_outcomes(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        selected: _Offer,
+        rejected: _Offer,
+        due: date,
+        offers: Sequence[_Offer],
+    ) -> tuple[tuple[int, str], ...]:
+        """Independently reproduce the strict route comparator chain."""
+
+        selected_on_time = selected.material_available <= due
+        rejected_on_time = rejected.material_available <= due
+        outcomes: list[tuple[int, str]] = [
+            (
+                1,
+                "selected_on_time"
+                if selected_on_time and not rejected_on_time
+                else "rejected_on_time_advantage"
+                if rejected_on_time and not selected_on_time
+                else f"equal_on_time={str(selected_on_time).lower()}",
+            )
+        ]
+        conditions = {
+            item
+            for item in (selected.condition_for(due), rejected.condition_for(due))
+            if item is not None
+        }
+        if "b" in conditions:
+            domestic = "skipped_condition_b"
+        elif conditions & {"a", "c"}:
+            domestic = "moot_condition_a_or_c"
+        elif selected.international == rejected.international:
+            domestic = "moot_same_domesticity"
+        elif not selected.international and rejected.international:
+            domestic = "selected_domestic_preference_applied"
+        else:
+            domestic = "rejected_domestic_preference_advantage"
+        outcomes.append((2, domestic))
+
+        parameters = self._parameters(snapshot.configuration.current_date)
+
+        def strategic_penalty(offer: _Offer) -> bool:
+            if self._concept("strategic_supplier", offer.supplier) is not EvidenceStatus.FAIL:
+                return False
+            strategic = tuple(
+                item
+                for item in offers
+                if due in item.allowed_buckets
+                and self._concept("strategic_supplier", item.supplier)
+                is EvidenceStatus.PASS
+            )
+            if not strategic:
+                return False
+            best = min(strategic, key=lambda item: item.catalog.unit_price)
+            savings = (
+                ZERO
+                if best.catalog.unit_price == ZERO
+                else (best.catalog.unit_price - offer.catalog.unit_price)
+                / best.catalog.unit_price
+            )
+            return (
+                savings
+                <= parameters.strategic_continuity.maximum_alternative_savings_fraction
+            )
+
+        def sustainability_penalty(offer: _Offer) -> bool:
+            rating = _rating(offer.supplier.sustainability_rating)
+            if rating is None:
+                return False
+            for alternative in offers:
+                other = _rating(alternative.supplier.sustainability_rating)
+                if due not in alternative.allowed_buckets or other is None or other <= rating:
+                    continue
+                low = min(offer.catalog.unit_price, alternative.catalog.unit_price)
+                price_comparable = (
+                    offer.catalog.unit_price == alternative.catalog.unit_price
+                    if low == ZERO
+                    else abs(offer.catalog.unit_price - alternative.catalog.unit_price)
+                    / low
+                    <= parameters.sustainability.comparable_price_fraction
+                )
+                delivery_comparable = (
+                    _business_days(
+                        offer.material_available,
+                        alternative.material_available,
+                    )
+                    <= parameters.sustainability.comparable_delivery_days
+                )
+                if price_comparable and delivery_comparable:
+                    return True
+            return False
+
+        for stage, selected_label, penalty in (
+            (3, "selected_strategic_retention", strategic_penalty),
+            (4, "selected_sustainability_preference", sustainability_penalty),
+        ):
+            selected_penalty = penalty(selected)
+            rejected_penalty = penalty(rejected)
+            outcomes.append(
+                (
+                    stage,
+                    selected_label
+                    if not selected_penalty and rejected_penalty
+                    else "rejected_policy_preference_advantage"
+                    if selected_penalty and not rejected_penalty
+                    else "outside_window_or_equal",
+                )
+            )
+        outcomes.extend(
+            (
+                (
+                    5,
+                    "selected_lower_known_cost"
+                    if selected.catalog.unit_price < rejected.catalog.unit_price
+                    else "rejected_lower_known_cost"
+                    if rejected.catalog.unit_price < selected.catalog.unit_price
+                    else "equal_known_cost",
+                ),
+                (
+                    6,
+                    "selected_shorter_lead_time"
+                    if selected.lead_days < rejected.lead_days
+                    else "rejected_shorter_lead_time"
+                    if rejected.lead_days < selected.lead_days
+                    else "equal_lead_time",
+                ),
+                (
+                    7,
+                    "selected_lower_id_free_fingerprint"
+                    if (selected.supplier_fingerprint, selected.route_fingerprint)
+                    < (rejected.supplier_fingerprint, rejected.route_fingerprint)
+                    else "rejected_lower_id_free_fingerprint",
+                ),
+            )
+        )
+        selected_outcomes = {
+            "selected_on_time",
+            "selected_domestic_preference_applied",
+            "selected_strategic_retention",
+            "selected_sustainability_preference",
+            "selected_lower_known_cost",
+            "selected_shorter_lead_time",
+            "selected_lower_id_free_fingerprint",
+        }
+        rejected_outcomes = {
+            "rejected_on_time_advantage",
+            "rejected_domestic_preference_advantage",
+            "rejected_policy_preference_advantage",
+            "rejected_lower_known_cost",
+            "rejected_shorter_lead_time",
+            "rejected_lower_id_free_fingerprint",
+        }
+        decisive = next(
+            (
+                stage
+                for stage, outcome in outcomes
+                if outcome in selected_outcomes | rejected_outcomes
+            ),
+            None,
+        )
+        if decisive is None:
+            return tuple(outcomes)
+        return tuple(
+            (
+                stage,
+                outcome
+                if stage <= decisive
+                else f"not_evaluated_after_stage_{decisive}",
+            )
+            for stage, outcome in outcomes
+        )
+
+    def _independent_material_blockers(
+        self,
+        snapshot: ScenarioSnapshot,
+        requirement: _SourceRequirement,
+        offer: _Offer,
+        contract: EvidenceContract,
+    ) -> tuple[EvidenceStatus, tuple[str, ...]]:
+        """Reconstruct hard route status and citations from source facts."""
+
+        current = snapshot.configuration.current_date
+        supplier = offer.supplier
+        component = requirement.component
+        failed: set[str] = set()
+        unknown: set[str] = set()
+
+        if supplier.on_approved_list is not True:
+            failed.update(
+                rule.rule_id
+                for rule in self._rules(current, "approved_supplier_required")
+            )
+
+        certification_rules = self._rules(current, "required_certification")
+        electronic = _tokens(component.category or "") == (
+            "electronic",
+            "component",
+        )
+        iso_required = (
+            electronic
+            or self._concept("printed_circuit_board", component)
+            is EvidenceStatus.PASS
+            or self._concept("safety_critical_part", component)
+            is EvidenceStatus.PASS
+        )
+        for rule in certification_rules:
+            required = str(rule.data["constraint"]["certification"])
+            canonical = _certification(required)
+            applies = (
+                canonical == "ISO9001" and iso_required
+            ) or (
+                canonical != "ISO9001"
+                and self._concept("power_supply_component", component)
+                is EvidenceStatus.PASS
+            )
+            if applies and not _holds(supplier, required):
+                failed.add(rule.rule_id)
+        for value in component.required_certifications:
+            for required in _CERT_SPLIT_RE.split(value):
+                required = required.strip()
+                if required and not _holds(supplier, required):
+                    failed.add(
+                        "MASTER-DATA.required_certification."
+                        + _certification(required)
+                    )
+
+        domestic = self._concept("domestic_supplier", supplier)
+        if domestic is EvidenceStatus.UNKNOWN:
+            unknown.add("DATA-QUALITY.supplier_domesticity")
+
+        pcb_rules = self._rules(current, "incumbent_supplier_only")
+        if (
+            pcb_rules
+            and self._concept("printed_circuit_board_component", component)
+            is EvidenceStatus.PASS
+            and (component.component_id, supplier.supplier_id)
+            not in self.accepted_shipment_pairs
+        ):
+            if contract is EvidenceContract.PRODUCTION:
+                unknown.add(pcb_rules[0].rule_id)
+            else:
+                prior = any(
+                    item.component_id == component.component_id
+                    and item.supplier_id == supplier.supplier_id
+                    for item in snapshot.purchase_orders
+                )
+                relationship = self._relationship_predates(
+                    supplier, pcb_rules[0].effective_from
+                )
+                if not prior and not relationship:
+                    failed.add(pcb_rules[0].rule_id)
+
+        if offer.international and all(
+            condition == "shut" for _due, condition in offer.gate_conditions
+        ):
+            failed.update(
+                rule.rule_id
+                for rule in self._rules(
+                    current, "international_sourcing_justification"
+                )
+            )
+
+        rating = _rating(supplier.sustainability_rating)
+        below_rules = self._rules(current, "below_rating_review")
+        if below_rules:
+            boundary = _rating(
+                str(below_rules[0].data["constraint"]["below_rating"])
+            )
+            if rating is None or boundary is None:
+                unknown.add(below_rules[0].rule_id)
+            elif rating < boundary:
+                suppliers = {
+                    item.supplier_id: item for item in snapshot.suppliers
+                }
+                b_or_better = False
+                for other in snapshot.catalog_lines:
+                    candidate = suppliers.get(other.supplier_id)
+                    other_rating = (
+                        _rating(candidate.sustainability_rating)
+                        if candidate is not None
+                        else None
+                    )
+                    if (
+                        other.component_id == component.component_id
+                        and other.supplier_id != supplier.supplier_id
+                        and candidate is not None
+                        and other_rating is not None
+                        and other_rating >= boundary
+                        and self._hard_eligible(
+                            snapshot,
+                            requirement,
+                            candidate,
+                            other,
+                            contract,
+                        )[0]
+                    ):
+                        b_or_better = True
+                        break
+                if b_or_better:
+                    failed.add(below_rules[0].rule_id)
+                else:
+                    unknown.add(below_rules[0].rule_id)
+
+        if failed:
+            return EvidenceStatus.FAIL, tuple(sorted(failed | unknown))
+        if unknown:
+            return EvidenceStatus.UNKNOWN, tuple(sorted(unknown))
+        return EvidenceStatus.PASS, ()
+
+    def _check_structured_rationale_facts(
+        self,
+        snapshot: ScenarioSnapshot,
+        decision: DecisionRecord,
+        requirement: _SourceRequirement,
+        offers: Sequence[_Offer],
+        sink: _IssueSink,
+    ) -> None:
+        """Verify explanation facts directly from source and certified plan facts."""
+
+        selected_plan = decision.selected_plan
+        if selected_plan is None:
+            if decision.comparator_facts or decision.material_rejections:
+                sink.error(
+                    "RATIONALE_FACTS_UNSCOPED",
+                    "A decision without an executable plan carries selection rationale facts.",
+                    component_id=decision.component_id,
+                )
+            return
+        quantity = tuple(
+            item
+            for item in decision.comparator_facts
+            if item.kind == "quantity_calibration"
+        )
+        selected_total = sum((line.quantity for line in selected_plan.lines), ZERO)
+        minimum = selected_plan.minimum_compliant_total
+        expected_quantity_rules = tuple(
+            sorted(
+                {
+                    rule.rule_id
+                    for kind in ("on_time_arrival", "total_cost_of_ownership")
+                    for rule in self._rules(snapshot.configuration.current_date, kind)
+                }
+                | {
+                    exception.split(":condition_", 1)[0]
+                    for line in selected_plan.lines
+                    for allocation in line.bucket_allocations
+                    for exception in allocation.exception_ids
+                }
+            )
+        )
+        expected_quantity_cost = (
+            selected_plan.total_cost - selected_plan.cheapest_covering_cost
+            if selected_plan.cheapest_covering_cost is not None
+            else None
+        )
+        expected_quantity_outcome = (
+            f"selected total {selected_total} against certified minimum {minimum}; "
+            f"forced surplus {selected_plan.forced_surplus}; discretionary surplus "
+            f"{selected_plan.discretionary_surplus}"
+        )
+        if (
+            len(quantity) != 1
+            or minimum is None
+            or quantity[0].stage != 0
+            or not quantity[0].decisive
+            or quantity[0].comparator != "certified_quantity_calibration"
+            or quantity[0].outcome != expected_quantity_outcome
+            or quantity[0].selected_route_ids
+            != tuple(line.route_id for line in selected_plan.lines)
+            or quantity[0].compared_route_ids
+            or quantity[0].rule_ids != expected_quantity_rules
+            or quantity[0].quantity_delta != selected_total - minimum
+            or quantity[0].cost_delta != expected_quantity_cost
+            or quantity[0].delivery_delta_days is not None
+            or quantity[0].policy_window
+            != self._parameters(
+                snapshot.configuration.current_date
+            ).economic_autonomy.disclosure()
+        ):
+            sink.error(
+                "RATIONALE_QUANTITY_CALIBRATION_MISMATCH",
+                "Structured quantity calibration does not match the certified source/plan facts.",
+                component_id=decision.component_id,
+            )
+
+        route_facts = tuple(
+            item
+            for item in decision.comparator_facts
+            if item.kind == "route_selection"
+        )
+        if not route_facts and not decision.material_rejections:
+            return
+
+        selected_offers = {
+            line.route_id: offer
+            for line in selected_plan.lines
+            if (offer := self._match_offer(offers, line)) is not None
+        }
+        if len(selected_offers) != len(selected_plan.lines):
+            sink.error(
+                "RATIONALE_SELECTED_ROUTE_MISMATCH",
+                "A selected route cannot be reconstructed exactly from source facts.",
+                component_id=decision.component_id,
+            )
+            return
+
+        selected_suppliers = {line.supplier_id for line in selected_plan.lines}
+        suppliers = {item.supplier_id: item for item in snapshot.suppliers}
+        quarantined_suppliers = _quarantined_supplier_ids(snapshot)
+        quarantined_catalogs = _quarantined_catalog_keys(snapshot)
+        relevant_catalogs = tuple(
+            catalog
+            for catalog in snapshot.catalog_lines
+            if catalog.component_id == decision.component_id
+            and catalog.supplier_id in suppliers
+            and catalog.supplier_id not in quarantined_suppliers
+            and (catalog.supplier_id, catalog.component_id)
+            not in quarantined_catalogs
+        )
+        expected_rejected_suppliers = {
+            catalog.supplier_id
+            for catalog in relevant_catalogs
+            if catalog.supplier_id not in selected_suppliers
+        }
+        actual_rejected_suppliers = {
+            item.supplier_id for item in decision.material_rejections
+        }
+        if actual_rejected_suppliers != expected_rejected_suppliers:
+            sink.error(
+                "RATIONALE_MATERIAL_REJECTION_MISSING",
+                "Material rejection coverage must include every unselected catalog supplier, including hard-gated routes.",
+                component_id=decision.component_id,
+            )
+
+        gate_conditions = offers[0].gate_conditions
+        buffer_days = (
+            self.receiving_buffer_days
+            if requirement.component.is_hazardous
+            or self._concept(
+                "printed_circuit_board_component", requirement.component
+            )
+            is EvidenceStatus.PASS
+            else 0
+        )
+        rationale_offers = list(offers)
+        offer_status = {item.route_id: EvidenceStatus.PASS for item in offers}
+        offer_rules: dict[str, tuple[str, ...]] = {
+            item.route_id: () for item in offers
+        }
+        for catalog in relevant_catalogs:
+            supplier = suppliers[catalog.supplier_id]
+            if any(
+                item.catalog == catalog
+                and item.supplier.supplier_id == supplier.supplier_id
+                and item.shipping_method == "standard"
+                for item in rationale_offers
+            ):
+                continue
+            supplier_hash = _supplier_fingerprint(supplier)
+            route_hash = _route_fingerprint(
+                requirement.component,
+                catalog,
+                "standard",
+                catalog.lead_time_days,
+            )
+            expected = snapshot.configuration.current_date + timedelta(
+                days=catalog.lead_time_days
+            )
+            material = expected + timedelta(days=buffer_days)
+            international = (
+                self._concept("international_supplier", supplier)
+                is EvidenceStatus.PASS
+            )
+            all_deadlines = tuple(
+                due for due, _quantity in requirement.bucket_quantities
+            )
+            route_specs: list[
+                tuple[tuple[str, ...], tuple[date, ...], tuple[date, ...]]
+            ] = []
+            if international:
+                by_condition: dict[str, list[date]] = defaultdict(list)
+                for due, condition in gate_conditions:
+                    if condition != "shut":
+                        by_condition[condition].append(due)
+                if by_condition:
+                    critical = self._concept(
+                        "critical_component", requirement.component
+                    )
+                    critical_status = (
+                        True
+                        if critical is EvidenceStatus.PASS
+                        else False
+                        if critical is EvidenceStatus.FAIL
+                        else None
+                    )
+                    premium_rule_id = self._parameters(
+                        snapshot.configuration.current_date
+                    ).domestic_premiums.for_critical_status(
+                        critical_status
+                    ).rule_id
+                    for condition, scoped in sorted(by_condition.items()):
+                        scope = tuple(scoped)
+                        route_specs.append(
+                            (
+                                (f"{premium_rule_id}:condition_{condition}",),
+                                tuple(due for due in scope if material <= due),
+                                scope,
+                            )
+                        )
+                else:
+                    route_specs.append(((), (), ()))
+            else:
+                route_specs.append(
+                    ((), tuple(due for due in all_deadlines if material <= due), ())
+                )
+            for exceptions, feasible, exception_scope in route_specs:
+                route_id = _independent_route_id(
+                    supplier_hash,
+                    route_hash,
+                    exceptions,
+                    feasible,
+                    exception_scope,
+                )
+                offer = _Offer(
+                    requirement.component,
+                    supplier,
+                    catalog,
+                    expected,
+                    material,
+                    catalog.lead_time_days,
+                    "standard",
+                    international,
+                    frozenset(),
+                    exception_scope or all_deadlines,
+                    gate_conditions,
+                    ZERO,
+                    supplier_hash,
+                    route_hash,
+                    route_id,
+                )
+                status, rules = self._independent_material_blockers(
+                    snapshot,
+                    requirement,
+                    offer,
+                    decision.evidence_contract,
+                )
+                rationale_offers.append(offer)
+                offer_status[route_id] = status
+                offer_rules[route_id] = rules
+
+        current = snapshot.configuration.current_date
+        parameters = self._parameters(current)
+        expected_comparators = {
+            1: "on_time_feasibility",
+            2: "domestic_preference",
+            3: "strategic_retention",
+            4: "sustainability_band",
+            5: "known_landed_cost",
+            6: "shorter_lead_time",
+            7: "id_free_fingerprint",
+        }
+        expected_rules = {
+            1: tuple(rule.rule_id for rule in self._rules(current, "on_time_arrival")),
+            2: tuple(
+                rule.rule_id
+                for rule in self._rules(current, "domestic_supplier_preference")
+            ),
+            3: tuple(
+                rule.rule_id
+                for rule in self._rules(current, "strategic_supplier_continuity")
+            ),
+            4: tuple(
+                rule.rule_id
+                for rule in self._rules(current, "sustainability_preference")
+            ),
+            5: tuple(
+                rule.rule_id
+                for rule in self._rules(current, "total_cost_of_ownership")
+            ),
+            6: tuple(rule.rule_id for rule in self._rules(current, "on_time_arrival")),
+            7: (),
+        }
+        expected_windows = {
+            1: "Material availability was compared with each scoped demand deadline.",
+            2: (
+                "The domestic comparator is skipped only for §3(b), moot for "
+                "§3(a)/(c), and not reached when the gate is shut."
+            ),
+            3: (
+                "A non-Strategic route is penalized only where its savings do not "
+                f"strictly exceed {parameters.strategic_continuity.maximum_alternative_savings_fraction}."
+            ),
+            4: (
+                "The rating preference applies only inside the inclusive "
+                f"{parameters.sustainability.comparable_price_fraction}-price and "
+                f"{parameters.sustainability.comparable_delivery_days}-business-day window."
+            ),
+            5: (
+                "Known catalog price is used because no additional landed-cost fact "
+                "is represented."
+            ),
+            6: "Shorter supplier lead time wins after the policy comparators.",
+            7: "The final deterministic key excludes supplier and component database IDs.",
+        }
+        selected_outcomes = {
+            "selected_on_time",
+            "selected_domestic_preference_applied",
+            "selected_strategic_retention",
+            "selected_sustainability_preference",
+            "selected_lower_known_cost",
+            "selected_shorter_lead_time",
+            "selected_lower_id_free_fingerprint",
+        }
+        rejected_outcomes = {
+            "rejected_on_time_advantage",
+            "rejected_domestic_preference_advantage",
+            "rejected_policy_preference_advantage",
+            "rejected_lower_known_cost",
+            "rejected_shorter_lead_time",
+            "rejected_lower_id_free_fingerprint",
+        }
+        expected_route_facts: list[DecisionComparatorFact] = []
+        expected_material: list[MaterialRouteRejection] = []
+        by_supplier: dict[str, list[_Offer]] = defaultdict(list)
+        for offer in rationale_offers:
+            if offer.supplier.supplier_id in expected_rejected_suppliers:
+                by_supplier[offer.supplier.supplier_id].append(offer)
+
+        air_approval_rule_ids = {
+            rule.rule_id
+            for kind in (
+                "air_freight_individual_approval",
+                "air_freight_period_spend_cap",
+            )
+            for rule in self._rules(current, kind)
+        }
+        below_b_rule_ids = {
+            rule.rule_id for rule in self._rules(current, "below_rating_review")
+        }
+
+        def approval_required(offer: _Offer) -> bool:
+            if (
+                offer.shipping_method == "air freight"
+                and not air_approval_rule_ids.issubset(self.approved_rule_ids)
+            ):
+                return True
+            return (
+                offer_status.get(offer.route_id) is EvidenceStatus.UNKNOWN
+                and bool(set(offer_rules.get(offer.route_id, ())) & below_b_rule_ids)
+            )
+
+        for supplier_id in sorted(expected_rejected_suppliers):
+            rejected_offer = min(
+                by_supplier[supplier_id],
+                key=lambda item: (
+                    offer_status.get(item.route_id, EvidenceStatus.UNKNOWN)
+                    is not EvidenceStatus.PASS,
+                    approval_required(item),
+                    item.catalog.unit_price,
+                    item.material_available,
+                    item.route_id,
+                ),
+            )
+            selected_offer = min(
+                selected_offers.values(),
+                key=lambda item: (
+                    abs(item.catalog.unit_price - rejected_offer.catalog.unit_price),
+                    abs((item.material_available - rejected_offer.material_available).days),
+                    item.route_id,
+                ),
+            )
+            selected_line = next(
+                line
+                for line in selected_plan.lines
+                if line.route_id == selected_offer.route_id
+            )
+            due = min(
+                allocation.due_date
+                for allocation in selected_line.bucket_allocations
+            )
+            price_delta = (
+                rejected_offer.catalog.unit_price
+                - selected_offer.catalog.unit_price
+            )
+            delivery_delta = (
+                rejected_offer.material_available
+                - selected_offer.material_available
+            ).days
+            status = offer_status.get(
+                rejected_offer.route_id, EvidenceStatus.UNKNOWN
+            )
+            blocker_rules = set(offer_rules.get(rejected_offer.route_id, ()))
+            route_path: list[DecisionComparatorFact] = []
+            first_difference: tuple[int, str] | None = None
+            if status is EvidenceStatus.PASS:
+                outcomes = self._structured_route_stage_outcomes(
+                    snapshot,
+                    requirement,
+                    selected_offer,
+                    rejected_offer,
+                    due,
+                    offers,
+                )
+                first_difference = next(
+                    (
+                        (stage, outcome)
+                        for stage, outcome in outcomes
+                        if outcome in selected_outcomes | rejected_outcomes
+                    ),
+                    None,
+                )
+                if first_difference is not None and first_difference[1] in selected_outcomes:
+                    deciding_stage = first_difference[0]
+                    for stage, outcome in outcomes:
+                        fact = DecisionComparatorFact(
+                            stage=stage,
+                            kind="route_selection",
+                            comparator=expected_comparators[stage],
+                            outcome=outcome,
+                            selected_route_ids=(selected_offer.route_id,),
+                            compared_route_ids=(rejected_offer.route_id,),
+                            rule_ids=tuple(sorted(expected_rules[stage])),
+                            decisive=stage == deciding_stage,
+                            cost_delta=(
+                                price_delta if stage in {3, 4, 5} else None
+                            ),
+                            delivery_delta_days=(
+                                delivery_delta if stage in {1, 4, 6} else None
+                            ),
+                            policy_window=expected_windows[stage],
+                        )
+                        route_path.append(fact)
+                        expected_route_facts.append(fact)
+                    for fact in route_path:
+                        if fact.decisive:
+                            blocker_rules.update(fact.rule_ids)
+
+            if status is EvidenceStatus.FAIL:
+                reason_code = "POLICY_GATE_FAILED"
+            elif status is EvidenceStatus.UNKNOWN:
+                reason_code = "POLICY_GATE_UNRESOLVED"
+            elif not any(
+                rejected_offer.material_available <= scoped_due
+                for scoped_due in rejected_offer.allowed_buckets
+            ):
+                reason_code = "NO_FEASIBLE_DEADLINE"
+            elif route_path:
+                reason_code = "NOT_SELECTED_BY_COMPARATOR"
+            else:
+                reason_code = "NOT_SELECTED_BY_CERTIFIED_ALLOCATION"
+                blocker_rules.update(expected_quantity_rules)
+
+            expected_material.append(
+                MaterialRouteRejection(
+                    route_id=rejected_offer.route_id,
+                    supplier_id=supplier_id,
+                    reason_code=reason_code,
+                    eligibility=status,
+                    rule_ids=tuple(sorted(blocker_rules)),
+                    unit_price=rejected_offer.catalog.unit_price,
+                    selected_unit_price=selected_offer.catalog.unit_price,
+                    price_delta=price_delta,
+                    material_available_date=rejected_offer.material_available,
+                    selected_material_available_date=selected_offer.material_available,
+                    delivery_delta_days=delivery_delta,
+                )
+            )
+
+        canonical_fact_key = lambda item: (
+            item.stage,
+            item.comparator,
+            item.compared_route_ids,
+        )
+        actual_route_facts = tuple(
+            sorted(
+                (
+                    item
+                    for item in decision.comparator_facts
+                    if item.kind == "route_selection"
+                ),
+                key=canonical_fact_key,
+            )
+        )
+        expected_route_tuple = tuple(
+            sorted(expected_route_facts, key=canonical_fact_key)
+        )
+        if actual_route_facts != expected_route_tuple:
+            sink.error(
+                "RATIONALE_COMPARATOR_MISMATCH",
+                "Route comparator facts must exactly match independently reconstructed routes, stages, outcomes, citations, deltas, and windows.",
+                component_id=decision.component_id,
+            )
+        if decision.material_rejections != tuple(expected_material):
+            sink.error(
+                "RATIONALE_MATERIAL_REJECTION_MISMATCH",
+                "Material rejection route, reason, eligibility, citations, price, or date facts do not match independent reconstruction.",
+                component_id=decision.component_id,
+            )
 
     def _synthetic_objective(
         self,
@@ -4504,6 +5371,13 @@ class IndependentPlanValidator:
                 sink,
             )
             offers = self._offers(snapshot, requirement, decision.evidence_contract, include_unapproved=True)
+            self._check_structured_rationale_facts(
+                snapshot,
+                decision,
+                requirement,
+                offers,
+                sink,
+            )
             self._check_time_phased_ledger(
                 decision,
                 requirement,
@@ -4641,6 +5515,7 @@ class IndependentPlanValidator:
                 "no-silent-gap-and-requirement-state",
                 "policy-window-comparators-6-8",
                 "rationale-citations-and-capacity-disclosure",
+                "structured-quantity-comparators-and-material-rejections",
                 "route-input-quarantine-and-data-quality",
                 "time-phased-recovery-lateness-and-alerts",
                 "u-derivation",

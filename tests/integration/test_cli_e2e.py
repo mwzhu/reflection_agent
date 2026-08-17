@@ -16,14 +16,23 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import apex_procurement.decisions as decisions_module
 from apex_procurement.cli import PlanningFailure, main, run
-from apex_procurement.config import RuntimeConfig
+from apex_procurement.config import EvidenceContract, RuntimeConfig
 from apex_procurement.domain import (
+    AlertCategory,
+    EvidenceStatus,
     PlanDisposition,
     SolveKind,
     ValidationIssue,
     ValidationSeverity,
 )
+from apex_procurement.explanations import (
+    parse_owned_alert,
+    render_decision_rationale,
+    render_line_rationale,
+)
+from apex_procurement.validator import IndependentPlanValidator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -243,6 +252,342 @@ class AssembledCliTests(unittest.TestCase):
                 self.assertEqual(accounting_count, 1)
                 self.assertEqual(order_counts[0], order_counts[1])
 
+    def test_compact_rationales_are_at_most_45_percent_of_v3_on_all_scenarios(self) -> None:
+        observed: list[tuple[str, int, int]] = []
+        stage_two_outcomes: set[str] = set()
+        for source in ALL_SCENARIOS:
+            artifacts = run(RuntimeConfig(source, dry_run=True))
+            for decision in artifacts.decisions:
+                quantity = tuple(
+                    item
+                    for item in decision.comparator_facts
+                    if item.kind == "quantity_calibration"
+                )
+                if decision.selected_plan is not None:
+                    self.assertEqual(len(quantity), 1)
+                    self.assertEqual(quantity[0].stage, 0)
+                    self.assertTrue(quantity[0].decisive)
+                route_facts = tuple(
+                    item
+                    for item in decision.comparator_facts
+                    if item.kind == "route_selection"
+                )
+                pairs = {
+                    (item.selected_route_ids, item.compared_route_ids)
+                    for item in route_facts
+                }
+                for pair in pairs:
+                    path = tuple(
+                        sorted(
+                            (
+                                item
+                                for item in route_facts
+                                if (
+                                    item.selected_route_ids,
+                                    item.compared_route_ids,
+                                )
+                                == pair
+                            ),
+                            key=lambda item: item.stage,
+                        )
+                    )
+                    self.assertEqual(
+                        tuple(item.stage for item in path),
+                        tuple(range(1, 8)),
+                    )
+                    self.assertEqual(sum(item.decisive for item in path), 1)
+                    stage_two_outcomes.add(path[1].outcome)
+            provisional = tuple(
+                item
+                for item in artifacts.outputs.alerts
+                if item.category is AlertCategory.ASSUMPTION
+                and "PROVISIONAL_ECONOMIC_AUTONOMY" in item.description
+            )
+            evidence_contract = tuple(
+                item
+                for item in artifacts.outputs.alerts
+                if item.category is AlertCategory.EVIDENCE_CONTRACT
+            )
+            self.assertEqual(len(provisional), 1)
+            self.assertLessEqual(len(evidence_contract), 1)
+            accounting = next(
+                item
+                for item in artifacts.outputs.alerts
+                if item.category is AlertCategory.RUN_ACCOUNTING
+            )
+            parsed_accounting = parse_owned_alert(accounting.description)
+            assert parsed_accounting is not None
+            managed = int(parsed_accounting.body.split("Managed ", 1)[1].split(" ", 1)[0])
+            bucket_sum = int(parsed_accounting.body.split("bucket sum ", 1)[1].split(".", 1)[0])
+            self.assertEqual(bucket_sum, managed)
+
+            for target in artifacts.outputs.purchase_orders:
+                decision = replace(
+                    target.decision,
+                    source_fingerprint=None,
+                    comparator_facts=(),
+                    material_rejections=(),
+                )
+                decision = replace(
+                    decision,
+                    rationale=render_decision_rationale(decision),
+                )
+                assert decision.selected_plan is not None
+                line = next(
+                    item
+                    for item in decision.selected_plan.lines
+                    if item.route_id == target.route_id
+                )
+                record_token = decisions_module._encoded(
+                    decisions_module._legacy_v3_record(decision)
+                )
+                old_marker = decisions_module._po_marker(
+                    key=target.action_key,
+                    demand_digest=target.demand_fingerprint,
+                    route_id=target.route_id,
+                    policy_pack_version=target.policy_pack_version,
+                    line_index=target.line_index,
+                    decision_token=record_token,
+                    version=3,
+                )
+                old_rationale = f"{old_marker} {render_line_rationale(decision, line)}"
+                observed.append(
+                    (source.name, len(target.rationale), len(old_rationale))
+                )
+                self.assertLessEqual(
+                    len(target.rationale) * 100,
+                    len(old_rationale) * 45,
+                )
+                self.assertNotIn(" record=", target.rationale)
+        self.assertTrue(observed)
+        self.assertIn("skipped_condition_b", stage_two_outcomes)
+        self.assertIn("moot_same_domesticity", stage_two_outcomes)
+
+    def test_independent_validator_rejects_rationale_tampering_and_omission(self) -> None:
+        artifacts = run(RuntimeConfig(SOURCE, dry_run=True))
+        decision = next(
+            item
+            for item in artifacts.decisions
+            if any(
+                fact.kind == "route_selection" for fact in item.comparator_facts
+            )
+        )
+        validator = IndependentPlanValidator(
+            artifacts.registry,
+            policy_parameters=artifacts.registry.parameters_for(
+                artifacts.snapshot.configuration.current_date
+            ),
+        )
+        deciding = next(
+            item
+            for item in decision.comparator_facts
+            if item.kind == "route_selection" and item.decisive
+        )
+        tampered_facts = tuple(
+            replace(item, outcome="tampered_outcome")
+            if item is deciding
+            else item
+            for item in decision.comparator_facts
+        )
+        tampered = replace(decision, comparator_facts=tampered_facts)
+        tampered_decisions = tuple(
+            tampered if item.requirement_id == decision.requirement_id else item
+            for item in artifacts.decisions
+        )
+        tampered_validation = validator.validate(
+            artifacts.snapshot,
+            tampered_decisions,
+            artifacts.solver_results,
+        )
+        self.assertIn(
+            "RATIONALE_COMPARATOR_MISMATCH",
+            {item.code for item in tampered_validation.issues},
+        )
+
+        route_path = tuple(
+            item
+            for item in decision.comparator_facts
+            if item.kind == "route_selection"
+        )
+        forged_route = "route-" + "f" * 64
+        route_tampered = replace(
+            decision,
+            comparator_facts=tuple(
+                replace(item, compared_route_ids=(forged_route,))
+                if item.kind == "route_selection"
+                else item
+                for item in decision.comparator_facts
+            ),
+        )
+        rule_tampered = replace(
+            decision,
+            comparator_facts=tuple(
+                replace(
+                    item,
+                    rule_ids=("POL-PROC-001.section_2.approved_supplier",),
+                )
+                if item is deciding
+                else item
+                for item in decision.comparator_facts
+            ),
+        )
+        for changed in (route_tampered, rule_tampered):
+            with self.subTest(comparator_tamper=changed.comparator_facts):
+                validation = validator.validate(
+                    artifacts.snapshot,
+                    tuple(
+                        changed
+                        if item.requirement_id == decision.requirement_id
+                        else item
+                        for item in artifacts.decisions
+                    ),
+                    artifacts.solver_results,
+                )
+                self.assertIn(
+                    "RATIONALE_COMPARATOR_MISMATCH",
+                    {item.code for item in validation.issues},
+                )
+
+        rejection = decision.material_rejections[0]
+        rejection_mutations = (
+            replace(rejection, route_id=forged_route),
+            replace(rejection, reason_code="POLICY_GATE_FAILED"),
+            replace(
+                rejection,
+                rule_ids=("POL-PROC-001.section_2.approved_supplier",),
+            ),
+            replace(rejection, eligibility=EvidenceStatus.FAIL),
+        )
+        for changed_rejection in rejection_mutations:
+            with self.subTest(rejection_tamper=changed_rejection):
+                changed = replace(
+                    decision, material_rejections=(changed_rejection,)
+                )
+                validation = validator.validate(
+                    artifacts.snapshot,
+                    tuple(
+                        changed
+                        if item.requirement_id == decision.requirement_id
+                        else item
+                        for item in artifacts.decisions
+                    ),
+                    artifacts.solver_results,
+                )
+                self.assertIn(
+                    "RATIONALE_MATERIAL_REJECTION_MISMATCH",
+                    {item.code for item in validation.issues},
+                )
+
+        stage_seven = next(item for item in route_path if item.stage == 7)
+        stage_seven_decision = replace(
+            decision,
+            comparator_facts=tuple(
+                replace(item, decisive=False)
+                if item is deciding
+                else replace(
+                    item,
+                    decisive=True,
+                    outcome="selected_lower_id_free_fingerprint",
+                    rule_ids=(),
+                )
+                if item is stage_seven
+                else item
+                for item in decision.comparator_facts
+            ),
+        )
+        rendered = render_decision_rationale(stage_seven_decision)
+        self.assertIn("deciding stage 7 id_free_fingerprint", rendered)
+        self.assertIn("rule IDs [none]", rendered)
+
+        omitted = replace(decision, material_rejections=())
+        omitted_decisions = tuple(
+            omitted if item.requirement_id == decision.requirement_id else item
+            for item in artifacts.decisions
+        )
+        omitted_validation = validator.validate(
+            artifacts.snapshot,
+            omitted_decisions,
+            artifacts.solver_results,
+        )
+        self.assertIn(
+            "RATIONALE_MATERIAL_REJECTION_MISSING",
+            {item.code for item in omitted_validation.issues},
+        )
+
+        hard_artifacts = run(RuntimeConfig(ASSIGNED_SCENARIOS[0], dry_run=True))
+        hard_decision = next(
+            item
+            for item in hard_artifacts.decisions
+            if len(
+                tuple(
+                    rejection
+                    for rejection in item.material_rejections
+                    if rejection.eligibility is EvidenceStatus.FAIL
+                )
+            )
+            >= 2
+        )
+        omitted_hard = replace(
+            hard_decision,
+            material_rejections=hard_decision.material_rejections[1:],
+        )
+        hard_validator = IndependentPlanValidator(
+            hard_artifacts.registry,
+            policy_parameters=hard_artifacts.registry.parameters_for(
+                hard_artifacts.snapshot.configuration.current_date
+            ),
+        )
+        hard_validation = hard_validator.validate(
+            hard_artifacts.snapshot,
+            tuple(
+                omitted_hard
+                if item.requirement_id == hard_decision.requirement_id
+                else item
+                for item in hard_artifacts.decisions
+            ),
+            hard_artifacts.solver_results,
+        )
+        self.assertIn(
+            "RATIONALE_MATERIAL_REJECTION_MISSING",
+            {item.code for item in hard_validation.issues},
+        )
+
+    def test_exact_comparator_reconstruction_handles_multiple_rejected_suppliers(self) -> None:
+        scenario = Path(self.temporary_directory.name) / "multi-rejected.sqlite"
+        shutil.copy2(ASSIGNED_SCENARIOS[0], scenario)
+        with closing(sqlite3.connect(scenario)) as connection:
+            connection.execute(
+                "UPDATE suppliers SET country = 'Canada', is_domestic = 1 "
+                "WHERE supplier_id = 'SUP-104'"
+            )
+            connection.commit()
+        artifacts = run(RuntimeConfig(scenario, dry_run=True))
+        decision = next(
+            item
+            for item in artifacts.decisions
+            if len(
+                {
+                    fact.compared_route_ids
+                    for fact in item.comparator_facts
+                    if fact.kind == "route_selection"
+                }
+            )
+            >= 2
+        )
+        pairs = {
+            fact.compared_route_ids
+            for fact in decision.comparator_facts
+            if fact.kind == "route_selection"
+        }
+        self.assertGreaterEqual(len(pairs), 2)
+        for pair in pairs:
+            path = tuple(
+                fact
+                for fact in decision.comparator_facts
+                if fact.compared_route_ids == pair
+            )
+            self.assertEqual({fact.stage for fact in path}, set(range(1, 8)))
+
     def test_production_contract_preserves_evidence_blocked_dispositions_on_all_scenarios(self) -> None:
         for source in ALL_SCENARIOS:
             with self.subTest(scenario=source.name):
@@ -327,12 +672,26 @@ class AssembledCliTests(unittest.TestCase):
                     sum("category=RUN_ACCOUNTING" in item for item in descriptions),
                     1,
                 )
+                accounting_description = next(
+                    item
+                    for item in descriptions
+                    if "category=RUN_ACCOUNTING" in item
+                )
+                accounting = parse_owned_alert(accounting_description)
+                assert accounting is not None
+                managed = int(
+                    accounting.body.split("Managed ", 1)[1].split(" ", 1)[0]
+                )
+                bucket_sum = int(
+                    accounting.body.split("bucket sum ", 1)[1].split(".", 1)[0]
+                )
+                self.assertEqual(bucket_sum, managed)
                 assumption_descriptions = tuple(
                     item
                     for item in descriptions
                     if "category=ASSUMPTION" in item
                 )
-                self.assertTrue(assumption_descriptions)
+                self.assertEqual(len(assumption_descriptions), 1)
                 self.assertTrue(
                     all(
                         "PROVISIONAL_ECONOMIC_AUTONOMY" in item
@@ -344,6 +703,13 @@ class AssembledCliTests(unittest.TestCase):
                         "ROLLING_HISTORY_UNKNOWN" in item
                         for item in assumption_descriptions
                     )
+                )
+                self.assertEqual(
+                    sum(
+                        "category=EVIDENCE_CONTRACT" in item
+                        for item in descriptions
+                    ),
+                    1,
                 )
                 self.assertFalse(
                     any(
@@ -359,13 +725,12 @@ class AssembledCliTests(unittest.TestCase):
                             for item in descriptions
                         )
                     )
-                    self.assertTrue(
-                        any(
-                            "category=EVIDENCE_CONTRACT" in item
-                            and f"Component {component_id}" in item
-                            for item in descriptions
-                        )
+                    global_evidence = next(
+                        item
+                        for item in descriptions
+                        if "category=EVIDENCE_CONTRACT" in item
                     )
+                    self.assertIn(component_id, global_evidence)
                 self.assertFalse(
                     any(
                         "relied on assumption" in item
@@ -832,6 +1197,51 @@ class AssembledCliTests(unittest.TestCase):
         self.assertEqual(changed.returncode, 0, changed.stderr)
         self.assertIn('"no_op":false', changed.stdout)
         self.assertTrue(orders_after_first < orders_after_change)
+
+    def test_changed_alternative_route_keeps_old_po_physical_without_duplicate_demand(self) -> None:
+        scenario = Path(self.temporary_directory.name) / "changed-alternative.sqlite"
+        shutil.copy2(SOURCE, scenario)
+        arguments = (
+            "--scenario",
+            str(scenario),
+            "--contract=benchmark",
+            "--llm=off",
+            "--json",
+        )
+
+        first = self.command(*arguments)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        orders_after_first = output_rows(scenario)[0]
+        cmp016_before = tuple(
+            row for row in orders_after_first if row[1] == "CMP-016"
+        )
+        self.assertEqual(len(cmp016_before), 1)
+        self.assertIn(" source=", cmp016_before[0][7])
+        self.assertNotIn(" record=", cmp016_before[0][7])
+
+        with closing(sqlite3.connect(scenario)) as connection, connection:
+            connection.execute(
+                "UPDATE supplier_catalog SET unit_price = ? "
+                "WHERE component_id = ? AND supplier_id = ?",
+                ("10.0", "CMP-016", "SUP-109"),
+            )
+
+        changed = self.command(*arguments)
+        self.assertEqual(changed.returncode, 0, changed.stderr)
+        changed_payload = json.loads(changed.stdout)
+        cmp016_decision = next(
+            item
+            for item in changed_payload["decisions"]
+            if item["component_id"] == "CMP-016"
+        )
+        cmp016_after = tuple(
+            row for row in output_rows(scenario)[0] if row[1] == "CMP-016"
+        )
+
+        self.assertEqual(cmp016_after, cmp016_before)
+        self.assertIsNone(cmp016_decision["selected_plan"])
+        self.assertEqual(cmp016_decision["residual_gap"], "0")
+        self.assertFalse(changed_payload["commit"]["no_op"])
 
     def test_default_contract_reconciles_optimizer_and_validator_objectives(self) -> None:
         scenario = Path(self.temporary_directory.name) / "scenario_objective.sqlite"
@@ -1319,8 +1729,8 @@ class AssembledCliTests(unittest.TestCase):
         recompile = self.command(
             "--scenario", str(self.path), "--recompile-policy"
         )
-        self.assertEqual(recompile.returncode, 4)
-        self.assertIn("reviewed compiled policy pack", recompile.stderr)
+        self.assertEqual(recompile.returncode, 2)
+        self.assertIn("unrecognized arguments: --recompile-policy", recompile.stderr)
 
 
 if __name__ == "__main__":

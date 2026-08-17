@@ -33,7 +33,6 @@ class RuntimeConfig:
     scenario_path: Path
     contract: EvidenceContract = EvidenceContract.BENCHMARK
     model_mode: ModelMode = ModelMode.OFF
-    recompile_policy: bool = False
     dry_run: bool = False
     explain_component_id: str | None = None
     strict: bool = False
@@ -52,4 +51,3 @@ class RuntimeConfig:
 
 
 __all__ = ["EvidenceContract", "ModelMode", "RuntimeConfig"]
-

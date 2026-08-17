@@ -12,13 +12,17 @@ from hashlib import sha256
 from pathlib import Path
 import re
 import sqlite3
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
+from .config import EvidenceContract
 from .domain import (
     AlertCategory,
+    CandidateRoute,
     CommitResult,
     DecisionRecord,
+    DemandBucket,
     ExistingPurchaseOrder,
+    InboundSupply,
     PlanLine,
     RouteInputIssue,
     ScenarioSnapshot,
@@ -45,15 +49,23 @@ from .repository import (
 from .serialization import canonical_dumps, canonical_loads
 
 
-PO_MARKER_VERSION = 3
-_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, 2, PO_MARKER_VERSION})
+PO_MARKER_VERSION = 4
+_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, 2, 3, PO_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
 _TOKEN = r"[A-Za-z0-9_-]+"
-_PO_MARKER = re.compile(
+_LEGACY_PO_MARKER = re.compile(
     rf"\A\[APEX_AGENT:v(?P<version>[0-9]+) action=(?P<action>{_HEX_64}) "
     rf"demand=(?P<demand>{_HEX_64}) route=(?P<route>{_TOKEN}) "
     rf"policy=(?P<policy>{_TOKEN}) line=(?P<line>[0-9]+) "
     rf"record=(?P<record>{_TOKEN})\]"
+)
+_COMPACT_PO_MARKER = re.compile(
+    rf"\A\[APEX_AGENT:v(?P<version>[0-9]+) action=(?P<action>{_HEX_64}) "
+    rf"demand=(?P<demand>{_HEX_64}) source=(?P<source>{_HEX_64}) "
+    rf"contract=(?P<contract>{_TOKEN}) requirement=(?P<requirement>{_TOKEN}) "
+    rf"route=(?P<route>{_TOKEN}) policy=(?P<policy>{_TOKEN}) "
+    rf"line=(?P<line>[0-9]+)/(?P<line_count>[1-9][0-9]*) "
+    rf"group=(?P<group>{_HEX_64}) fields=(?P<fields>{_HEX_64})\]"
 )
 
 
@@ -92,6 +104,8 @@ class CommitStep(str, Enum):
 class PurchaseOrderOutput:
     action_key: str
     demand_fingerprint: str
+    source_fingerprint: str | None
+    evidence_contract: EvidenceContract
     policy_pack_version: str
     route_id: str
     line_index: int
@@ -112,6 +126,12 @@ class PurchaseOrderOutput:
         ):
             if not re.fullmatch(_HEX_64, digest):
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+        if self.source_fingerprint is not None and not re.fullmatch(
+            _HEX_64, self.source_fingerprint
+        ):
+            raise ValueError("source_fingerprint must be a lowercase SHA-256 digest or None")
+        if not isinstance(self.evidence_contract, EvidenceContract):
+            raise TypeError("evidence_contract must be EvidenceContract")
         if self.po_number != po_number_for_action(self.action_key):
             raise ValueError("po_number does not match the action key")
         if not isinstance(self.line_index, int) or isinstance(self.line_index, bool):
@@ -137,10 +157,16 @@ class PurchaseOrderOutput:
 class ParsedOwnedPurchaseOrder:
     action_key: str
     demand_fingerprint: str
+    source_fingerprint: str | None
+    evidence_contract: EvidenceContract | None
     policy_pack_version: str
     route_id: str
     line_index: int
-    decision: DecisionRecord
+    line_count: int
+    requirement_id: str
+    group_digest: str
+    field_digest: str
+    decision: DecisionRecord | None
     marker_version: int
 
 
@@ -187,13 +213,27 @@ def demand_fingerprint(decision: DecisionRecord) -> str:
 
     if not isinstance(decision, DecisionRecord):
         raise TypeError("decision must be DecisionRecord")
+    return demand_fingerprint_from_facts(
+        decision.demand_buckets,
+        decision.supply_ledger.on_hand,
+        decision.supply_ledger.committed_inbound,
+    )
+
+
+def demand_fingerprint_from_facts(
+    demand_buckets: Sequence[DemandBucket],
+    on_hand: Decimal,
+    committed_inbound: Sequence[InboundSupply],
+) -> str:
+    """Hash current demand/netting facts without requiring a DecisionRecord."""
+
     demand = sorted(
         (
             contribution.order_id,
             bucket.due_date.isoformat(),
             _canonical_decimal(contribution.quantity),
         )
-        for bucket in decision.demand_buckets
+        for bucket in demand_buckets
         for contribution in bucket.contributions
     )
     inbound = sorted(
@@ -206,15 +246,125 @@ def demand_fingerprint(decision: DecisionRecord) -> str:
             item.order_date.isoformat() if item.order_date is not None else None,
             _canonical_decimal(item.unit_price) if item.unit_price is not None else None,
         )
-        for item in decision.supply_ledger.committed_inbound
+        for item in committed_inbound
         if not item.agent_owned
     )
     payload = canonical_dumps(
         {
             "version": 1,
             "demand": demand,
-            "on_hand": _canonical_decimal(decision.supply_ledger.on_hand),
+            "on_hand": _canonical_decimal(on_hand),
             "counted_external_inbound": inbound,
+        }
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def component_source_fingerprint(
+    snapshot: ScenarioSnapshot,
+    component_id: str,
+    policy_pack_version: str,
+    evidence_contract: EvidenceContract,
+    *,
+    policy_concepts_version: str = "",
+    candidate_routes: Sequence[CandidateRoute] = (),
+    candidate_rejections: Sequence[object] = (),
+    candidate_alerts: Sequence[object] = (),
+) -> str:
+    """Bind ownership to every source fact that can change a component choice.
+
+    Managed output rows are deliberately excluded.  Existing external orders
+    for relevant suppliers remain included because rolling history, capacity,
+    and physical inbound can change route eligibility or ranking.
+    """
+
+    if not isinstance(snapshot, ScenarioSnapshot):
+        raise TypeError("snapshot must be ScenarioSnapshot")
+    if not isinstance(component_id, str) or not component_id:
+        raise ValueError("component_id must be non-empty text")
+    if not isinstance(policy_pack_version, str) or not policy_pack_version:
+        raise ValueError("policy_pack_version must be non-empty text")
+    if not isinstance(evidence_contract, EvidenceContract):
+        raise TypeError("evidence_contract must be EvidenceContract")
+    if not isinstance(policy_concepts_version, str):
+        raise TypeError("policy_concepts_version must be str")
+    route_facts = tuple(
+        item for item in candidate_routes if item.component_id == component_id
+    )
+    rejection_facts = tuple(
+        item
+        for item in candidate_rejections
+        if getattr(item, "component_id", None) == component_id
+    )
+    alert_facts = tuple(
+        item
+        for item in candidate_alerts
+        if getattr(item, "component_id", None) in {None, component_id}
+    )
+    components = tuple(
+        item for item in snapshot.components if item.component_id == component_id
+    )
+    if len(components) != 1:
+        raise DecisionError(
+            f"component source fingerprint requires exactly one {component_id!r} row"
+        )
+    bom_lines = tuple(
+        item for item in snapshot.bom_lines if item.component_id == component_id
+    )
+    product_ids = {item.product_id for item in bom_lines}
+    catalog_lines = tuple(
+        item for item in snapshot.catalog_lines if item.component_id == component_id
+    )
+    issue_suppliers = {
+        issue.supplier_id
+        for issue in snapshot.route_input_issues
+        if component_id in issue.affected_component_ids
+    }
+    supplier_ids = {
+        item.supplier_id for item in catalog_lines
+    } | issue_suppliers
+    external_orders = tuple(
+        order
+        for order in snapshot.purchase_orders
+        if parse_owned_purchase_order(order) is None
+        and (
+            order.component_id == component_id
+            or order.supplier_id in supplier_ids
+        )
+    )
+    payload = canonical_dumps(
+        {
+            "version": 1,
+            "policy_pack_version": policy_pack_version,
+            "policy_concepts_version": policy_concepts_version,
+            "evidence_contract": evidence_contract,
+            "configuration": snapshot.configuration,
+            "component": components[0],
+            "products": tuple(
+                item for item in snapshot.products if item.product_id in product_ids
+            ),
+            "bom_lines": bom_lines,
+            "production_orders": tuple(
+                item
+                for item in snapshot.production_orders
+                if item.product_id in product_ids
+            ),
+            "inventory": tuple(
+                item for item in snapshot.inventory if item.component_id == component_id
+            ),
+            "suppliers": tuple(
+                item for item in snapshot.suppliers if item.supplier_id in supplier_ids
+            ),
+            "catalog_lines": catalog_lines,
+            "external_purchase_orders": external_orders,
+            "route_input_issues": tuple(
+                issue
+                for issue in snapshot.route_input_issues
+                if component_id in issue.affected_component_ids
+            ),
+            "candidate_routes": route_facts,
+            "candidate_rejections": rejection_facts,
+            "candidate_alerts": alert_facts,
         }
     )
     return sha256(payload.encode("utf-8")).hexdigest()
@@ -272,6 +422,9 @@ def _legacy_v1_record(decision: DecisionRecord) -> str:
     """Serialize exactly the DecisionRecord schema embedded by marker v1."""
 
     primitive = canonical_loads(canonical_dumps(decision), dict)
+    primitive.pop("comparator_facts", None)
+    primitive.pop("material_rejections", None)
+    primitive.pop("source_fingerprint", None)
     primitive.pop("deadline_lateness", None)
     ledger = primitive.get("supply_ledger")
     if isinstance(ledger, dict):
@@ -301,6 +454,9 @@ def _legacy_v2_record(decision: DecisionRecord) -> str:
     """Serialize the pre-R03 record schema without line approval fields."""
 
     primitive = canonical_loads(canonical_dumps(decision), dict)
+    primitive.pop("comparator_facts", None)
+    primitive.pop("material_rejections", None)
+    primitive.pop("source_fingerprint", None)
     plans = [primitive.get("selected_plan")]
     alternatives = primitive.get("alternatives")
     if isinstance(alternatives, list):
@@ -314,6 +470,16 @@ def _legacy_v2_record(decision: DecisionRecord) -> str:
         for line in lines:
             if isinstance(line, dict):
                 line.pop("approval_rule_ids", None)
+    return canonical_dumps(primitive)
+
+
+def _legacy_v3_record(decision: DecisionRecord) -> str:
+    """Serialize the pre-R07 record schema embedded by marker v3."""
+
+    primitive = canonical_loads(canonical_dumps(decision), dict)
+    primitive.pop("comparator_facts", None)
+    primitive.pop("material_rejections", None)
+    primitive.pop("source_fingerprint", None)
     return canonical_dumps(primitive)
 
 
@@ -382,7 +548,100 @@ def _po_marker(
     )
 
 
-def _purchase_order_output(
+def _compact_field_digest(
+    *,
+    action_digest: str,
+    demand_digest: str,
+    source_digest: str,
+    evidence_contract: EvidenceContract,
+    requirement_id: str,
+    route_id: str,
+    policy_pack_version: str,
+    line_index: int,
+    line_count: int,
+    po_number: str,
+    component_id: str,
+    supplier_id: str,
+    quantity: Decimal,
+    unit_price: Decimal,
+    order_date: date,
+    expected_delivery_date: date,
+    rationale_body: str,
+) -> str:
+    payload = canonical_dumps(
+        {
+            "version": 1,
+            "action": action_digest,
+            "demand": demand_digest,
+            "source": source_digest,
+            "evidence_contract": evidence_contract,
+            "requirement": requirement_id,
+            "route": route_id,
+            "policy": policy_pack_version,
+            "line": line_index,
+            "line_count": line_count,
+            "po_number": po_number,
+            "component": component_id,
+            "supplier": supplier_id,
+            "quantity": _canonical_decimal(quantity),
+            "unit_price": _canonical_decimal(unit_price),
+            "order_date": order_date,
+            "expected_delivery_date": expected_delivery_date,
+            "rationale_body": rationale_body,
+        }
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compact_group_digest(
+    *,
+    requirement_id: str,
+    demand_digest: str,
+    source_digest: str,
+    evidence_contract: EvidenceContract,
+    policy_pack_version: str,
+    line_count: int,
+    lines: Sequence[tuple[int, str, str, str]],
+) -> str:
+    payload = canonical_dumps(
+        {
+            "version": 1,
+            "requirement": requirement_id,
+            "demand": demand_digest,
+            "source": source_digest,
+            "evidence_contract": evidence_contract,
+            "policy": policy_pack_version,
+            "line_count": line_count,
+            "lines": tuple(sorted(lines)),
+        }
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compact_po_marker(
+    *,
+    key: str,
+    demand_digest: str,
+    source_digest: str,
+    evidence_contract: EvidenceContract,
+    requirement_id: str,
+    route_id: str,
+    policy_pack_version: str,
+    line_index: int,
+    line_count: int,
+    group_digest: str,
+    field_digest: str,
+) -> str:
+    return (
+        f"[APEX_AGENT:v{PO_MARKER_VERSION} action={key} demand={demand_digest} "
+        f"source={source_digest} contract={_encoded(evidence_contract.value)} "
+        f"requirement={_encoded(requirement_id)} route={_encoded(route_id)} "
+        f"policy={_encoded(policy_pack_version)} line={line_index}/{line_count} "
+        f"group={group_digest} fields={field_digest}]"
+    )
+
+
+def _legacy_purchase_order_output(
     decision: DecisionRecord,
     line: PlanLine,
     line_index: int,
@@ -420,6 +679,8 @@ def _purchase_order_output(
     return PurchaseOrderOutput(
         action_key=key,
         demand_fingerprint=demand_digest,
+        source_fingerprint=None,
+        evidence_contract=decision.evidence_contract,
         policy_pack_version=policy_pack_version,
         route_id=line.route_id,
         line_index=line_index,
@@ -432,6 +693,116 @@ def _purchase_order_output(
         expected_delivery_date=line.expected_delivery_date,
         rationale=rationale,
         decision=decision,
+    )
+
+
+def _purchase_order_outputs(
+    decision: DecisionRecord,
+    policy_pack_version: str,
+) -> tuple[PurchaseOrderOutput, ...]:
+    if decision.selected_plan is None:
+        return ()
+    if _is_legacy_v1_decision(decision):
+        return tuple(
+            _legacy_purchase_order_output(
+                decision,
+                line,
+                line_index,
+                policy_pack_version,
+            )
+            for line_index, line in enumerate(decision.selected_plan.lines)
+        )
+
+    demand_digest = demand_fingerprint(decision)
+    source_digest = decision.source_fingerprint
+    if source_digest is None:
+        raise DecisionError(
+            f"selected decision {decision.requirement_id} lacks a component source fingerprint"
+        )
+    lines = decision.selected_plan.lines
+    line_count = len(lines)
+    prepared: list[tuple[PlanLine, int, str, str, str, str]] = []
+    for line_index, line in enumerate(lines):
+        key = action_key(
+            demand_digest,
+            line.component_id,
+            line.supplier_id,
+            line.route_id,
+            line.order_date,
+            policy_pack_version,
+        )
+        number = po_number_for_action(key)
+        rationale_body = render_line_rationale(decision, line)
+        field_digest = _compact_field_digest(
+            action_digest=key,
+            demand_digest=demand_digest,
+            source_digest=source_digest,
+            evidence_contract=decision.evidence_contract,
+            requirement_id=decision.requirement_id,
+            route_id=line.route_id,
+            policy_pack_version=policy_pack_version,
+            line_index=line_index,
+            line_count=line_count,
+            po_number=number,
+            component_id=line.component_id,
+            supplier_id=line.supplier_id,
+            quantity=line.quantity,
+            unit_price=line.unit_price,
+            order_date=line.order_date,
+            expected_delivery_date=line.expected_delivery_date,
+            rationale_body=rationale_body,
+        )
+        prepared.append(
+            (line, line_index, key, number, rationale_body, field_digest)
+        )
+    group_digest = _compact_group_digest(
+        requirement_id=decision.requirement_id,
+        demand_digest=demand_digest,
+        source_digest=source_digest,
+        evidence_contract=decision.evidence_contract,
+        policy_pack_version=policy_pack_version,
+        line_count=line_count,
+        lines=tuple(
+            (line_index, key, line.route_id, field_digest)
+            for line, line_index, key, _number, _body, field_digest in prepared
+        ),
+    )
+    return tuple(
+        PurchaseOrderOutput(
+            action_key=key,
+            demand_fingerprint=demand_digest,
+            source_fingerprint=source_digest,
+            evidence_contract=decision.evidence_contract,
+            policy_pack_version=policy_pack_version,
+            route_id=line.route_id,
+            line_index=line_index,
+            po_number=number,
+            component_id=line.component_id,
+            supplier_id=line.supplier_id,
+            quantity=line.quantity,
+            unit_price=line.unit_price,
+            order_date=line.order_date,
+            expected_delivery_date=line.expected_delivery_date,
+            rationale=(
+                _compact_po_marker(
+                    key=key,
+                    demand_digest=demand_digest,
+                    source_digest=source_digest,
+                    evidence_contract=decision.evidence_contract,
+                    requirement_id=decision.requirement_id,
+                    route_id=line.route_id,
+                    policy_pack_version=policy_pack_version,
+                    line_index=line_index,
+                    line_count=line_count,
+                    group_digest=group_digest,
+                    field_digest=field_digest,
+                )
+                + " "
+                + rationale_body
+            ),
+            decision=decision,
+        )
+        for line, line_index, key, number, rationale_body, field_digest in prepared
     )
 
 
@@ -457,10 +828,7 @@ def build_decision_outputs(
         raise DecisionError("all managed decisions in one run must use one evidence contract")
     orders: list[PurchaseOrderOutput] = []
     for decision in records:
-        if decision.selected_plan is None:
-            continue
-        for index, line in enumerate(decision.selected_plan.lines):
-            orders.append(_purchase_order_output(decision, line, index, policy_pack_version))
+        orders.extend(_purchase_order_outputs(decision, policy_pack_version))
     by_key: dict[str, PurchaseOrderOutput] = {}
     by_number: dict[str, PurchaseOrderOutput] = {}
     for order in orders:
@@ -495,7 +863,9 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         raise TypeError("order must be ExistingPurchaseOrder")
     rationale = order.rationale or ""
     claims_ownership = order.po_number.startswith("APX-") or "[APEX_AGENT:" in rationale
-    match = _PO_MARKER.match(rationale)
+    compact = _COMPACT_PO_MARKER.match(rationale)
+    legacy = _LEGACY_PO_MARKER.match(rationale)
+    match = compact or legacy
     if match is None:
         if claims_ownership:
             raise OwnershipMarkerError(
@@ -510,6 +880,99 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         raise OwnershipMarkerError(
             f"purchase order {order.po_number} has an invalid ownership marker version or number"
         )
+    if compact is not None:
+        if marker_version != PO_MARKER_VERSION:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} has an invalid compact marker version"
+            )
+        route_id = _decoded(match.group("route"), "route")
+        policy_version = _decoded(match.group("policy"), "policy")
+        try:
+            evidence_contract = EvidenceContract(
+                _decoded(match.group("contract"), "contract")
+            )
+        except ValueError as error:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} has an invalid evidence contract"
+            ) from error
+        requirement_id = _decoded(match.group("requirement"), "requirement")
+        line_index = int(match.group("line"))
+        line_count = int(match.group("line_count"))
+        if line_index >= line_count:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} line index is outside its compact group"
+            )
+        if (
+            order.unit_price is None
+            or order.order_date is None
+            or order.expected_delivery_date is None
+        ):
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} has incomplete owned business fields"
+            )
+        demand_digest = match.group("demand")
+        source_digest = match.group("source")
+        key = action_key(
+            demand_digest,
+            order.component_id,
+            order.supplier_id,
+            route_id,
+            order.order_date,
+            policy_version,
+        )
+        if match.group("action") != key or order.po_number != po_number_for_action(key):
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} action key or short number is invalid"
+            )
+        marker_end = match.end()
+        if rationale[marker_end : marker_end + 1] != " " or not rationale[marker_end + 1 :]:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} has a missing compact rationale body"
+            )
+        rationale_body = rationale[marker_end + 1 :]
+        field_digest = _compact_field_digest(
+            action_digest=key,
+            demand_digest=demand_digest,
+            source_digest=source_digest,
+            evidence_contract=evidence_contract,
+            requirement_id=requirement_id,
+            route_id=route_id,
+            policy_pack_version=policy_version,
+            line_index=line_index,
+            line_count=line_count,
+            po_number=order.po_number,
+            component_id=order.component_id,
+            supplier_id=order.supplier_id,
+            quantity=order.quantity,
+            unit_price=order.unit_price,
+            order_date=order.order_date,
+            expected_delivery_date=order.expected_delivery_date,
+            rationale_body=rationale_body,
+        )
+        if match.group("fields") != field_digest:
+            raise OwnershipMarkerError(
+                f"purchase order {order.po_number} compact marker does not validate against stored business fields"
+            )
+        return ParsedOwnedPurchaseOrder(
+            action_key=key,
+            demand_fingerprint=demand_digest,
+            source_fingerprint=source_digest,
+            evidence_contract=evidence_contract,
+            policy_pack_version=policy_version,
+            route_id=route_id,
+            line_index=line_index,
+            line_count=line_count,
+            requirement_id=requirement_id,
+            group_digest=match.group("group"),
+            field_digest=field_digest,
+            decision=None,
+            marker_version=marker_version,
+        )
+
+    if marker_version not in {1, 2, 3}:
+        raise OwnershipMarkerError(
+            f"purchase order {order.po_number} has an invalid legacy marker version"
+        )
     route_id = _decoded(match.group("route"), "route")
     policy_version = _decoded(match.group("policy"), "policy")
     record_json = _decoded(match.group("record"), "record")
@@ -517,10 +980,6 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
     try:
         decision = canonical_loads(record_json, DecisionRecord)
     except (TypeError, ValueError) as strict_error:
-        if marker_version not in {1, 2}:
-            raise OwnershipMarkerError(
-                f"purchase order {order.po_number} contains an invalid decision record"
-            ) from strict_error
         try:
             decision = _load_legacy_decision(record_json)
             legacy_schema_version = marker_version
@@ -533,6 +992,8 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
         if legacy_schema_version == 1
         else _legacy_v2_record(decision)
         if legacy_schema_version == 2
+        else _legacy_v3_record(decision)
+        if legacy_schema_version == 3
         else canonical_dumps(decision)
     )
     if _encoded(expected_record) != match.group("record"):
@@ -619,20 +1080,37 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
     return ParsedOwnedPurchaseOrder(
         action_key=key,
         demand_fingerprint=demand_digest,
+        source_fingerprint=None,
+        evidence_contract=None,
         policy_pack_version=policy_version,
         route_id=route_id,
         line_index=line_index,
+        line_count=len(decision.selected_plan.lines),
+        requirement_id=decision.requirement_id,
+        group_digest=sha256(record_json.encode("utf-8")).hexdigest(),
+        field_digest=sha256(expected_rationale.encode("utf-8")).hexdigest(),
         decision=decision,
         marker_version=marker_version,
     )
 
 
-def reconstruct_managed_decisions(snapshot: ScenarioSnapshot) -> tuple[DecisionRecord, ...]:
-    """Rebuild and cross-check prior managed records from validated PO rationales."""
+@dataclass(frozen=True, slots=True)
+class _ManagedPurchaseOrderGroup:
+    requirement_id: str
+    demand_fingerprint: str
+    source_fingerprint: str | None
+    evidence_contract: EvidenceContract | None
+    policy_pack_version: str
+    group_digest: str
+    line_count: int
+    rows: tuple[tuple[ExistingPurchaseOrder, ParsedOwnedPurchaseOrder], ...]
+    legacy_decision: DecisionRecord | None = None
 
-    if not isinstance(snapshot, ScenarioSnapshot):
-        raise TypeError("snapshot must be ScenarioSnapshot")
-    groups: dict[str, tuple[DecisionRecord, set[int]]] = {}
+
+def _managed_purchase_order_groups(
+    snapshot: ScenarioSnapshot,
+) -> tuple[_ManagedPurchaseOrderGroup, ...]:
+    groups: dict[str, list[tuple[ExistingPurchaseOrder, ParsedOwnedPurchaseOrder]]] = {}
     action_keys: dict[str, ExistingPurchaseOrder] = {}
     for order in snapshot.purchase_orders:
         parsed = parse_owned_purchase_order(order)
@@ -644,21 +1122,227 @@ def reconstruct_managed_decisions(snapshot: ScenarioSnapshot) -> tuple[DecisionR
                 f"full action key {parsed.action_key} is reused by {prior.po_number} and {order.po_number}"
             )
         action_keys[parsed.action_key] = order
-        token = canonical_dumps(parsed.decision)
-        if token not in groups:
-            groups[token] = (parsed.decision, set())
-        groups[token][1].add(parsed.line_index)
-    records: list[DecisionRecord] = []
-    for token in sorted(groups):
-        record, indexes = groups[token]
-        assert record.selected_plan is not None
-        expected = set(range(len(record.selected_plan.lines)))
-        if indexes != expected:
-            raise OwnershipMarkerError(
-                f"managed record {record.requirement_id} is missing or duplicates selected lines"
+        groups.setdefault(parsed.group_digest, []).append((order, parsed))
+
+    result: list[_ManagedPurchaseOrderGroup] = []
+    for group_digest, raw_rows in sorted(groups.items()):
+        rows = tuple(sorted(raw_rows, key=lambda item: item[1].line_index))
+        first = rows[0][1]
+        facts = {
+            (
+                parsed.requirement_id,
+                parsed.demand_fingerprint,
+                parsed.source_fingerprint,
+                parsed.evidence_contract,
+                parsed.policy_pack_version,
+                parsed.line_count,
+                parsed.marker_version,
             )
-        records.append(record)
-    return tuple(sorted(records, key=lambda item: (item.requirement_id, item.component_id)))
+            for _order, parsed in rows
+        }
+        if len(facts) != 1:
+            raise OwnershipMarkerError(
+                f"managed group {group_digest} has inconsistent compact metadata"
+            )
+        indexes = tuple(parsed.line_index for _order, parsed in rows)
+        if indexes != tuple(range(first.line_count)):
+            raise OwnershipMarkerError(
+                f"managed record {first.requirement_id} has an incomplete or duplicate line group"
+            )
+        legacy_decisions = {
+            canonical_dumps(parsed.decision): parsed.decision
+            for _order, parsed in rows
+            if parsed.decision is not None
+        }
+        if first.marker_version == PO_MARKER_VERSION:
+            if first.source_fingerprint is None or first.evidence_contract is None:
+                raise OwnershipMarkerError(
+                    f"managed record {first.requirement_id} lacks compact source metadata"
+                )
+            expected_group = _compact_group_digest(
+                requirement_id=first.requirement_id,
+                demand_digest=first.demand_fingerprint,
+                source_digest=first.source_fingerprint,
+                evidence_contract=first.evidence_contract,
+                policy_pack_version=first.policy_pack_version,
+                line_count=first.line_count,
+                lines=tuple(
+                    (
+                        parsed.line_index,
+                        parsed.action_key,
+                        parsed.route_id,
+                        parsed.field_digest,
+                    )
+                    for _order, parsed in rows
+                ),
+            )
+            if expected_group != group_digest:
+                raise OwnershipMarkerError(
+                    f"managed record {first.requirement_id} has a forged compact group digest"
+                )
+            legacy_decision = None
+        else:
+            if len(legacy_decisions) != 1:
+                raise OwnershipMarkerError(
+                    f"managed record {first.requirement_id} has inconsistent legacy decisions"
+                )
+            legacy_decision = next(iter(legacy_decisions.values()))
+        result.append(
+            _ManagedPurchaseOrderGroup(
+                requirement_id=first.requirement_id,
+                demand_fingerprint=first.demand_fingerprint,
+                source_fingerprint=first.source_fingerprint,
+                evidence_contract=first.evidence_contract,
+                policy_pack_version=first.policy_pack_version,
+                group_digest=group_digest,
+                line_count=first.line_count,
+                rows=rows,
+                legacy_decision=legacy_decision,
+            )
+        )
+    return tuple(result)
+
+
+def current_managed_order_numbers(
+    snapshot: ScenarioSnapshot,
+    demand_fingerprints: Mapping[str, str],
+    policy_pack_version: str,
+    evidence_contract: EvidenceContract,
+    routes: Sequence[CandidateRoute],
+    *,
+    policy_concepts_version: str = "",
+    candidate_rejections: Sequence[object] = (),
+    candidate_alerts: Sequence[object] = (),
+) -> frozenset[str]:
+    """Identify complete current actions eligible for fresh reconstruction.
+
+    Only exact current demand, policy, route, price, and date matches qualify.
+    Everything else remains in the planning snapshot as an independently
+    counted prior commitment.
+    """
+
+    if not isinstance(snapshot, ScenarioSnapshot):
+        raise TypeError("snapshot must be ScenarioSnapshot")
+    if not isinstance(policy_pack_version, str) or not policy_pack_version:
+        raise ValueError("policy_pack_version must be non-empty text")
+    if not isinstance(evidence_contract, EvidenceContract):
+        raise TypeError("evidence_contract must be EvidenceContract")
+    route_by_id = {route.route_id: route for route in routes}
+    if len(route_by_id) != len(tuple(routes)):
+        raise DecisionError("candidate routes contain duplicate route IDs")
+    result: set[str] = set()
+    for group in _managed_purchase_order_groups(snapshot):
+        # Legacy markers have no all-candidate source digest.  Their embedded
+        # selected route is insufficient proof that removing them is safe.
+        if group.legacy_decision is not None:
+            continue
+        first_order = group.rows[0][0]
+        if (
+            group.policy_pack_version != policy_pack_version
+            or group.evidence_contract is not evidence_contract
+            or demand_fingerprints.get(first_order.component_id)
+            != group.demand_fingerprint
+            or group.source_fingerprint
+            != component_source_fingerprint(
+                snapshot,
+                first_order.component_id,
+                policy_pack_version,
+                evidence_contract,
+                policy_concepts_version=policy_concepts_version,
+                candidate_routes=routes,
+                candidate_rejections=candidate_rejections,
+                candidate_alerts=candidate_alerts,
+            )
+        ):
+            continue
+        current = True
+        for order, parsed in group.rows:
+            route = route_by_id.get(parsed.route_id)
+            current = current and (
+                route is not None
+                and route.component_id == order.component_id
+                and route.supplier_id == order.supplier_id
+                and route.may_enter_executable_model
+                and order.unit_price == route.unit_price
+                and order.order_date == route.order_date
+                and order.expected_delivery_date == route.expected_delivery_date
+                and order.quantity >= route.minimum_order_quantity
+            )
+        if current:
+            result.update(order.po_number for order, _parsed in group.rows)
+    return frozenset(result)
+
+
+def reconstruct_managed_decisions(
+    snapshot: ScenarioSnapshot,
+    planned_decisions: Sequence[DecisionRecord] | None = None,
+    policy_pack_version: str | None = None,
+) -> tuple[DecisionRecord, ...]:
+    """Reconstruct current managed actions from fresh, validated plan records.
+
+    Legacy v1-v3 payloads remain strictly parseable, but are returned directly
+    only for compatibility callers that have no compact rows.  Compact v4 rows
+    intentionally contain no decision payload and therefore require the fresh
+    independently validated records that are authoritative for the current run.
+    """
+
+    if not isinstance(snapshot, ScenarioSnapshot):
+        raise TypeError("snapshot must be ScenarioSnapshot")
+    groups = _managed_purchase_order_groups(snapshot)
+    if planned_decisions is None:
+        if any(group.legacy_decision is None for group in groups):
+            raise DecisionError(
+                "compact managed rows require fresh validated decisions for reconstruction"
+            )
+        return tuple(
+            sorted(
+                (group.legacy_decision for group in groups if group.legacy_decision is not None),
+                key=lambda item: (item.requirement_id, item.component_id),
+            )
+        )
+    if not isinstance(policy_pack_version, str) or not policy_pack_version:
+        raise ValueError("policy_pack_version is required with planned_decisions")
+    planned = tuple(_normalized_decision(item) for item in planned_decisions)
+    outputs = build_decision_outputs(planned, policy_pack_version)
+    targets_by_requirement: dict[str, list[PurchaseOrderOutput]] = {}
+    for target in outputs.purchase_orders:
+        targets_by_requirement.setdefault(target.decision.requirement_id, []).append(target)
+    reconstructed: list[DecisionRecord] = []
+    for group in groups:
+        targets = targets_by_requirement.get(group.requirement_id, [])
+        stored_actions = {parsed.action_key for _order, parsed in group.rows}
+        target_actions = {target.action_key for target in targets}
+        if stored_actions != target_actions:
+            continue
+        if group.policy_pack_version != policy_pack_version:
+            continue
+        if group.demand_fingerprint != targets[0].demand_fingerprint:
+            continue
+        if group.legacy_decision is None and (
+            group.source_fingerprint != targets[0].source_fingerprint
+            or group.evidence_contract is not targets[0].evidence_contract
+        ):
+            continue
+        stored_by_action = {
+            parsed.action_key: order for order, parsed in group.rows
+        }
+        for target in targets:
+            stored = stored_by_action[target.action_key]
+            same_business = _stored_fields(stored)[:-1] == target.business_fields[:-1]
+            exact = _stored_fields(stored) == target.business_fields
+            if not same_business or (
+                group.legacy_decision is None and not exact
+            ):
+                raise ActionCollisionError(
+                    f"current action {target.action_key} disagrees with stored business fields"
+                )
+        reconstructed.append(targets[0].decision)
+    return tuple(
+        sorted(
+            {item.requirement_id: item for item in reconstructed}.values(),
+            key=lambda item: (item.requirement_id, item.component_id),
+        )
+    )
 
 
 def reconcile_managed_decisions(
@@ -666,72 +1350,21 @@ def reconcile_managed_decisions(
     planned_decisions: Sequence[DecisionRecord],
     policy_pack_version: str,
 ) -> tuple[DecisionRecord, ...]:
-    """Reattach unchanged closed requirements to their prior managed actions.
-
-    Ledgers correctly count an owned PO as physical inbound.  Consequently an
-    unchanged second planning pass can describe the requirement as closed with
-    no newly selected plan.  The canonical fingerprint excludes that owned
-    inbound, allowing this function to recognize the same source demand and
-    return the reconstructable prior action instead.  A changed demand,
-    inventory position, external inbound row, or policy version does not match
-    and therefore retains the newly planned record.
-    """
+    """Reconcile fresh planned decisions without reviving an embedded record."""
 
     if not isinstance(snapshot, ScenarioSnapshot):
         raise TypeError("snapshot must be ScenarioSnapshot")
     if not isinstance(policy_pack_version, str) or not policy_pack_version:
         raise ValueError("policy_pack_version must be non-empty text")
-    reconstruct_managed_decisions(snapshot)
-    prior_by_requirement: dict[str, list[tuple[DecisionRecord, str]]] = {}
-    for order in snapshot.purchase_orders:
-        parsed = parse_owned_purchase_order(order)
-        if parsed is None:
-            continue
-        candidates = prior_by_requirement.setdefault(parsed.decision.requirement_id, [])
-        pair = (parsed.decision, parsed.policy_pack_version)
-        if pair not in candidates:
-            candidates.append(pair)
-
     planned = tuple(_normalized_decision(item) for item in planned_decisions)
     if len({item.requirement_id for item in planned}) != len(planned):
         raise DecisionError("planned decisions contain duplicate requirement IDs")
-    reconciled: list[DecisionRecord] = []
-    planned_ids: set[str] = set()
-    for current in sorted(planned, key=lambda item: (item.requirement_id, item.component_id)):
-        planned_ids.add(current.requirement_id)
-        matching = [
-            prior
-            for prior, version in prior_by_requirement.get(current.requirement_id, [])
-            if version == policy_pack_version
-            and prior.component_id == current.component_id
-            and prior.evidence_contract is current.evidence_contract
-            and demand_fingerprint(prior) == demand_fingerprint(current)
-        ]
-        exact = [item for item in matching if item == current]
-        if len(exact) == 1:
-            reconciled.append(exact[0])
-        elif current.selected_plan is None and len(matching) == 1:
-            reconciled.append(matching[0])
-        elif len(exact) > 1 or (current.selected_plan is None and len(matching) > 1):
-            raise ActionCollisionError(
-                f"multiple prior actions ambiguously match requirement {current.requirement_id}"
-            )
-        else:
-            reconciled.append(current)
-
-    for requirement_id in sorted(set(prior_by_requirement) - planned_ids):
-        matching = [
-            prior
-            for prior, version in prior_by_requirement[requirement_id]
-            if version == policy_pack_version
-        ]
-        if len(matching) == 1:
-            reconciled.append(matching[0])
-        elif len(matching) > 1:
-            raise ActionCollisionError(
-                f"multiple prior actions exist for omitted requirement {requirement_id}"
-            )
-    return tuple(sorted(reconciled, key=lambda item: (item.requirement_id, item.component_id)))
+    _managed_purchase_order_groups(snapshot)
+    # Matching current actions are reconstructed here as an ownership check;
+    # unmatched historical commitments remain physical inbound and are never
+    # copied into current decisions.
+    reconstruct_managed_decisions(snapshot, planned, policy_pack_version)
+    return tuple(sorted(planned, key=lambda item: (item.requirement_id, item.component_id)))
 
 
 def _stored_fields(order: ExistingPurchaseOrder) -> tuple[object, ...]:
@@ -1002,6 +1635,7 @@ class AtomicDecisionWriter:
                 outputs,
                 external_alerts,
                 stored_owned,
+                self._policy_pack_version,
             )
             self._step(CommitStep.POSTCONDITIONS_CHECKED)
             if _file_identity(resolved_path) != expected_identity:
@@ -1031,6 +1665,7 @@ class AtomicDecisionWriter:
         outputs: DecisionOutputs,
         external_alerts: dict[int, str],
         prior_owned: dict[str, int],
+        policy_pack_version: str,
     ) -> None:
         if _source_state(after) != _source_state(before):
             raise CommitPostconditionError("a source or master table changed during commit")
@@ -1067,7 +1702,11 @@ class AtomicDecisionWriter:
                 raise CommitPostconditionError(
                     f"purchase order {number} failed exact business-field post-validation"
                 )
-        reconstruct_managed_decisions(after)
+        reconstruct_managed_decisions(
+            after,
+            outputs.decisions,
+            policy_pack_version,
+        )
 
         after_alerts = {item.alert_id: item.description for item in after.alerts}
         for alert_id, description in external_alerts.items():
@@ -1149,7 +1788,10 @@ __all__ = [
     "action_key",
     "build_decision_outputs",
     "commit_decisions",
+    "component_source_fingerprint",
+    "current_managed_order_numbers",
     "demand_fingerprint",
+    "demand_fingerprint_from_facts",
     "parse_owned_purchase_order",
     "po_number_for_action",
     "reconstruct_managed_decisions",

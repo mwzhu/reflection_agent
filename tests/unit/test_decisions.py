@@ -42,6 +42,7 @@ from apex_procurement.domain import (
 )
 from apex_procurement.explanations import (
     make_owned_alert,
+    parse_owned_alert,
     render_alerts,
     render_legacy_v1_decision_rationale,
     render_legacy_v1_line_rationale,
@@ -189,6 +190,7 @@ def make_decision(
         evidence=(),
         alert_categories=alerts,
         rationale="upstream prose is deliberately ignored",
+        source_fingerprint="c" * 64,
     )
 
 
@@ -240,7 +242,7 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertNotEqual(demand_fingerprint(original), demand_fingerprint(changed_inventory))
         self.assertNotEqual(demand_fingerprint(original), demand_fingerprint(changed_demand))
 
-    def test_owned_po_round_trips_full_record_and_selected_line_state(self) -> None:
+    def test_compact_owned_po_round_trips_digests_without_embedded_record(self) -> None:
         registry = load_policy_registry()
         decision = replace(
             make_decision(),
@@ -264,13 +266,12 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(parsed.action_key, target.action_key)
-        self.assertEqual(parsed.decision, output.decisions[0])
-        self.assertEqual(
-            parsed.decision.economic_autonomy,
-            registry.economic_autonomy,
-        )
+        self.assertIsNone(parsed.decision)
+        self.assertEqual(parsed.source_fingerprint, decision.source_fingerprint)
+        self.assertEqual(parsed.evidence_contract, EvidenceContract.BENCHMARK)
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
-        self.assertIn("[APEX_AGENT:v3 ", target.rationale)
+        self.assertIn("[APEX_AGENT:v4 ", target.rationale)
+        self.assertNotIn(" record=", target.rationale)
         self.assertIn("Fulfillment FULFILLED; resolution RESOLVED", target.rationale)
 
     def test_pre_r03_v2_record_without_line_approvals_remains_parseable(self) -> None:
@@ -324,7 +325,7 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         assert parsed is not None
         self.assertEqual(parsed.marker_version, 2)
-        self.assertEqual(parsed.decision, decision)
+        self.assertEqual(parsed.decision, replace(decision, source_fingerprint=None))
 
     def test_v1_owned_po_remains_strictly_parseable_and_reconstructable(self) -> None:
         policy_version = "policy-version-one"
@@ -376,7 +377,8 @@ class IdentityAndRenderingTests(unittest.TestCase):
 
         self.assertIsNotNone(parsed)
         assert parsed is not None
-        self.assertEqual(parsed.decision, legacy)
+        expected_legacy = replace(legacy, source_fingerprint=None)
+        self.assertEqual(parsed.decision, expected_legacy)
         rebuilt = build_decision_outputs(
             (parsed.decision,),
             policy_version,
@@ -391,6 +393,86 @@ class IdentityAndRenderingTests(unittest.TestCase):
             stored.expected_delivery_date,
             stored.rationale,
         ))
+
+    def test_compact_marker_rejects_forged_source_and_incomplete_line_group(self) -> None:
+        policy_version = "policy-version-one"
+        target = build_decision_outputs(
+            (make_decision(),),
+            policy_version,
+        ).purchase_orders[0]
+        forged = ExistingPurchaseOrder(
+            po_number=target.po_number,
+            component_id=target.component_id,
+            supplier_id=target.supplier_id,
+            quantity=target.quantity,
+            unit_price=target.unit_price,
+            order_date=target.order_date,
+            expected_delivery_date=target.expected_delivery_date,
+            rationale=target.rationale.replace(
+                f"source={target.source_fingerprint}",
+                f"source={'d' * 64}",
+                1,
+            ),
+        )
+        with self.assertRaises(decisions_module.OwnershipMarkerError):
+            parse_owned_purchase_order(forged)
+
+        marker = decisions_module._COMPACT_PO_MARKER.match(target.rationale)
+        assert marker is not None
+        rationale_body = target.rationale[marker.end() + 1 :]
+        assert target.source_fingerprint is not None
+        field_digest = decisions_module._compact_field_digest(
+            action_digest=target.action_key,
+            demand_digest=target.demand_fingerprint,
+            source_digest=target.source_fingerprint,
+            evidence_contract=target.evidence_contract,
+            requirement_id=target.decision.requirement_id,
+            route_id=target.route_id,
+            policy_pack_version=policy_version,
+            line_index=0,
+            line_count=2,
+            po_number=target.po_number,
+            component_id=target.component_id,
+            supplier_id=target.supplier_id,
+            quantity=target.quantity,
+            unit_price=target.unit_price,
+            order_date=target.order_date,
+            expected_delivery_date=target.expected_delivery_date,
+            rationale_body=rationale_body,
+        )
+        incomplete_marker = decisions_module._compact_po_marker(
+            key=target.action_key,
+            demand_digest=target.demand_fingerprint,
+            source_digest=target.source_fingerprint,
+            evidence_contract=target.evidence_contract,
+            requirement_id=target.decision.requirement_id,
+            route_id=target.route_id,
+            policy_pack_version=policy_version,
+            line_index=0,
+            line_count=2,
+            group_digest="e" * 64,
+            field_digest=field_digest,
+        )
+        incomplete = replace(
+            SQLiteRepository().load_snapshot(SOURCE_SCENARIO),
+            purchase_orders=(
+                ExistingPurchaseOrder(
+                    po_number=target.po_number,
+                    component_id=target.component_id,
+                    supplier_id=target.supplier_id,
+                    quantity=target.quantity,
+                    unit_price=target.unit_price,
+                    order_date=target.order_date,
+                    expected_delivery_date=target.expected_delivery_date,
+                    rationale=f"{incomplete_marker} {rationale_body}",
+                ),
+            ),
+        )
+        with self.assertRaisesRegex(
+            decisions_module.OwnershipMarkerError,
+            "incomplete or duplicate line group",
+        ):
+            reconstruct_managed_decisions(incomplete)
 
     def test_residual_assumption_decision_and_solver_alerts_are_all_owned(self) -> None:
         selected = make_plan(
@@ -426,6 +508,14 @@ class IdentityAndRenderingTests(unittest.TestCase):
             sum(item.category is AlertCategory.RUN_ACCOUNTING for item in alerts),
             1,
         )
+        accounting = next(
+            item for item in alerts if item.category is AlertCategory.RUN_ACCOUNTING
+        )
+        parsed_accounting = parse_owned_alert(accounting.description)
+        assert parsed_accounting is not None
+        self.assertIn("AGENT_ORDERED_WITH_RESIDUAL=1", parsed_accounting.body)
+        self.assertIn("DECISION_DEFERRED=0", parsed_accounting.body)
+        self.assertIn("bucket sum 1", parsed_accounting.body)
         self.assertTrue(all("[APEX_ALERT:v1" in item.description for item in alerts))
 
     def test_approval_alert_is_a_complete_proposal_from_policy_facts(self) -> None:
@@ -471,7 +561,11 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
         )
         first_rows = (self.table_rows("purchase_orders"), self.table_rows("alerts"))
         after_first = SQLiteRepository().load_snapshot(self.path)
-        reconstructed = reconstruct_managed_decisions(after_first)
+        reconstructed = reconstruct_managed_decisions(
+            after_first,
+            (original,),
+            "policy-version-one",
+        )
         alert_ids = {item.description: item.alert_id for item in after_first.alerts}
         stored_order = after_first.purchase_orders[0]
         parsed = parse_owned_purchase_order(stored_order)
@@ -485,13 +579,9 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
         self.assertTrue(owned_inbound.agent_owned)
         self.assertEqual(owned_inbound.action_key, parsed.action_key)
         self.assertEqual(owned_inbound.demand_fingerprint, parsed.demand_fingerprint)
-        closed_by_owned_inbound = make_decision(
-            selected_plan=None,
-            inbound=(owned_inbound,),
-        )
         reconciled = reconcile_managed_decisions(
             after_first,
-            (closed_by_owned_inbound,),
+            (original,),
             "policy-version-one",
         )
 
@@ -513,7 +603,7 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
             {item.description: item.alert_id for item in after_second.alerts},
         )
 
-    def test_legacy_v1_owned_rows_remain_an_exact_no_op_on_rerun(self) -> None:
+    def test_legacy_v1_owned_rows_remain_physical_and_are_not_recreated(self) -> None:
         policy_version = "policy-version-one"
         current = build_decision_outputs(
             (make_decision(),),
@@ -574,61 +664,55 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
             valid_validation(),
         )
 
-        self.assertTrue(result.no_op)
-        self.assertEqual(
-            before,
-            (self.table_rows("purchase_orders"), self.table_rows("alerts")),
-        )
+        self.assertEqual(result.committed_po_numbers, ())
+        self.assertEqual(before[0], self.table_rows("purchase_orders"))
 
-    def test_expanded_r02_v1_marker_remains_a_no_op_after_v3_bump(self) -> None:
+    def test_pre_r07_v3_record_remains_strictly_parseable(self) -> None:
         policy_version = "policy-version-one"
-        original = make_decision()
-        snapshot = SQLiteRepository().load_snapshot(self.path)
-        AtomicDecisionWriter(self.path, policy_version).commit(
-            snapshot,
-            (original,),
-            valid_validation(),
-        )
-        with closing(sqlite3.connect(self.path)) as connection, connection:
-            rationale = connection.execute(
-                "SELECT rationale FROM purchase_orders"
-            ).fetchone()[0]
-            self.assertIn("[APEX_AGENT:v3 ", rationale)
-            connection.execute(
-                "UPDATE purchase_orders SET rationale = ?",
-                (rationale.replace("[APEX_AGENT:v3 ", "[APEX_AGENT:v1 ", 1),),
-            )
-        before = (self.table_rows("purchase_orders"), self.table_rows("alerts"))
-        downgraded = SQLiteRepository().load_snapshot(self.path)
-        parsed = parse_owned_purchase_order(downgraded.purchase_orders[0])
-        assert parsed is not None
-        self.assertEqual(parsed.marker_version, 1)
-        managed_ledger = build_ledgers(downgraded).ledger_for(
-            downgraded.purchase_orders[0].component_id
-        )
-        owned_inbound = next(
-            item
-            for item in managed_ledger.committed_inbound
-            if item.po_number == downgraded.purchase_orders[0].po_number
-        )
-        closed = make_decision(selected_plan=None, inbound=(owned_inbound,))
-        reconciled = reconcile_managed_decisions(
-            downgraded,
-            (closed,),
+        current = build_decision_outputs(
+            (make_decision(),),
+            policy_version,
+        ).decisions[0]
+        legacy = replace(current, source_fingerprint=None)
+        assert legacy.selected_plan is not None
+        line = legacy.selected_plan.lines[0]
+        demand_digest = demand_fingerprint(legacy)
+        key = decisions_module.action_key(
+            demand_digest,
+            line.component_id,
+            line.supplier_id,
+            line.route_id,
+            line.order_date,
             policy_version,
         )
-
-        result = AtomicDecisionWriter(self.path, policy_version).commit(
-            downgraded,
-            reconciled,
-            valid_validation(),
+        record_token = decisions_module._encoded(
+            decisions_module._legacy_v3_record(legacy)
+        )
+        marker = decisions_module._po_marker(
+            key=key,
+            demand_digest=demand_digest,
+            route_id=line.route_id,
+            policy_pack_version=policy_version,
+            line_index=0,
+            decision_token=record_token,
+            version=3,
+        )
+        stored = ExistingPurchaseOrder(
+            po_number=decisions_module.po_number_for_action(key),
+            component_id=line.component_id,
+            supplier_id=line.supplier_id,
+            quantity=line.quantity,
+            unit_price=line.unit_price,
+            order_date=line.order_date,
+            expected_delivery_date=line.expected_delivery_date,
+            rationale=f"{marker} {render_line_rationale(legacy, line)}",
         )
 
-        self.assertTrue(result.no_op)
-        self.assertEqual(
-            before,
-            (self.table_rows("purchase_orders"), self.table_rows("alerts")),
-        )
+        parsed = parse_owned_purchase_order(stored)
+
+        assert parsed is not None
+        self.assertEqual(parsed.marker_version, 3)
+        self.assertEqual(parsed.decision, legacy)
 
     def test_alert_reconciliation_inserts_missing_deletes_obsolete_and_preserves_external(self) -> None:
         decision = make_decision(alerts=(AlertCategory.DATA_QUALITY,))
