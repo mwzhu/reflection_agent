@@ -1040,20 +1040,65 @@ class IndependentPlanValidator:
         return True, assumption
 
     def _named_primary(self, snapshot: ScenarioSnapshot, component: Component) -> NamedEntityCheck | None:
-        rules = self._directive_rules(snapshot.configuration.current_date, "named_primary_supplier")
-        if not rules or self._concept("neodymium_magnet", component) is not EvidenceStatus.PASS:
+        rules = tuple(
+            rule
+            for rule in self._directive_rules(
+                snapshot.configuration.current_date, "named_primary_supplier"
+            )
+            if self._selector_status(rule, component) is EvidenceStatus.PASS
+        )
+        if not rules:
             return None
         reference = rules[0].data["directive"]["supplier"]
         return self.resolve_source_named_entity(reference, snapshot.suppliers)
 
     def _release_subject(self, snapshot: ScenarioSnapshot, component: Component) -> NamedEntityCheck | None:
-        rules = self._directive_rules(snapshot.configuration.current_date, "named_primary_supplier")
-        if not rules or self._concept("neodymium_magnet", component) is not EvidenceStatus.PASS:
+        rules = tuple(
+            rule
+            for rule in self._directive_rules(
+                snapshot.configuration.current_date, "named_primary_supplier"
+            )
+            if self._selector_status(rule, component) is EvidenceStatus.PASS
+        )
+        if not rules:
             return None
         release = rules[0].data.get("release_condition")
         if not isinstance(release, Mapping) or not isinstance(release.get("subject"), Mapping):
             return None
         return self.resolve_source_named_entity(release["subject"], snapshot.suppliers)
+
+    def _shaping_degradation_required(
+        self, snapshot: ScenarioSnapshot, component: Component
+    ) -> bool:
+        """Independently reconstruct unresolved conditional shaping scope."""
+
+        for rule in self._directive_rules(
+            snapshot.configuration.current_date, "named_primary_supplier"
+        ):
+            if (
+                RuleSeverity(rule.severity) is not RuleSeverity.SHAPING
+                or self._selector_status(rule, component) is EvidenceStatus.FAIL
+            ):
+                continue
+            references: list[Mapping[str, object]] = []
+            directive = rule.data.get("directive")
+            if isinstance(directive, Mapping) and isinstance(
+                directive.get("supplier"), Mapping
+            ):
+                references.append(directive["supplier"])
+            release = rule.data.get("release_condition")
+            if isinstance(release, Mapping) and isinstance(
+                release.get("subject"), Mapping
+            ):
+                references.append(release["subject"])
+            if any(
+                not self.resolve_source_named_entity(
+                    reference, snapshot.suppliers
+                ).resolved
+                for reference in references
+            ):
+                return True
+        return False
 
     def _minimum_secondary_parameter(
         self, snapshot: ScenarioSnapshot, component: Component
@@ -5467,8 +5512,9 @@ class IndependentPlanValidator:
             if expected_residual > ZERO and not (set(decision.alert_categories) & _TERMINAL_ALERTS):
                 sink.error("SILENT_RESIDUAL_GAP", "Every positive post-plan residual needs a terminal component-specific alert, including after a partial PO.", component_id=decision.component_id)
             solver_verified = self._check_solver_results(snapshot, decision, result_tuple, requirement, sink) and solver_verified
-            named = self._named_primary(snapshot, requirement.component)
-            if named is not None and not named.resolved:
+            if self._shaping_degradation_required(
+                snapshot, requirement.component
+            ):
                 if AlertCategory.POLICY_CONFLICT not in decision.alert_categories:
                     sink.error("SHAPING_DEGRADATION_MISSING", "Unresolvable shaping subject must drop only that directive and emit POLICY_CONFLICT.", component_id=decision.component_id)
             citations = tuple(

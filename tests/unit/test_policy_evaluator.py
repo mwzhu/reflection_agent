@@ -328,6 +328,7 @@ class SourceNamedEntityTests(EvaluatorFixture):
 
     def test_unresolved_shaping_reference_drops_only_that_directive(self) -> None:
         magnet = self.component("Neodymium")
+        nonmagnet = self.component("Copper Wire")
         suppliers = tuple(
             replace(item, name=f"Replacement {index}")
             if item.name.startswith(("Nanjing", "MagnetPro"))
@@ -346,13 +347,64 @@ class SourceNamedEntityTests(EvaluatorFixture):
         rolling = by_id["MEMO-2025-041.magnet_rolling_cap"]
         secondary = by_id["MEMO-2025-041.magnet_secondary_allocation"]
         self.assertFalse(named.applicable)
+        self.assertIs(named.selector_status, EvidenceStatus.PASS)
         self.assertFalse(named.blocks_scope)
-        self.assertIn(AlertCategory.POLICY_CONFLICT, {alert.category for alert in named.alerts})
+        self.assertEqual(
+            {alert.category for alert in named.alerts},
+            {AlertCategory.POLICY_CONFLICT},
+        )
+        self.assertEqual(
+            {alert.entity_id for alert in named.alerts},
+            {magnet.component_id},
+        )
         self.assertIsNotNone(rolling.evidence)
+        self.assertIs(rolling.selector_status, EvidenceStatus.PASS)
         self.assertIsNotNone(secondary.evidence)
+        self.assertIs(secondary.selector_status, EvidenceStatus.PASS)
+
+        out_of_scope = PolicyEvaluator(self.registry).evaluate_rule(
+            self.rule,
+            self.context(
+                component=nonmagnet,
+                supplier=suppliers[0],
+                suppliers=suppliers,
+            ),
+        )
+        self.assertFalse(out_of_scope.applicable)
+        self.assertIs(out_of_scope.selector_status, EvidenceStatus.FAIL)
+        self.assertIsNone(out_of_scope.evidence)
+        self.assertFalse(out_of_scope.alerts)
+
+        unknown_data = dict(self.rule.data)
+        unknown_data["selector"] = {
+            "entity": "component",
+            "semantic_tags": ("critical_component",),
+            "operator": "all",
+        }
+        unknown_rule = replace(self.rule, data=unknown_data)
+        uncertain = self.component("Pressure Transducer")
+        unknown = PolicyEvaluator(self.registry).evaluate_rule(
+            unknown_rule,
+            self.context(
+                component=uncertain,
+                supplier=suppliers[0],
+                suppliers=suppliers,
+            ),
+        )
+        self.assertFalse(unknown.applicable)
+        self.assertIs(unknown.selector_status, EvidenceStatus.UNKNOWN)
+        self.assertIn("ROBUST_BOTH_WAYS", unknown.evidence.assumption_codes)
+        self.assertEqual(
+            {alert.entity_id for alert in unknown.alerts},
+            {uncertain.component_id},
+        )
+        unknown_categories = {alert.category for alert in unknown.alerts}
+        self.assertIn(AlertCategory.POLICY_CONFLICT, unknown_categories)
+        self.assertNotIn(AlertCategory.DECISION_REQUIRED, unknown_categories)
 
         hard = replace(self.rule, severity="hard")
         hard_result = PolicyEvaluator(self.registry).evaluate_rule(hard, context)
+        self.assertIs(hard_result.selector_status, EvidenceStatus.PASS)
         self.assertTrue(hard_result.blocks_scope)
         self.assertIs(hard_result.evidence.contract_disposition, PlanDisposition.DECISION_REQUIRED)
 

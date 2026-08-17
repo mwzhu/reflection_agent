@@ -217,57 +217,9 @@ class PolicyEvaluator:
                 None,
             )
 
-        named, named_alerts = self._resolve_named_references(rule, context)
-        unresolved_named = tuple(item for item in named.values() if item.status is EvidenceStatus.UNKNOWN)
-        if unresolved_named:
-            severity = RuleSeverity(rule.severity)
-            if severity is RuleSeverity.SHAPING:
-                alerts = tuple(
-                    EvaluationAlert(
-                        AlertCategory.POLICY_CONFLICT,
-                        "SHAPING_REFERENCE_UNRESOLVED",
-                        f"Dropped shaping directive {rule.rule_id!r}: its source-named supplier cannot be resolved safely",
-                        rule.rule_id,
-                    )
-                    for _item in unresolved_named[:1]
-                )
-                evidence = self._evidence(
-                    rule,
-                    EvidenceStatus.UNKNOWN,
-                    "Source-named reference unresolved; this shaping directive is inapplicable only within its own scope.",
-                    assumptions=("SOURCE_NAMED_ENTITY_UNRESOLVED",),
-                    disposition=None,
-                )
-                return RuleEvaluation(
-                    rule.rule_id,
-                    rule.source_document,
-                    kind,
-                    True,
-                    False,
-                    EvidenceStatus.UNKNOWN,
-                    evidence,
-                    named_alerts + alerts,
-                )
-            evidence = self._evidence(
-                rule,
-                EvidenceStatus.UNKNOWN,
-                "A hard rule's source-named reference cannot be resolved safely.",
-                assumptions=("SOURCE_NAMED_ENTITY_UNRESOLVED",),
-                disposition=PlanDisposition.DECISION_REQUIRED,
-            )
-            return RuleEvaluation(
-                rule.rule_id,
-                rule.source_document,
-                kind,
-                True,
-                True,
-                EvidenceStatus.UNKNOWN,
-                evidence,
-                named_alerts,
-            )
-
-        selector_status, selector_alerts, selector_assumptions = self._evaluate_selector(rule, context)
-        alerts = named_alerts + selector_alerts
+        selector_status, selector_alerts, selector_assumptions = self._evaluate_selector(
+            rule, context
+        )
         if selector_status is EvidenceStatus.FAIL:
             return RuleEvaluation(
                 rule.rule_id,
@@ -277,8 +229,87 @@ class PolicyEvaluator:
                 False,
                 selector_status,
                 None,
-                alerts,
+                selector_alerts,
             )
+
+        named, named_alerts = self._resolve_named_references(rule, context)
+        unresolved_named = tuple(
+            item
+            for item in named.values()
+            if item.status is EvidenceStatus.UNKNOWN
+        )
+        if unresolved_named:
+            severity = RuleSeverity(rule.severity)
+            scoped_named_alerts = self._scope_conditional_alerts(
+                rule, context, named_alerts
+            )
+            if severity is RuleSeverity.SHAPING:
+                conflict = EvaluationAlert(
+                    AlertCategory.POLICY_CONFLICT,
+                    "SHAPING_REFERENCE_UNRESOLVED",
+                    f"Dropped shaping directive {rule.rule_id!r}: its source-named supplier cannot be resolved safely",
+                    rule.rule_id,
+                    self._conditional_scope_entity_id(rule, context),
+                )
+                evidence = self._evidence(
+                    rule,
+                    EvidenceStatus.UNKNOWN,
+                    "Source-named reference unresolved; this shaping directive is inapplicable only within its own scope.",
+                    assumptions=tuple(
+                        sorted(
+                            set(
+                                selector_assumptions
+                                + ("SOURCE_NAMED_ENTITY_UNRESOLVED",)
+                                + (
+                                    ("ROBUST_BOTH_WAYS",)
+                                    if selector_status is EvidenceStatus.UNKNOWN
+                                    else ()
+                                )
+                            )
+                        )
+                    ),
+                    disposition=None,
+                )
+                return RuleEvaluation(
+                    rule.rule_id,
+                    rule.source_document,
+                    kind,
+                    True,
+                    False,
+                    selector_status,
+                    evidence,
+                    selector_alerts
+                    + tuple(
+                        alert
+                        for alert in scoped_named_alerts
+                        if alert.category is not AlertCategory.DECISION_REQUIRED
+                    )
+                    + (conflict,),
+                )
+            assumptions = selector_assumptions + (
+                "SOURCE_NAMED_ENTITY_UNRESOLVED",
+            )
+            if selector_status is EvidenceStatus.UNKNOWN:
+                assumptions += ("ROBUST_BOTH_WAYS",)
+            evidence = self._evidence(
+                rule,
+                EvidenceStatus.UNKNOWN,
+                "A hard rule's source-named reference cannot be resolved safely.",
+                assumptions=tuple(sorted(set(assumptions))),
+                disposition=PlanDisposition.DECISION_REQUIRED,
+            )
+            return RuleEvaluation(
+                rule.rule_id,
+                rule.source_document,
+                kind,
+                True,
+                True if selector_status is EvidenceStatus.PASS else None,
+                selector_status,
+                evidence,
+                selector_alerts + scoped_named_alerts,
+            )
+
+        alerts = selector_alerts + named_alerts
 
         if kind == "named_primary_supplier" and self._is_released(rule, context, named):
             evidence = self._evidence(
@@ -378,6 +409,35 @@ class PolicyEvaluator:
             resolved[path] = result
             alerts.extend(self._convert_resolution_alerts(rule, result.alerts, result.resolved_supplier_id))
         return resolved, tuple(alerts)
+
+    @staticmethod
+    def _conditional_scope_entity_id(
+        rule: PolicyRule, context: EvaluationContext
+    ) -> str | None:
+        selector = rule.data.get("selector")
+        if (
+            isinstance(selector, Mapping)
+            and selector.get("entity") == "component"
+            and context.component is not None
+        ):
+            return context.component.component_id
+        return None
+
+    def _scope_conditional_alerts(
+        self,
+        rule: PolicyRule,
+        context: EvaluationContext,
+        alerts: tuple[EvaluationAlert, ...],
+    ) -> tuple[EvaluationAlert, ...]:
+        entity_id = self._conditional_scope_entity_id(rule, context)
+        if entity_id is None:
+            return alerts
+        return tuple(
+            replace(alert, entity_id=entity_id)
+            if alert.entity_id is None
+            else alert
+            for alert in alerts
+        )
 
     @staticmethod
     def _convert_resolution_alerts(
