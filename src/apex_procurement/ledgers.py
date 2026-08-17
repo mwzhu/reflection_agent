@@ -26,6 +26,8 @@ from .domain import (
     PlanLine,
     ScenarioSnapshot,
     SupplyLedger,
+    UnitNormalizationDisclosure,
+    UnitRoundingRule,
     ZERO,
 )
 
@@ -118,6 +120,7 @@ class LedgerAlert:
     description: str
     component_id: str | None = None
     po_number: str | None = None
+    normalization_disclosure: UnitNormalizationDisclosure | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.category, AlertCategory):
@@ -128,6 +131,12 @@ class LedgerAlert:
             _require_text(self.component_id, "component_id")
         if self.po_number is not None:
             _require_text(self.po_number, "po_number")
+        if self.normalization_disclosure is not None and not isinstance(
+            self.normalization_disclosure, UnitNormalizationDisclosure
+        ):
+            raise TypeError(
+                "normalization_disclosure must be UnitNormalizationDisclosure or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +355,7 @@ def _alert(
     *,
     component_id: str | None = None,
     po_number: str | None = None,
+    normalization_disclosure: UnitNormalizationDisclosure | None = None,
 ) -> LedgerAlert:
     return LedgerAlert(
         category=category,
@@ -353,6 +363,7 @@ def _alert(
         description=description,
         component_id=component_id,
         po_number=po_number,
+        normalization_disclosure=normalization_disclosure,
     )
 
 
@@ -654,12 +665,21 @@ def build_ledgers(
         component = component_by_id[component_id]
         _, _, recognised_unit = unit_contract.rule_for(component.unit_of_measure)
         if not recognised_unit:
+            disclosure = UnitNormalizationDisclosure(
+                source_unit=component.unit_of_measure,
+                increment=Decimal("1"),
+                rounding_rule=(
+                    UnitRoundingRule.DISCRETE_CEILING_AFTER_AGGREGATION
+                ),
+            )
             alerts.append(
                 _alert(
                     AlertCategory.ASSUMPTION,
                     "UNKNOWN_UNIT_TREATED_AS_DISCRETE",
-                    "The unit of measure is unrecognised and will be rounded as discrete.",
+                    "The source unit of measure is unrecognised; exact aggregate demand "
+                    "will be rounded up as discrete to increment 1 before MOQ is applied.",
                     component_id=component_id,
+                    normalization_disclosure=disclosure,
                 )
             )
         if component_id not in inventory_by_component:

@@ -18,6 +18,8 @@ from apex_procurement.domain import (
     ScenarioConfiguration,
     Supplier,
     SupplierCatalogLine,
+    UnitNormalizationDisclosure,
+    UnitRoundingRule,
 )
 from apex_procurement.ledgers import (
     RouteAvailability,
@@ -405,6 +407,22 @@ class QuantityAndGeneralisationTests(unittest.TestCase):
             (AlertCategory.ASSUMPTION, "UNKNOWN_UNIT_TREATED_AS_DISCRETE"),
             {(item.category, item.code) for item in result.alerts},
         )
+        alert = next(
+            item
+            for item in result.alerts
+            if item.code == "UNKNOWN_UNIT_TREATED_AS_DISCRETE"
+        )
+        self.assertEqual(
+            alert.normalization_disclosure,
+            UnitNormalizationDisclosure(
+                source_unit="box",
+                increment=Decimal("1"),
+                rounding_rule=(
+                    UnitRoundingRule.DISCRETE_CEILING_AFTER_AGGREGATION
+                ),
+            ),
+        )
+        self.assertIn("before MOQ", alert.description)
 
     def test_aggregate_then_round_avoids_per_order_double_rounding(self) -> None:
         discrete = aggregate_round_and_apply_moq(

@@ -45,11 +45,14 @@ from .domain import (
     RouteQuarantineScope,
     RuleSeverity,
     ScenarioSnapshot,
+    SourceEntityNormalizationDisclosure,
     SolveKind,
     SolverResult,
     SolverStatus,
     Supplier,
     SupplierCatalogLine,
+    UnitNormalizationDisclosure,
+    UnitRoundingRule,
     ValidationIssue,
     ValidationResult,
     ValidationSeverity,
@@ -765,13 +768,23 @@ class IndependentPlanValidator:
 
         source_id = str(reference.get("source_id", ""))
         legal_name = str(reference.get("legal_name", ""))
-        id_match = next((item for item in suppliers if item.supplier_id == source_id), None)
+        id_matches = tuple(
+            item for item in suppliers if item.supplier_id == source_id
+        )
         name_matches = tuple(item for item in suppliers if _normal_name(item.name) == _normal_name(legal_name))
-        if id_match is not None and len(name_matches) == 1 and name_matches[0] is id_match:
-            return NamedEntityCheck(NamedEntityOutcome.RESOLVED, id_match.supplier_id, source_id, legal_name)
-        if id_match is None and len(name_matches) == 1:
+        if (
+            len(id_matches) == 1
+            and len(name_matches) == 1
+            and name_matches[0] is id_matches[0]
+        ):
+            return NamedEntityCheck(NamedEntityOutcome.RESOLVED, id_matches[0].supplier_id, source_id, legal_name)
+        if not id_matches and len(name_matches) == 1:
             return NamedEntityCheck(NamedEntityOutcome.STALE_SOURCE_ID, name_matches[0].supplier_id, source_id, legal_name)
-        if id_match is not None and len(name_matches) == 1 and name_matches[0] is not id_match:
+        if (
+            len(id_matches) == 1
+            and len(name_matches) == 1
+            and name_matches[0] is not id_matches[0]
+        ):
             return NamedEntityCheck(NamedEntityOutcome.CONFLICT, None, source_id, legal_name)
         return NamedEntityCheck(NamedEntityOutcome.MISSING_OR_AMBIGUOUS, None, source_id, legal_name)
 
@@ -1208,6 +1221,82 @@ class IndependentPlanValidator:
         if not isinstance(release, Mapping) or not isinstance(release.get("subject"), Mapping):
             return None
         return self.resolve_source_named_entity(release["subject"], snapshot.suppliers)
+
+    def _expected_normalization_disclosures(
+        self,
+        snapshot: ScenarioSnapshot,
+        component: Component,
+    ) -> tuple[
+        SourceEntityNormalizationDisclosure | UnitNormalizationDisclosure, ...
+    ]:
+        """Independently reconstruct every R14 degraded-normalization fact."""
+
+        expected: set[
+            SourceEntityNormalizationDisclosure | UnitNormalizationDisclosure
+        ] = set()
+        unit = " ".join(_tokens(component.unit_of_measure))
+        if unit not in {"each", "tube", "can", "kg", "meter"}:
+            expected.add(
+                UnitNormalizationDisclosure(
+                    source_unit=component.unit_of_measure,
+                    increment=Decimal("1"),
+                    rounding_rule=(
+                        UnitRoundingRule.DISCRETE_CEILING_AFTER_AGGREGATION
+                    ),
+                )
+            )
+
+        for rule in self.registry.active_rules(
+            snapshot.configuration.current_date
+        ):
+            if self._selector_status(rule, component) is EvidenceStatus.FAIL:
+                continue
+            references: list[tuple[str, Mapping[str, object]]] = []
+            directive = rule.data.get("directive")
+            if isinstance(directive, Mapping) and isinstance(
+                directive.get("supplier"), Mapping
+            ):
+                references.append(
+                    ("directive.supplier", directive["supplier"])
+                )
+            release = rule.data.get("release_condition")
+            if isinstance(release, Mapping) and isinstance(
+                release.get("subject"), Mapping
+            ):
+                references.append(
+                    ("release_condition.subject", release["subject"])
+                )
+            constraint = rule.data.get("constraint")
+            if isinstance(constraint, Mapping):
+                for key in ("supplier", "subject"):
+                    reference = constraint.get(key)
+                    if isinstance(reference, Mapping):
+                        references.append((f"constraint.{key}", reference))
+
+            for path, reference in references:
+                resolution = self.resolve_source_named_entity(
+                    reference, snapshot.suppliers
+                )
+                if (
+                    resolution.outcome is NamedEntityOutcome.STALE_SOURCE_ID
+                    and resolution.supplier_id is not None
+                ):
+                    expected.add(
+                        SourceEntityNormalizationDisclosure(
+                            source_id=resolution.source_id,
+                            legal_name=resolution.legal_name,
+                            resolved_supplier_id=resolution.supplier_id,
+                            rule_id=rule.rule_id,
+                            source_document=rule.source_document,
+                            reference_path=path,
+                        )
+                    )
+        return tuple(
+            sorted(
+                expected,
+                key=lambda item: (type(item).__name__, repr(item)),
+            )
+        )
 
     def _shaping_degradation_required(
         self, snapshot: ScenarioSnapshot, component: Component
@@ -5746,6 +5835,73 @@ class IndependentPlanValidator:
                         component_id=decision.component_id,
                     )
 
+    def _check_normalization_disclosures(
+        self,
+        snapshot: ScenarioSnapshot,
+        decision: DecisionRecord,
+        component: Component,
+        sink: _IssueSink,
+    ) -> None:
+        expected = set(
+            self._expected_normalization_disclosures(snapshot, component)
+        )
+        actual = set(decision.normalization_disclosures)
+        missing = expected - actual
+        unexpected = actual - expected
+
+        if any(
+            isinstance(item, SourceEntityNormalizationDisclosure)
+            for item in missing
+        ):
+            sink.error(
+                "SOURCE_ID_NORMALIZATION_DISCLOSURE_MISSING",
+                "A stale source ID resolved by one unique exact normalized legal-name "
+                "match requires the source ID, current supplier ID, legal name, rule, "
+                "reference path, and source document in a component-scoped disclosure.",
+                component_id=decision.component_id,
+            )
+        if any(isinstance(item, UnitNormalizationDisclosure) for item in missing):
+            sink.error(
+                "UNIT_NORMALIZATION_DISCLOSURE_MISSING",
+                "An unrecognised source unit requires its original unit, discrete "
+                "ceiling-after-aggregation rule, and increment 1 in a component-scoped "
+                "disclosure.",
+                component_id=decision.component_id,
+            )
+        if unexpected:
+            sink.error(
+                "NORMALIZATION_DISCLOSURE_MISMATCH",
+                "A normalization disclosure does not match independently reconstructed "
+                "source/reference or unit-rounding facts.",
+                component_id=decision.component_id,
+            )
+
+        expects_source = any(
+            isinstance(item, SourceEntityNormalizationDisclosure)
+            for item in expected
+        )
+        expects_unit = any(
+            isinstance(item, UnitNormalizationDisclosure) for item in expected
+        )
+        if (
+            expects_source
+            and AlertCategory.DATA_QUALITY not in decision.alert_categories
+        ):
+            sink.error(
+                "SOURCE_ID_NORMALIZATION_ALERT_MISSING",
+                "Stale source-ID normalization requires component-scoped DATA_QUALITY.",
+                component_id=decision.component_id,
+            )
+        if (
+            expects_unit
+            and AlertCategory.ASSUMPTION not in decision.alert_categories
+        ):
+            sink.error(
+                "UNIT_NORMALIZATION_ALERT_MISSING",
+                "Unknown-unit discrete rounding requires a component-scoped ASSUMPTION.",
+                component_id=decision.component_id,
+            )
+
     def validate(
         self,
         snapshot: ScenarioSnapshot,
@@ -5783,6 +5939,12 @@ class IndependentPlanValidator:
             if requirement is None:
                 sink.error("UNKNOWN_REQUIREMENT_COMPONENT", "Decision has no independently reconstructed source requirement.", component_id=decision.component_id)
                 continue
+            self._check_normalization_disclosures(
+                snapshot,
+                decision,
+                requirement.component,
+                sink,
+            )
             if (
                 self._supplier_attribute_quality_required(
                     snapshot, decision.component_id
@@ -5983,6 +6145,7 @@ class IndependentPlanValidator:
                 "forced-discretionary-surplus-and-autonomy",
                 "inbound-delivery-date-netting",
                 "no-silent-gap-and-requirement-state",
+                "normalization-disclosure-source-and-rounding-parity",
                 "policy-window-comparators-6-8",
                 "rationale-citations-and-capacity-disclosure",
                 "structured-quantity-comparators-and-material-rejections",

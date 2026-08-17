@@ -8,7 +8,13 @@ from pathlib import Path
 import unittest
 
 from apex_procurement.config import EvidenceContract
-from apex_procurement.domain import AlertCategory, EvidenceStatus, PlanDisposition, Supplier
+from apex_procurement.domain import (
+    AlertCategory,
+    EvidenceStatus,
+    PlanDisposition,
+    SourceEntityNormalizationDisclosure,
+    Supplier,
+)
 from apex_procurement.policy.entity_resolution import EntityResolver
 from apex_procurement.policy.evaluator import (
     CapacityConfirmation,
@@ -325,6 +331,38 @@ class SourceNamedEntityTests(EvaluatorFixture):
         self.assertIs(result.status, EvidenceStatus.PASS)
         self.assertEqual(result.resolved_supplier_id, renamed.supplier_id)
         self.assertFalse(result.alerts)
+
+    def test_stale_source_resolution_retains_component_and_policy_provenance(
+        self,
+    ) -> None:
+        original = self.supplier("Nanjing")
+        stale = replace(original, supplier_id="supplier-renumbered")
+        suppliers = tuple(
+            stale if item is original else item for item in self.snapshot.suppliers
+        )
+        magnet = self.component("Neodymium")
+
+        evaluated = PolicyEvaluator(self.registry).evaluate_rule(
+            self.rule,
+            self.context(component=magnet, suppliers=suppliers),
+        )
+
+        alert = next(
+            item for item in evaluated.alerts if item.code == "STALE_SOURCE_ID"
+        )
+        self.assertEqual(alert.entity_id, magnet.component_id)
+        self.assertEqual(
+            alert.normalization_disclosure,
+            SourceEntityNormalizationDisclosure(
+                source_id=str(self.primary_ref["source_id"]),
+                legal_name=str(self.primary_ref["legal_name"]),
+                resolved_supplier_id=stale.supplier_id,
+                rule_id=self.rule.rule_id,
+                source_document=self.rule.source_document,
+                reference_path="directive.supplier",
+            ),
+        )
+        self.assertIn(stale.supplier_id, alert.message)
 
     def test_unresolved_shaping_reference_drops_only_that_directive(self) -> None:
         magnet = self.component("Neodymium")

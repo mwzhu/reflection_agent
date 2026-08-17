@@ -29,6 +29,8 @@ from .domain import (
     RouteInputIssue,
     RouteQuarantineScope,
     RuleSeverity,
+    SourceEntityNormalizationDisclosure,
+    UnitNormalizationDisclosure,
     ZERO,
 )
 from .policy.registry import PolicyRegistry, load_policy_registry
@@ -766,6 +768,37 @@ def _assumption_alert(decision: DecisionRecord, code: str) -> str:
     )
 
 
+def _source_entity_normalization_alert(
+    decision: DecisionRecord,
+    disclosure: SourceEntityNormalizationDisclosure,
+) -> str:
+    return (
+        f"Component {decision.component_id}, requirement {decision.requirement_id}: "
+        f"policy source {disclosure.source_document}, rule {disclosure.rule_id}, "
+        f"reference {disclosure.reference_path} retains stale source ID "
+        f"{disclosure.source_id} and legal name {disclosure.legal_name!r}. The agent "
+        f"resolved current supplier ID {disclosure.resolved_supplier_id} using one "
+        "unique exact normalized legal-name match; it did not trust the stale ID or "
+        "perform a fuzzy match. Human action: correct the policy source ID during the "
+        "next reviewed policy-pack update."
+    )
+
+
+def _unit_normalization_alert(
+    decision: DecisionRecord,
+    disclosure: UnitNormalizationDisclosure,
+) -> str:
+    return (
+        f"Component {decision.component_id}, requirement {decision.requirement_id}: "
+        f"source {disclosure.source_table}.{disclosure.source_field} supplied unit "
+        f"{disclosure.source_unit!r}, which has no configured unit semantics. The "
+        "deterministic fallback treats the unit as discrete: aggregate exact demand "
+        f"once, then round up by ceiling to increment {_number(disclosure.increment)} "
+        "before applying MOQ. No pack size or conversion factor was guessed. Human "
+        "action: configure the source unit if different quantity semantics are required."
+    )
+
+
 def _residual_alert(decision: DecisionRecord) -> str:
     return (
         f"Component {decision.component_id}, requirement {decision.requirement_id} has residual "
@@ -912,6 +945,26 @@ def render_alerts(
                 _assumption_alert(decision, code),
                 decision=decision,
             )
+
+        for index, disclosure in enumerate(
+            decision.normalization_disclosures, start=1
+        ):
+            if isinstance(disclosure, SourceEntityNormalizationDisclosure):
+                add(
+                    AlertCategory.DATA_QUALITY,
+                    f"{scope}:normalization:source-entity:{index}",
+                    _source_entity_normalization_alert(decision, disclosure),
+                    decision=decision,
+                )
+            elif isinstance(disclosure, UnitNormalizationDisclosure):
+                add(
+                    AlertCategory.ASSUMPTION,
+                    f"{scope}:normalization:unit:{index}",
+                    _unit_normalization_alert(decision, disclosure),
+                    decision=decision,
+                )
+            else:  # pragma: no cover - DecisionRecord enforces the union.
+                raise ExplanationError("unsupported normalization disclosure")
 
         approval_count = 0
         decision_count = 0

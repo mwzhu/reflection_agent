@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
+from decimal import Decimal
 from pathlib import Path
 import sqlite3
 
 import pytest
 
-from apex_procurement.domain import AlertCategory
+from apex_procurement.cli import run
+from apex_procurement.config import RuntimeConfig
+from apex_procurement.domain import (
+    AlertCategory,
+    SourceEntityNormalizationDisclosure,
+    UnitNormalizationDisclosure,
+)
 from apex_procurement.explanations import parse_owned_alert
+from apex_procurement.validator import IndependentPlanValidator
 from tests.r08_mutation_fixtures import (
     build_moq_25_net_need_5_fixture,
     build_stale_named_supplier_id_fixture,
@@ -17,6 +26,13 @@ from tests.r08_test_support import owned_alerts, purchase_order_rows, run_cli
 
 
 SUB_MOQ_RULE = "POL-PROC-001.section_4_1.sub_moq_approval"
+
+
+def _component_from_scope(scope: str) -> str | None:
+    return next(
+        (part for part in scope.split(":") if part.startswith("CMP-")),
+        None,
+    )
 
 
 def _live_sub_moq_alerts(path: Path):
@@ -167,10 +183,6 @@ def test_r12_changed_inbound_expires_live_request_and_preserves_human_rows(
     assert _business_rows(fixture.scenario_path) == before_unchanged
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="R14: required data-quality and assumption disclosures",
-)
 def test_r14_stale_named_supplier_id_discloses_legal_name_resolution(
     tmp_path: Path,
 ) -> None:
@@ -191,16 +203,31 @@ def test_r14_stale_named_supplier_id_discloses_legal_name_resolution(
         and "SUP-207" in alert.body
     )
     assert len(disclosures) == 1
+    disclosure = disclosures[0]
+    assert _component_from_scope(disclosure.scope) == "CMP-003"
+    for expected in (
+        "Nanjing Rare Earth Co.",
+        "MEMO-2025-041",
+        "MEMO-2025-041.magnet_named_primary",
+        "directive.supplier",
+        "one unique exact normalized legal-name match",
+    ):
+        assert expected in disclosure.body
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="R14: required data-quality and assumption disclosures",
-)
+@pytest.mark.parametrize("source_unit", ("box", "roll"))
 def test_r14_unknown_uom_discloses_discrete_rounding(
     tmp_path: Path,
+    source_unit: str,
 ) -> None:
     fixture = build_unknown_uom_fixture(tmp_path)
+    if source_unit != "box":
+        with closing(sqlite3.connect(fixture.scenario_path)) as connection:
+            connection.execute(
+                "UPDATE components SET unit_of_measure = ? WHERE component_id = ?",
+                (source_unit, "CMP-011"),
+            )
+            connection.commit()
 
     observed = run_cli(fixture.scenario_path)
 
@@ -213,7 +240,119 @@ def test_r14_unknown_uom_discloses_discrete_rounding(
         alert
         for alert in owned_alerts(fixture.scenario_path)
         if alert.category is AlertCategory.ASSUMPTION
-        and "box" in alert.body.lower()
+        and source_unit in alert.body.lower()
         and "discrete" in alert.body.lower()
     )
     assert len(disclosures) == 1
+    disclosure = disclosures[0]
+    assert _component_from_scope(disclosure.scope) == "CMP-011"
+    for expected in (
+        "components.unit_of_measure",
+        "aggregate exact demand once",
+        "round up by ceiling to increment 1",
+        "before applying MOQ",
+        "No pack size or conversion factor was guessed",
+    ):
+        assert expected in disclosure.body
+
+
+def test_r14_validator_rejects_missing_or_incorrect_source_normalization(
+    tmp_path: Path,
+) -> None:
+    fixture = build_stale_named_supplier_id_fixture(tmp_path)
+    artifacts = run(RuntimeConfig(fixture.scenario_path, dry_run=True))
+    decision = next(
+        item for item in artifacts.decisions if item.component_id == "CMP-003"
+    )
+    disclosure = next(
+        item
+        for item in decision.normalization_disclosures
+        if isinstance(item, SourceEntityNormalizationDisclosure)
+    )
+    validator = IndependentPlanValidator(
+        artifacts.registry,
+        policy_parameters=artifacts.registry.parameters_for(
+            artifacts.snapshot.configuration.current_date
+        ),
+    )
+
+    missing = replace(decision, normalization_disclosures=())
+    incorrect = replace(
+        decision,
+        normalization_disclosures=(
+            replace(disclosure, resolved_supplier_id="SUP-999"),
+        ),
+    )
+    missing_alert = replace(
+        decision,
+        alert_categories=tuple(
+            category
+            for category in decision.alert_categories
+            if category is not AlertCategory.DATA_QUALITY
+        ),
+    )
+
+    for changed, expected_code in (
+        (missing, "SOURCE_ID_NORMALIZATION_DISCLOSURE_MISSING"),
+        (incorrect, "NORMALIZATION_DISCLOSURE_MISMATCH"),
+        (missing_alert, "SOURCE_ID_NORMALIZATION_ALERT_MISSING"),
+    ):
+        validation = validator.validate(
+            artifacts.snapshot,
+            tuple(
+                changed if item.component_id == changed.component_id else item
+                for item in artifacts.decisions
+            ),
+            artifacts.solver_results,
+        )
+        assert expected_code in {issue.code for issue in validation.issues}
+
+
+def test_r14_validator_rejects_missing_or_incorrect_unit_normalization(
+    tmp_path: Path,
+) -> None:
+    fixture = build_unknown_uom_fixture(tmp_path)
+    artifacts = run(RuntimeConfig(fixture.scenario_path, dry_run=True))
+    decision = next(
+        item for item in artifacts.decisions if item.component_id == "CMP-011"
+    )
+    disclosure = next(
+        item
+        for item in decision.normalization_disclosures
+        if isinstance(item, UnitNormalizationDisclosure)
+    )
+    validator = IndependentPlanValidator(
+        artifacts.registry,
+        policy_parameters=artifacts.registry.parameters_for(
+            artifacts.snapshot.configuration.current_date
+        ),
+    )
+
+    missing = replace(decision, normalization_disclosures=())
+    incorrect = replace(
+        decision,
+        normalization_disclosures=(replace(disclosure, increment=Decimal("2")),),
+    )
+    missing_alert = replace(
+        decision,
+        alert_categories=tuple(
+            category
+            for category in decision.alert_categories
+            if category is not AlertCategory.ASSUMPTION
+        ),
+    )
+
+    for changed, expected_code in (
+        (missing, "UNIT_NORMALIZATION_DISCLOSURE_MISSING"),
+        (incorrect, "NORMALIZATION_DISCLOSURE_MISMATCH"),
+        (missing_alert, "UNIT_NORMALIZATION_ALERT_MISSING"),
+    ):
+        validation = validator.validate(
+            artifacts.snapshot,
+            tuple(
+                changed if item.component_id == changed.component_id else item
+                for item in artifacts.decisions
+            ),
+            artifacts.solver_results,
+        )
+        assert expected_code in {issue.code for issue in validation.issues}

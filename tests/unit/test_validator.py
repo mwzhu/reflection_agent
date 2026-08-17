@@ -815,10 +815,23 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
             (supplier, _supplier("source-two", name="Other Legal Name")),
         )
         missing = validator.resolve_source_named_entity({"source_id": "missing", "legal_name": "Missing"}, (supplier,))
+        reused = validator.resolve_source_named_entity(
+            {"source_id": "source-one", "legal_name": "Exact Legal Name"},
+            (replace(supplier, name="Reused Company"),),
+        )
+        duplicated_id = validator.resolve_source_named_entity(
+            {"source_id": "source-one", "legal_name": "Exact Legal Name"},
+            (supplier, replace(supplier, name="Duplicate ID Company")),
+        )
         self.assertEqual(same.outcome, NamedEntityOutcome.RESOLVED)
         self.assertEqual(stale.outcome, NamedEntityOutcome.STALE_SOURCE_ID)
         self.assertEqual(conflict.outcome, NamedEntityOutcome.CONFLICT)
         self.assertEqual(missing.outcome, NamedEntityOutcome.MISSING_OR_AMBIGUOUS)
+        self.assertEqual(reused.outcome, NamedEntityOutcome.MISSING_OR_AMBIGUOUS)
+        self.assertEqual(
+            duplicated_id.outcome,
+            NamedEntityOutcome.MISSING_OR_AMBIGUOUS,
+        )
 
     def test_module_import_and_validation_never_import_optimizer(self) -> None:
         sys.modules.pop("apex_procurement.optimizer", None)
