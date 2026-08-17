@@ -576,10 +576,13 @@ Rule kinds: `supplier_eligibility`, `component_classification`, `sourcing_prefer
 written supplier approval."* Without this the planner has only two framings for an extreme MOQ —
 overbuy or nothing — and neither is what a human would do when the need is 1 and the MOQ is 1,000.
 §4.1 compiles as a `documentation_requirement` with `evidence_basis: external_system`, which under
-both contracts maps to `RECOMMEND_APPROVAL`. It generates a second candidate on any requirement where
-MOQ exceeds the net need: the MOQ order (executable, surplus disclosed) and the sub-MOQ order
-(`RECOMMEND_APPROVAL`, carrying the written-approval requirement). The alert costs both so the
-customer chooses rather than the agent guessing.
+both contracts maps to `RECOMMEND_APPROVAL`. The optimizer computes a second candidate on any
+requirement where MOQ exceeds the net need: the MOQ order (executable, surplus disclosed) and the
+sub-MOQ order (carrying the written-approval requirement). If no mutually exclusive executable MOQ
+action is committed and the sub-MOQ route remains applicable, it persists as a complete live
+`RECOMMEND_APPROVAL`. Once the executable MOQ action is selected for commitment, the sub-MOQ
+counterfactual is non-actionable cost diagnostic information only and no live approval request for it
+persists.
 
 **Directives with a stated duration but no end date carry `estimated_duration_days`.** MEMO-2025-085
 says the PCB freeze runs *"estimated 60-90 days"* and sets no `effective_through`, so it binds
@@ -1260,11 +1263,14 @@ converts a $88 overbuy of conformal coating into a missed customer delivery. Cro
 decision, and a different one.) Execution remains subject to the *genuine* gates: §7's $50k/$150k
 approval thresholds, which are Apex's rules rather than ours.
 
-**Where forced surplus is extreme, offer the third option instead of picking one.** Policy §4.1 grants
-it: *"Orders below MOQ require written supplier approval."* When the need is 1 and the MOQ is 1,000,
-the alert costs both routes — order the MOQ with surplus disclosed, or seek written supplier approval
-for a sub-MOQ order — and lets Apex choose (§5.1). Assuming "every planner just buys the MOQ" is
-usually right and wrong at exactly the extremes where it matters.
+**Where forced surplus is extreme, compute the third option but keep one live decision frontier.**
+Policy §4.1 grants it: *"Orders below MOQ require written supplier approval."* When the need is 1 and
+the MOQ is 1,000, the optimizer costs both routes — order the MOQ with surplus disclosed, or seek
+written supplier approval for a sub-MOQ order. The sub-MOQ proposal remains a live
+`RECOMMEND_APPROVAL` only when no mutually exclusive executable action was committed and current
+facts still make it applicable. After an executable MOQ commitment is selected, it is retained at
+most as explicitly non-actionable diagnostic context (§5.1). Assuming "every planner just buys the
+MOQ" is usually right and wrong at exactly the extremes where it matters.
 
 **Boundary semantics are stated because "within the bound" is ambiguous.** The comparison is
 inclusive: a plan at exactly the threshold executes; only a plan strictly above it routes to
@@ -1333,8 +1339,11 @@ solve can never be `INFEASIBLE`.
 
 Separately, every **candidate plan** carries exactly one disposition. A requirement executes **at most
 one** `EXECUTE`/`EXECUTE_WITH_ASSUMPTION` candidate and may simultaneously surface any number of
-`RECOMMEND_APPROVAL` or `DECISION_REQUIRED` alternatives in `alerts`. A requirement with no executable
-candidate writes no purchase order. A partial PO is never given an `INFEASIBLE` disposition: it carries
+still-applicable, non-mutually-exclusive `RECOMMEND_APPROVAL` or `DECISION_REQUIRED` alternatives in
+`alerts`. A computed sub-MOQ counterfactual is therefore live only when no mutually exclusive
+executable MOQ action was committed; after commitment it is non-actionable diagnostic information and
+does not persist as `RECOMMEND_APPROVAL`. A requirement with no executable candidate writes no purchase
+order. A partial PO is never given an `INFEASIBLE` disposition: it carries
 an executable disposition while its fulfillment status is `PARTIALLY_FULFILLED`, with the residual gap
 in an alert. Its resolution status may simultaneously be `INFEASIBLE` if certified, independently
 reproduced search finds the rest cannot be sourced. A requirement with only approval- or
@@ -2138,8 +2147,9 @@ Success criteria:
   discretionary part. A component whose MOQ exceeds its net
   need still produces an executable PO with a FORCED_SURPLUS alert — the small-order regression
   (one product x 2, empty inventory) writes a PO for every component with an eligible supplier.
-- Where MOQ greatly exceeds need, a §4.1 sub-MOQ RECOMMEND_APPROVAL candidate is generated alongside
-  the executable MOQ order.
+- Where MOQ greatly exceeds need, a §4.1 sub-MOQ counterfactual is computed alongside the executable
+  MOQ order. It persists as a live `RECOMMEND_APPROVAL` only when no mutually exclusive executable
+  action was committed and it remains applicable; otherwise it is non-actionable diagnostic context.
 - Exception-bearing routes allocate only to qualifying buckets, and the aggregate per exception is
   within the net unresolved shortage of those buckets; adding on-hand to the qualifying bucket reduces
   the allowance by the same amount.

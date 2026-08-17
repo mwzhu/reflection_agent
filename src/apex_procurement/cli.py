@@ -578,6 +578,8 @@ def _decision_categories(
     batch: EvaluationBatch,
     component_id: str,
     outcome: object | None,
+    *,
+    applicable_alternatives: Sequence[CandidatePlan] | None = None,
 ) -> tuple[AlertCategory, ...]:
     categories = {
         item.category
@@ -624,7 +626,11 @@ def _decision_categories(
 
     categories.update(item.category for item in getattr(outcome, "alerts"))
     selected = getattr(outcome, "selected_plan")
-    alternatives = getattr(outcome, "alternatives")
+    alternatives = (
+        tuple(getattr(outcome, "alternatives"))
+        if applicable_alternatives is None
+        else tuple(applicable_alternatives)
+    )
     residual = getattr(outcome, "residual_gap")
     if residual > ZERO:
         categories.add(AlertCategory.UNMET_DEMAND)
@@ -739,8 +745,15 @@ def _planned_decision(
 ) -> DecisionRecord:
     ledger = ledgers.ledger_for(component_id)
     selected = getattr(outcome, "selected_plan")
+    sub_moq_approval_rule_ids = frozenset(
+        rule.rule_id
+        for rule in registry.active_rules(snapshot.configuration.current_date)
+        if _rule_kind(rule) == "sub_moq_written_approval"
+    )
     alternatives = _nonredundant_alternatives(
-        selected, getattr(outcome, "alternatives")
+        selected,
+        getattr(outcome, "alternatives"),
+        sub_moq_approval_rule_ids=sub_moq_approval_rule_ids,
     )
     planned_coverage = selected.eventual_covered_quantity if selected is not None else ZERO
     existing_coverage = min(ledger.total_demand, ledger.eventual_supply)
@@ -781,6 +794,7 @@ def _planned_decision(
             batch,
             component_id,
             outcome,
+            applicable_alternatives=alternatives,
         ),
         rationale="Pending deterministic rendering.",
         deadline_lateness=post_plan_deadline_lateness(
@@ -1235,18 +1249,40 @@ def _plan_line_facts(plan: CandidatePlan) -> tuple[tuple[object, ...], ...]:
 def _nonredundant_alternatives(
     selected: CandidatePlan | None,
     alternatives: Sequence[CandidatePlan],
+    *,
+    sub_moq_approval_rule_ids: frozenset[str] = frozenset(),
 ) -> tuple[CandidatePlan, ...]:
-    """Keep only counterfactuals that actually change the selected action.
+    """Keep only counterfactuals applicable at the current decision frontier.
 
     A relaxed rule that produces the identical plan proves the relaxation was
     unnecessary.  It is neither an approval proposal nor a second semantic
     action and must not enter the recommendation set.
+
+    Selecting an executable plan with forced surplus also closes any live
+    sub-MOQ approval path for that requirement.  The optimizer still computes
+    the counterfactual, but it is mutually exclusive with the commitment and
+    therefore is not persisted as a current approval request.  If execution
+    is withheld for another reason, the complete proposal remains applicable.
     """
 
     selected_facts = _plan_line_facts(selected) if selected is not None else None
     result: list[CandidatePlan] = []
     seen: set[tuple[tuple[object, ...], ...]] = set()
     for plan in alternatives:
+        represented_sub_moq_approval = (
+            plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
+            and bool(
+                sub_moq_approval_rule_ids
+                & set(plan.relaxed_rule_ids)
+                & set(plan.unresolved_approval_ids)
+            )
+        )
+        if (
+            selected is not None
+            and selected.forced_surplus > ZERO
+            and represented_sub_moq_approval
+        ):
+            continue
         facts = _plan_line_facts(plan)
         if selected_facts is not None and facts == selected_facts:
             continue

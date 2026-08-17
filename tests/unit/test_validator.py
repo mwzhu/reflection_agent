@@ -616,7 +616,7 @@ class IndependentValidatorMutationTests(unittest.TestCase):
 
 
 class IndependentValidatorEdgeTests(unittest.TestCase):
-    def test_represented_sub_moq_proposal_may_share_the_selected_route(self) -> None:
+    def test_selected_moq_rejects_a_live_sub_moq_approval(self) -> None:
         snapshot = _snapshot(demand=Decimal("1"), moq=Decimal("5"))
         decision, results, validator = _decision_and_results(
             snapshot,
@@ -687,7 +687,8 @@ class IndependentValidatorEdgeTests(unittest.TestCase):
         )
         self.assertNotIn("MOQ_VIOLATION", _codes(result))
         self.assertNotIn("DUPLICATE_ACTION", _codes(result))
-        self.assertTrue(result.is_valid, result.issues)
+        self.assertIn("LIVE_SUB_MOQ_AFTER_COMMIT", _codes(result))
+        self.assertFalse(result.is_valid)
 
     def test_phased_objective_uses_only_allocations_assigned_by_deadline(self) -> None:
         snapshot = _snapshot(demand=Decimal("5"))
