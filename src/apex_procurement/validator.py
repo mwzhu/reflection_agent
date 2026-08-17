@@ -635,6 +635,34 @@ class IndependentPlanValidator:
             raise ValueError("policy_parameters do not belong to the active registry")
         return parameters
 
+    def _standard_lead_days(
+        self, current: date, catalog: SupplierCatalogLine
+    ) -> int:
+        """Independently apply the active standard-lead semantic contract."""
+
+        parameter = self._parameters(current).standard_lead_time
+        if parameter.calculation != "order_date_plus_quoted_lead_time":
+            raise ValueError("unsupported active standard lead-time calculation")
+        return catalog.lead_time_days
+
+    def _air_lead_days(
+        self, current: date, catalog: SupplierCatalogLine
+    ) -> int | None:
+        """Independently derive the effective air lead from typed policy data."""
+
+        parameter = self._parameters(current).air_freight_lead_time
+        if parameter is None:
+            return None
+        standard = self._standard_lead_days(current, catalog)
+        return max(
+            standard - parameter.lead_time_reduction_days,
+            parameter.minimum_lead_time_days,
+        )
+
+    def _is_air_shipping(self, current: date, shipping_method: str) -> bool:
+        parameter = self._parameters(current).air_freight_lead_time
+        return parameter is not None and shipping_method == parameter.shipping_mode
+
     # ---- independent policy and source reconstruction -----------------
 
     def _rules(self, current: date, kind: str) -> tuple[PolicyRule, ...]:
@@ -1400,7 +1428,13 @@ class IndependentPlanValidator:
         if not domestic:
             return "c"
         if not any(
-            snapshot.configuration.current_date + timedelta(days=item[1].lead_time_days) <= due
+            snapshot.configuration.current_date
+            + timedelta(
+                days=self._standard_lead_days(
+                    snapshot.configuration.current_date, item[1]
+                )
+            )
+            <= due
             for item in domestic
         ):
             return "a"
@@ -1491,6 +1525,8 @@ class IndependentPlanValidator:
         include_unapproved: bool = False,
         include_evidence_blocked: bool = False,
     ) -> tuple[_Offer, ...]:
+        current = snapshot.configuration.current_date
+        parameters = self._parameters(current)
         suppliers = {item.supplier_id: item for item in snapshot.suppliers}
         catalogs = tuple(item for item in snapshot.catalog_lines if item.component_id == requirement.component.component_id)
         quarantined_suppliers = _quarantined_supplier_ids(snapshot)
@@ -1556,10 +1592,11 @@ class IndependentPlanValidator:
         ).domestic_premiums.for_critical_status(critical_status).rule_id
         result: list[_Offer] = []
         for supplier, catalog, _assumption in eligible:
+            standard_lead = self._standard_lead_days(current, catalog)
             country_status = self._concept("domestic_supplier", supplier)
             country_unknown = country_status is EvidenceStatus.UNKNOWN
             international = country_status is not EvidenceStatus.PASS
-            expected = snapshot.configuration.current_date + timedelta(days=catalog.lead_time_days)
+            expected = current + timedelta(days=standard_lead)
             pcb = self._concept("printed_circuit_board_component", requirement.component) is EvidenceStatus.PASS
             buffer = self.receiving_buffer_days if requirement.component.is_hazardous or pcb else 0
             material = expected + timedelta(days=buffer)
@@ -1568,7 +1605,7 @@ class IndependentPlanValidator:
             )
             supplier_hash = _supplier_fingerprint(supplier)
             route_hash = _route_fingerprint(
-                requirement.component, catalog, "standard", catalog.lead_time_days
+                requirement.component, catalog, "standard", standard_lead
             )
             gate_conditions = tuple(
                 (due, gate[(supplier.supplier_id, due)] or "shut")
@@ -1616,7 +1653,13 @@ class IndependentPlanValidator:
                     if _condition == "b":
                         allowance += forced_allocation_surplus
                     bound = min(bound, allowance)
-                if bound < catalog.minimum_order_quantity:
+                sub_moq_approval_available = bool(
+                    self._rules(current, "sub_moq_written_approval")
+                )
+                if bound <= ZERO or (
+                    bound < catalog.minimum_order_quantity
+                    and not (include_unapproved and sub_moq_approval_available)
+                ):
                     continue
                 result.append(
                     _Offer(
@@ -1625,7 +1668,7 @@ class IndependentPlanValidator:
                         catalog,
                         expected,
                         material,
-                        catalog.lead_time_days,
+                        standard_lead,
                         "standard",
                         international,
                         country_status,
@@ -1644,14 +1687,12 @@ class IndependentPlanValidator:
                         ),
                     )
                 )
-            air_rules = self._rules(snapshot.configuration.current_date, "air_freight_authorization")
-            if not international or country_unknown or not air_rules:
+            air_parameter = parameters.air_freight_lead_time
+            if not international or country_unknown or air_parameter is None:
                 continue
-            air_rule = air_rules[0]
-            reduction = int(air_rule.data["constraint"]["lead_time_reduction_days"])
-            minimum_lead = int(air_rule.data["constraint"]["minimum_lead_time_days"])
-            air_lead = max(minimum_lead, catalog.lead_time_days - reduction)
-            if air_lead >= catalog.lead_time_days:
+            air_lead = self._air_lead_days(current, catalog)
+            assert air_lead is not None
+            if air_lead >= standard_lead:
                 continue
             approval_rules = (
                 *self._rules(snapshot.configuration.current_date, "air_freight_individual_approval"),
@@ -1660,10 +1701,13 @@ class IndependentPlanValidator:
             approvals_satisfied = all(item.rule_id in self.approved_rule_ids for item in approval_rules)
             if not include_unapproved and not approvals_satisfied:
                 continue
-            air_expected = snapshot.configuration.current_date + timedelta(days=air_lead)
+            air_expected = current + timedelta(days=air_lead)
             air_material = air_expected + timedelta(days=buffer)
             air_route_hash = _route_fingerprint(
-                requirement.component, catalog, "air freight", air_lead
+                requirement.component,
+                catalog,
+                air_parameter.shipping_mode,
+                air_lead,
             )
             air_groups: dict[str, list[date]] = defaultdict(list)
             for due, _quantity in requirement.bucket_quantities:
@@ -1686,7 +1730,13 @@ class IndependentPlanValidator:
                         ZERO,
                     ),
                 )
-                if air_bound < catalog.minimum_order_quantity:
+                sub_moq_approval_available = bool(
+                    self._rules(current, "sub_moq_written_approval")
+                )
+                if air_bound <= ZERO or (
+                    air_bound < catalog.minimum_order_quantity
+                    and not (include_unapproved and sub_moq_approval_available)
+                ):
                     continue
                 result.append(
                     _Offer(
@@ -1696,7 +1746,7 @@ class IndependentPlanValidator:
                         air_expected,
                         air_material,
                         air_lead,
-                        "air freight",
+                        air_parameter.shipping_mode,
                         international,
                         country_status,
                         review_keys,
@@ -1710,7 +1760,7 @@ class IndependentPlanValidator:
                             air_route_hash,
                             (
                                 f"{premium_rule_id}:condition_{_condition}",
-                                air_rule.rule_id,
+                                air_parameter.rule_id,
                             ),
                             air_allowed,
                             air_allowed,
@@ -2006,7 +2056,12 @@ class IndependentPlanValidator:
                         assert best_rating is not None
                         sustainability_penalty += (best_rating - current_rating) * allocation.quantity
         weighted_lead = sum(
-            (line.quantity * Decimal((line.expected_delivery_date - line.order_date).days) for line in plan.lines), ZERO
+            (
+                line.quantity * Decimal(offer.lead_days)
+                for line in plan.lines
+                if (offer := matched.get(line.route_id)) is not None
+            ),
+            ZERO,
         )
         return tuple(physical_gaps) + (
             unit_late,
@@ -2483,6 +2538,7 @@ class IndependentPlanValidator:
                 component_id=decision.component_id,
             )
 
+        current = snapshot.configuration.current_date
         buffer_days = (
             self.receiving_buffer_days
             if requirement.component.is_hazardous
@@ -2517,16 +2573,15 @@ class IndependentPlanValidator:
                 for item in rationale_offers
             ):
                 continue
+            standard_lead = self._standard_lead_days(current, catalog)
             supplier_hash = _supplier_fingerprint(supplier)
             route_hash = _route_fingerprint(
                 requirement.component,
                 catalog,
                 "standard",
-                catalog.lead_time_days,
+                standard_lead,
             )
-            expected = snapshot.configuration.current_date + timedelta(
-                days=catalog.lead_time_days
-            )
+            expected = current + timedelta(days=standard_lead)
             material = expected + timedelta(days=buffer_days)
             country_status = self._concept("domestic_supplier", supplier)
             international = country_status is not EvidenceStatus.PASS
@@ -2593,7 +2648,7 @@ class IndependentPlanValidator:
                     catalog,
                     expected,
                     material,
-                    catalog.lead_time_days,
+                    standard_lead,
                     "standard",
                     international,
                     country_status,
@@ -2720,7 +2775,7 @@ class IndependentPlanValidator:
 
         def approval_required(offer: _Offer) -> bool:
             if (
-                offer.shipping_method == "air freight"
+                self._is_air_shipping(current, offer.shipping_method)
                 and not air_approval_rule_ids.issubset(self.approved_rule_ids)
             ):
                 return True
@@ -4889,7 +4944,13 @@ class IndependentPlanValidator:
                 )
             if line.quantity > derived_u.get(line.supplier_id, ZERO):
                 sink.error("UPPER_BOUND_DERIVATION", "Line exceeds the independently derived sound U bound.", component_id=component_id, plan_id=plan_id)
-            if offer is not None and offer.shipping_method == "air freight" and plan.disposition.writes_purchase_order:
+            if (
+                offer is not None
+                and self._is_air_shipping(
+                    snapshot.configuration.current_date, offer.shipping_method
+                )
+                and plan.disposition.writes_purchase_order
+            ):
                 air_approvals = (
                     *self._rules(snapshot.configuration.current_date, "air_freight_individual_approval"),
                     *self._rules(snapshot.configuration.current_date, "air_freight_period_spend_cap"),
@@ -4908,7 +4969,19 @@ class IndependentPlanValidator:
                     sink.error("EXCEPTION_SCOPE", "International quantity was allocated where no §3 predicate is true.", component_id=component_id, plan_id=plan_id)
                 if offer.international and not any("condition_" in item for item in allocation.exception_ids):
                     sink.error("INTERNATIONAL_JUSTIFICATION_MISSING", "International allocation lacks its documented, bucket-scoped §3 justification.", component_id=component_id, plan_id=plan_id)
-                if offer.shipping_method == "air freight" and not any("air_freight_authorization" in item for item in allocation.exception_ids):
+                air_parameter = self._parameters(
+                    snapshot.configuration.current_date
+                ).air_freight_lead_time
+                if (
+                    self._is_air_shipping(
+                        snapshot.configuration.current_date,
+                        offer.shipping_method,
+                    )
+                    and (
+                        air_parameter is None
+                        or air_parameter.rule_id not in allocation.exception_ids
+                    )
+                ):
                     sink.error("AIR_EXCEPTION_SCOPE", "Air-freight allocation lacks its active memo authorization and bucket predicate.", component_id=component_id, plan_id=plan_id)
                 for exception_id in allocation.exception_ids:
                     exception_totals[exception_id] += allocation.quantity

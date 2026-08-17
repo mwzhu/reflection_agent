@@ -62,7 +62,6 @@ from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
 
 
 _STANDARD_SHIPPING = "standard"
-_AIR_SHIPPING = "air freight"
 _ELECTRONIC_CATEGORY = normalized_tokens("Electronic Component")
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 _CERTIFICATION_SPLIT_RE = re.compile(r"[,;|/]")
@@ -640,6 +639,16 @@ class CandidateBuilder:
             raise ValueError("policy_parameters do not belong to the active registry")
         return parameters
 
+    def _standard_lead_time_days(
+        self, facts: _OfferFacts, scenario_date: date
+    ) -> int:
+        """Apply the active standard-lead semantic contract in planner code."""
+
+        parameter = self._parameters(scenario_date).standard_lead_time
+        if parameter.calculation != "order_date_plus_quoted_lead_time":
+            raise ValueError("unsupported active standard lead-time calculation")
+        return facts.catalog.lead_time_days
+
     def _rules(self, kind: str, scenario_date: date) -> tuple[PolicyRule, ...]:
         return tuple(
             rule
@@ -1095,8 +1104,9 @@ class CandidateBuilder:
         return 0
 
     def _standard_material_date(self, facts: _OfferFacts, order_date: date) -> date:
+        lead_time_days = self._standard_lead_time_days(facts, order_date)
         return order_date + timedelta(
-            days=facts.catalog.lead_time_days + self._receiving_buffer(facts.component)
+            days=lead_time_days + self._receiving_buffer(facts.component)
         )
 
     def _international_evidence(
@@ -1263,7 +1273,10 @@ class CandidateBuilder:
     ) -> tuple[tuple[EvidenceResult, ...], tuple[str, ...]]:
         results: list[EvidenceResult] = []
         approvals: list[str] = []
-        authorization = self._one_rule("air_freight_authorization", scenario_date)
+        air_parameter = self._parameters(scenario_date).air_freight_lead_time
+        if air_parameter is None:
+            raise ValueError("air-freight evidence requires an active lead-time parameter")
+        authorization = self.registry.rule(air_parameter.rule_id)
         results.append(
             _evidence(
                 authorization,
@@ -1352,16 +1365,15 @@ class CandidateBuilder:
         order_date = snapshot.configuration.current_date
         expected = order_date + timedelta(days=lead_time_days)
         material = expected + timedelta(days=self._receiving_buffer(facts.component))
-        for delivery_rule in self._rules(
-            "quoted_lead_time_delivery_date", order_date
-        ):
-            all_evidence.append(
-                _evidence(
-                    delivery_rule,
-                    EvidenceStatus.PASS,
-                    "Expected delivery is the scenario order date plus the effective supplier-route lead; receiving time is excluded.",
-                )
+        delivery_parameter = self._parameters(order_date).standard_lead_time
+        delivery_rule = self.registry.rule(delivery_parameter.rule_id)
+        all_evidence.append(
+            _evidence(
+                delivery_rule,
+                EvidenceStatus.PASS,
+                "Expected delivery is the scenario order date plus the effective supplier-route lead; receiving time is excluded.",
             )
+        )
         below_b, below_b_approvals = self._below_b_evidence(
             snapshot, facts, route_hash
         )
@@ -1404,6 +1416,7 @@ class CandidateBuilder:
         gate: Mapping[tuple[str, str, date], DomesticGateDecision],
     ) -> tuple[CandidateRoute, ...]:
         order_date = snapshot.configuration.current_date
+        standard_lead_time_days = self._standard_lead_time_days(facts, order_date)
         material_date = self._standard_material_date(facts, order_date)
         buckets = ledgers.buckets_for(facts.component.component_id)
         physical_deadlines = tuple(
@@ -1415,7 +1428,7 @@ class CandidateBuilder:
                     snapshot,
                     facts,
                     shipping_method=_STANDARD_SHIPPING,
-                    lead_time_days=facts.catalog.lead_time_days,
+                    lead_time_days=standard_lead_time_days,
                     deadlines=physical_deadlines,
                     evidence=facts.base_evidence,
                 ),
@@ -1464,7 +1477,7 @@ class CandidateBuilder:
                         snapshot,
                         facts,
                         shipping_method=_STANDARD_SHIPPING,
-                        lead_time_days=facts.catalog.lead_time_days,
+                        lead_time_days=standard_lead_time_days,
                         deadlines=(),
                         evidence=facts.base_evidence
                         + self._unknown_country_evidence(
@@ -1505,7 +1518,7 @@ class CandidateBuilder:
                         snapshot,
                         facts,
                         shipping_method=_STANDARD_SHIPPING,
-                        lead_time_days=facts.catalog.lead_time_days,
+                        lead_time_days=standard_lead_time_days,
                         deadlines=allowed,
                         evidence=facts.base_evidence
                         + self._unknown_country_evidence(
@@ -1558,7 +1571,7 @@ class CandidateBuilder:
                     snapshot,
                     facts,
                     shipping_method=_STANDARD_SHIPPING,
-                    lead_time_days=facts.catalog.lead_time_days,
+                    lead_time_days=standard_lead_time_days,
                     deadlines=(),
                     evidence=facts.base_evidence
                     + self._international_evidence(decision, order_date),
@@ -1595,7 +1608,7 @@ class CandidateBuilder:
                     snapshot,
                     facts,
                     shipping_method=_STANDARD_SHIPPING,
-                    lead_time_days=facts.catalog.lead_time_days,
+                    lead_time_days=standard_lead_time_days,
                     deadlines=allowed,
                     evidence=facts.base_evidence
                     + self._international_evidence(representative, order_date),
@@ -1613,17 +1626,19 @@ class CandidateBuilder:
         gate: Mapping[tuple[str, str, date], DomesticGateDecision],
     ) -> tuple[CandidateRoute, ...]:
         scenario_date = snapshot.configuration.current_date
-        air_rules = self._rules("air_freight_authorization", scenario_date)
+        air_parameter = self._parameters(scenario_date).air_freight_lead_time
         if (
-            not air_rules
+            air_parameter is None
             or facts.domestic_status is not EvidenceStatus.FAIL
             or facts.base_status is EvidenceStatus.FAIL
         ):
             return ()
-        air_rule = air_rules[0]
-        reduction = int(air_rule.data["constraint"]["lead_time_reduction_days"])
-        minimum = int(air_rule.data["constraint"]["minimum_lead_time_days"])
-        air_lead = max(facts.catalog.lead_time_days - reduction, minimum)
+        air_rule = self.registry.rule(air_parameter.rule_id)
+        standard_lead = self._standard_lead_time_days(facts, scenario_date)
+        air_lead = max(
+            standard_lead - air_parameter.lead_time_reduction_days,
+            air_parameter.minimum_lead_time_days,
+        )
         standard_material = self._standard_material_date(facts, scenario_date)
         air_material = scenario_date + timedelta(
             days=air_lead + self._receiving_buffer(facts.component)
@@ -1645,7 +1660,7 @@ class CandidateBuilder:
                 grouped[decision.condition].append(bucket.due_date)
         routes = []
         route_hash = route_fingerprint(
-            facts.component, facts.catalog, _AIR_SHIPPING, air_lead
+            facts.component, facts.catalog, air_parameter.shipping_mode, air_lead
         )
         air_evidence, approvals = self._air_evidence(scenario_date, route_hash)
         for condition, deadlines in sorted(
@@ -1666,7 +1681,7 @@ class CandidateBuilder:
                 self._make_route(
                     snapshot,
                     facts,
-                    shipping_method=_AIR_SHIPPING,
+                    shipping_method=air_parameter.shipping_mode,
                     lead_time_days=air_lead,
                     deadlines=deadlines,
                     evidence=facts.base_evidence
@@ -1722,24 +1737,7 @@ class CandidateBuilder:
                 item for item in route.exception_codes if ":condition_" in item
             )
             if not international_codes:
-                component_international_codes = tuple(
-                    code
-                    for candidate in by_component[route.component_id]
-                    for code in candidate.exception_codes
-                    if ":condition_" in code
-                )
-                if any(
-                    item.endswith("condition_b")
-                    for item in component_international_codes
-                ):
-                    domestic_outcome = "skipped"
-                elif any(
-                    item.endswith(("condition_a", "condition_c"))
-                    for item in component_international_codes
-                ):
-                    domestic_outcome = "moot"
-                else:
-                    domestic_outcome = "not_reached"
+                domestic_outcome = "not_reached"
             elif any(item.endswith("condition_b") for item in international_codes):
                 domestic_outcome = "skipped"
             elif any(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 import inspect
 import json
@@ -67,9 +67,9 @@ def _derived_override(
     rule_id: str,
     pointer: str,
     field: str,
-    value: str,
+    value: object,
 ) -> None:
-    derivation_id = "r05_temporary_policy_override"
+    derivation_id = f"r05_temporary_policy_override_{field}"
     pack["derivations"].append(  # type: ignore[index,union-attr]
         {
             "derivation_id": derivation_id,
@@ -154,6 +154,80 @@ def _approval_snapshot() -> ScenarioSnapshot:
     )
 
 
+def _shipping_boundary_snapshot(current: date) -> ScenarioSnapshot:
+    component = Component(
+        "component-shipping-boundary",
+        "Generated General Bracket",
+        "General purpose bracket",
+        "Raw Material",
+        "each",
+        False,
+    )
+    domestic = Supplier(
+        "supplier-domestic-boundary",
+        "Generated Domestic Boundary Supply",
+        "USA",
+        True,
+        (),
+        "A",
+        "Standard",
+        True,
+    )
+    international = Supplier(
+        "supplier-international-boundary",
+        "Generated International Boundary Supply",
+        "China",
+        False,
+        (),
+        "A",
+        "Standard",
+        True,
+    )
+    product = Product(
+        "product-shipping-boundary",
+        "Generated Boundary Product",
+        None,
+        "Generated",
+        None,
+    )
+    return ScenarioSnapshot(
+        configuration=ScenarioConfiguration(current),
+        products=(product,),
+        components=(component,),
+        suppliers=(domestic, international),
+        bom_lines=(BomLine(product.product_id, component.component_id, Decimal("1")),),
+        catalog_lines=(
+            SupplierCatalogLine(
+                domestic.supplier_id,
+                component.component_id,
+                Decimal("200"),
+                20,
+                Decimal("1"),
+            ),
+            SupplierCatalogLine(
+                international.supplier_id,
+                component.component_id,
+                Decimal("100"),
+                20,
+                Decimal("1"),
+            ),
+        ),
+        production_orders=(
+            ProductionOrder(
+                "order-shipping-boundary",
+                product.product_id,
+                Decimal("5"),
+                None,
+                current + timedelta(days=10),
+            ),
+        ),
+        inventory=(InventoryPosition(component.component_id, Decimal("0")),),
+        purchase_orders=(),
+        alerts=(),
+        state_digest=f"shipping-boundary-{current.isoformat()}",
+    )
+
+
 def _plan_with_registry(registry):
     snapshot = _approval_snapshot()
     parameters = registry.parameters_for(CURRENT)
@@ -200,6 +274,169 @@ def _plan_with_registry(registry):
 
 
 class PolicyAuthorityTests(unittest.TestCase):
+    def test_shipping_boundaries_keep_planner_and_validator_in_exact_parity(self) -> None:
+        registry = load_policy_registry()
+        expected_air = {
+            date(2025, 1, 15): False,
+            date(2025, 1, 16): False,
+            date(2025, 6, 30): False,
+            date(2025, 7, 1): True,
+            date(2025, 7, 2): True,
+            date(2025, 9, 29): True,
+            date(2025, 9, 30): True,
+            date(2025, 10, 1): False,
+        }
+
+        for current, air_active in expected_air.items():
+            with self.subTest(current=current):
+                snapshot = _shipping_boundary_snapshot(current)
+                parameters = registry.parameters_for(current)
+                ledgers = build_ledgers(snapshot)
+                candidates = CandidateBuilder(
+                    registry,
+                    EvidenceContract.BENCHMARK,
+                    policy_parameters=parameters,
+                ).build(snapshot, ledgers)
+                validator = IndependentPlanValidator(
+                    registry,
+                    policy_parameters=parameters,
+                )
+                sink = type(
+                    "Sink",
+                    (),
+                    {"error": lambda *args, **kwargs: None},
+                )()
+                requirement = validator._source_requirements(snapshot, sink)[
+                    "component-shipping-boundary"
+                ]
+                offers = validator._offers(
+                    snapshot,
+                    requirement,
+                    EvidenceContract.BENCHMARK,
+                    include_unapproved=True,
+                )
+
+                planner_routes = {
+                    (
+                        route.shipping_method,
+                        route.lead_time_days,
+                        route.expected_delivery_date,
+                        route.material_available_date,
+                        route.route_id,
+                    )
+                    for route in candidates.routes
+                    if route.supplier_id == "supplier-international-boundary"
+                }
+                validator_routes = {
+                    (
+                        offer.shipping_method,
+                        offer.lead_days,
+                        offer.expected_delivery,
+                        offer.material_available,
+                        offer.route_id,
+                    )
+                    for offer in offers
+                    if offer.supplier.supplier_id
+                    == "supplier-international-boundary"
+                }
+                self.assertEqual(planner_routes, validator_routes)
+
+                air_parameter = parameters.air_freight_lead_time
+                planner_air = tuple(
+                    route
+                    for route in candidates.routes
+                    if air_parameter is not None
+                    and route.shipping_method == air_parameter.shipping_mode
+                )
+                validator_air = tuple(
+                    offer
+                    for offer in offers
+                    if air_parameter is not None
+                    and offer.shipping_method == air_parameter.shipping_mode
+                )
+                self.assertEqual(bool(planner_air), air_active)
+                self.assertEqual(bool(validator_air), air_active)
+                if air_parameter is not None:
+                    self.assertTrue(
+                        all(
+                            air_parameter.rule_id in route.exception_codes
+                            for route in planner_air
+                        )
+                    )
+                    self.assertEqual(
+                        {(route.lead_time_days) for route in planner_air},
+                        {7},
+                    )
+                    self.assertEqual(
+                        {(offer.lead_days) for offer in validator_air},
+                        {7},
+                    )
+
+    def test_air_lead_mutation_changes_both_independent_calculations(self) -> None:
+        mutated_pack = deepcopy(_pack())
+        rule_id = "MEMO-2025-072.air_freight_authorization"
+        _derived_override(
+            mutated_pack,
+            rule_id=rule_id,
+            pointer="/constraint/lead_time_reduction_days",
+            field="lead_time_reduction_days",
+            value=12,
+        )
+        _derived_override(
+            mutated_pack,
+            rule_id=rule_id,
+            pointer="/constraint/minimum_lead_time_days",
+            field="minimum_lead_time_days",
+            value=9,
+        )
+        directory, registry = _registry_from(mutated_pack)
+        self.addCleanup(directory.cleanup)
+        current = date(2025, 7, 1)
+        snapshot = _shipping_boundary_snapshot(current)
+        parameters = registry.parameters_for(current)
+        air_parameter = parameters.air_freight_lead_time
+        assert air_parameter is not None
+        self.assertEqual(air_parameter.lead_time_reduction_days, 12)
+        self.assertEqual(air_parameter.minimum_lead_time_days, 9)
+
+        ledgers = build_ledgers(snapshot)
+        candidates = CandidateBuilder(
+            registry,
+            EvidenceContract.BENCHMARK,
+            policy_parameters=parameters,
+        ).build(snapshot, ledgers)
+        validator = IndependentPlanValidator(
+            registry,
+            policy_parameters=parameters,
+        )
+        sink = type(
+            "Sink",
+            (),
+            {"error": lambda *args, **kwargs: None},
+        )()
+        requirement = validator._source_requirements(snapshot, sink)[
+            "component-shipping-boundary"
+        ]
+        offers = validator._offers(
+            snapshot,
+            requirement,
+            EvidenceContract.BENCHMARK,
+            include_unapproved=True,
+        )
+
+        planner_air_leads = {
+            route.lead_time_days
+            for route in candidates.routes
+            if route.shipping_method == air_parameter.shipping_mode
+        }
+        validator_air_leads = {
+            offer.lead_days
+            for offer in offers
+            if offer.shipping_method == air_parameter.shipping_mode
+        }
+        self.assertEqual(planner_air_leads, {9})
+        self.assertEqual(validator_air_leads, {9})
+
     def test_domestic_threshold_mutation_changes_planner_and_validator_readings(self) -> None:
         ordinary_rule = "POL-PROC-001.section_3.domestic_preference"
         original = load_policy_registry()

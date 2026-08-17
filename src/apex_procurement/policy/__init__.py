@@ -1,6 +1,7 @@
 """Validated, immutable access to Apex's checked-in compiled policy pack."""
 
 from .parameters import (
+    AirFreightLeadTimeParameters,
     AirFreightPeriodCapParameters,
     ApplicablePolicyParameters,
     ApprovalThresholdParameters,
@@ -10,6 +11,7 @@ from .parameters import (
     EmergencyApprovalParameters,
     SecondaryAllocationParameters,
     SemanticScope,
+    StandardLeadTimeParameters,
     StrategicContinuityParameters,
     SupplierVolumeCapParameters,
     SustainabilityParameters,
@@ -18,6 +20,7 @@ from .registry import PolicyRegistry, PolicyRule, load_policy_registry
 from .schema import PolicyValidationError, compute_content_hash, validate_policy_documents
 
 __all__ = [
+    "AirFreightLeadTimeParameters",
     "AirFreightPeriodCapParameters",
     "ApplicablePolicyParameters",
     "ApprovalThresholdParameters",
@@ -30,6 +33,7 @@ __all__ = [
     "PolicyValidationError",
     "SecondaryAllocationParameters",
     "SemanticScope",
+    "StandardLeadTimeParameters",
     "StrategicContinuityParameters",
     "SupplierVolumeCapParameters",
     "SustainabilityParameters",
