@@ -39,6 +39,8 @@ from .domain import (
     PlanDisposition,
     PlanLine,
     ResolutionStatus,
+    RouteInputIssue,
+    RouteQuarantineScope,
     RuleSeverity,
     ScenarioSnapshot,
     SolveKind,
@@ -91,6 +93,25 @@ _EXECUTABLE_OBJECTIVE_SUFFIX = (
     "stage_10_line_count",
 )
 _COMPLIANCE_DIAGNOSTIC_PREFIX = "Non-executable compliance-cost diagnostic;"
+
+
+def _quarantined_supplier_ids(snapshot: ScenarioSnapshot) -> frozenset[str]:
+    return frozenset(
+        issue.supplier_id
+        for issue in snapshot.route_input_issues
+        if issue.blast_radius is RouteQuarantineScope.SUPPLIER_ALL_ROUTES
+    )
+
+
+def _quarantined_catalog_keys(
+    snapshot: ScenarioSnapshot,
+) -> frozenset[tuple[str, str]]:
+    return frozenset(
+        (issue.supplier_id, issue.component_id)
+        for issue in snapshot.route_input_issues
+        if issue.blast_radius is RouteQuarantineScope.CATALOG_OFFER
+        and issue.component_id is not None
+    )
 
 
 def _evidence_contract_blockers(plan: CandidatePlan) -> tuple[EvidenceResult, ...]:
@@ -1215,9 +1236,21 @@ class IndependentPlanValidator:
     ) -> tuple[_Offer, ...]:
         suppliers = {item.supplier_id: item for item in snapshot.suppliers}
         catalogs = tuple(item for item in snapshot.catalog_lines if item.component_id == requirement.component.component_id)
+        quarantined_suppliers = _quarantined_supplier_ids(snapshot)
+        quarantined_catalogs = _quarantined_catalog_keys(snapshot)
         eligible: list[tuple[Supplier, SupplierCatalogLine, bool]] = []
         for catalog in catalogs:
-            supplier = suppliers[catalog.supplier_id]
+            if (
+                catalog.supplier_id in quarantined_suppliers
+                or (catalog.supplier_id, catalog.component_id)
+                in quarantined_catalogs
+            ):
+                continue
+            supplier = suppliers.get(catalog.supplier_id)
+            if supplier is None:
+                # Snapshot quarantine validation reports an unaccounted
+                # missing supplier.  It must never become a source offer.
+                continue
             allowed, assumption = self._hard_eligible(
                 snapshot,
                 requirement,
@@ -4299,6 +4332,121 @@ class IndependentPlanValidator:
                     verified = False
         return verified
 
+    def _check_route_quarantine(
+        self,
+        snapshot: ScenarioSnapshot,
+        decisions: Sequence[DecisionRecord],
+        sink: _IssueSink,
+    ) -> None:
+        """Independently reconstruct the route set removed by source quarantine."""
+
+        issues = tuple(snapshot.route_input_issues)
+        if any(not isinstance(item, RouteInputIssue) for item in issues):
+            sink.error(
+                "INVALID_ROUTE_ISSUE",
+                "Snapshot route-input issues are not typed quarantine records.",
+            )
+            return
+        supplier_ids = {item.supplier_id for item in snapshot.suppliers}
+        component_ids = {item.component_id for item in snapshot.components}
+        catalog_keys = {
+            (item.supplier_id, item.component_id)
+            for item in snapshot.catalog_lines
+        }
+        catalog_components: dict[str, set[str]] = defaultdict(set)
+        for supplier_id, component_id in catalog_keys:
+            catalog_components[supplier_id].add(component_id)
+
+        quarantined_suppliers = _quarantined_supplier_ids(snapshot)
+        quarantined_catalogs = _quarantined_catalog_keys(snapshot)
+        for issue in issues:
+            if any(
+                component_id not in component_ids
+                for component_id in issue.affected_component_ids
+            ):
+                sink.error(
+                    "QUARANTINE_COMPONENT_UNKNOWN",
+                    "A route-input issue names an affected component absent from master data.",
+                )
+            if issue.blast_radius is RouteQuarantineScope.SUPPLIER_ALL_ROUTES:
+                if issue.supplier_id in supplier_ids:
+                    sink.error(
+                        "QUARANTINED_SUPPLIER_PRESENT",
+                        "A supplier-wide malformed source row remained eligible as a typed supplier.",
+                    )
+                if not catalog_components.get(issue.supplier_id, set()).issubset(
+                    set(issue.affected_component_ids)
+                ):
+                    sink.error(
+                        "QUARANTINE_BLAST_RADIUS_MISMATCH",
+                        "Supplier-wide quarantine does not cover every reconstructable catalog route.",
+                    )
+            else:
+                key = (issue.supplier_id, issue.component_id)
+                if key in catalog_keys:
+                    sink.error(
+                        "QUARANTINED_CATALOG_PRESENT",
+                        "A malformed catalog offer remained available as a typed source offer.",
+                        component_id=issue.component_id,
+                    )
+
+        for supplier_id, component_id in catalog_keys:
+            if (
+                supplier_id not in supplier_ids
+                and supplier_id not in quarantined_suppliers
+            ):
+                sink.error(
+                    "UNACCOUNTED_CATALOG_SUPPLIER",
+                    "A catalog offer lacks a typed supplier and no supplier-wide issue explains it.",
+                    component_id=component_id,
+                )
+
+        for decision in decisions:
+            relevant = tuple(
+                issue
+                for issue in issues
+                if decision.component_id in issue.affected_component_ids
+            )
+            if not relevant:
+                continue
+            if AlertCategory.DATA_QUALITY not in decision.alert_categories:
+                sink.error(
+                    "QUARANTINE_ALERT_MISSING",
+                    "Every demanded component touched by route quarantine requires DATA_QUALITY.",
+                    component_id=decision.component_id,
+                )
+            plans = tuple(
+                plan
+                for plan in (decision.selected_plan, *decision.alternatives)
+                if plan is not None
+            )
+            for plan in plans:
+                for line in plan.lines:
+                    if line.supplier_id in quarantined_suppliers or (
+                        line.supplier_id,
+                        line.component_id,
+                    ) in quarantined_catalogs:
+                        sink.error(
+                            "QUARANTINED_ROUTE_SELECTED",
+                            "A managed plan uses a quarantined source route.",
+                            component_id=decision.component_id,
+                            plan_id=plan.plan_id,
+                        )
+            if decision.residual_gap > ZERO:
+                if decision.requirement_state.resolution is not ResolutionStatus.UNRESOLVED:
+                    sink.error(
+                        "QUARANTINE_INFEASIBILITY_CLAIM",
+                        "Route quarantine prevents a proven infeasibility "
+                        "classification; the residual must remain UNRESOLVED.",
+                        component_id=decision.component_id,
+                    )
+                if AlertCategory.NO_ELIGIBLE_SUPPLIER in decision.alert_categories:
+                    sink.error(
+                        "QUARANTINE_FALSE_NO_ELIGIBLE",
+                        "Quarantined commercial evidence cannot support NO_ELIGIBLE_SUPPLIER.",
+                        component_id=decision.component_id,
+                    )
+
     def validate(
         self,
         snapshot: ScenarioSnapshot,
@@ -4466,6 +4614,7 @@ class IndependentPlanValidator:
         for component_id, records in by_component.items():
             if len(records) > 1:
                 sink.error("MULTIPLE_COMPONENT_DECISIONS", "A component requirement may not execute more than one selected decision.", component_id=component_id)
+        self._check_route_quarantine(snapshot, decision_tuple, sink)
         # A forced solve-Q surplus is advisory.  Withholding solely because it
         # exceeds the discretionary ratio is a validator defect, not an outcome.
         for decision in decision_tuple:
@@ -4492,6 +4641,7 @@ class IndependentPlanValidator:
                 "no-silent-gap-and-requirement-state",
                 "policy-window-comparators-6-8",
                 "rationale-citations-and-capacity-disclosure",
+                "route-input-quarantine-and-data-quality",
                 "time-phased-recovery-lateness-and-alerts",
                 "u-derivation",
             ),

@@ -31,6 +31,8 @@ from apex_procurement.domain import (
     ProductionOrder,
     RequirementState,
     ResolutionStatus,
+    RouteInputIssue,
+    RouteQuarantineScope,
     RuleSeverity,
     ScenarioConfiguration,
     ScenarioSnapshot,
@@ -358,6 +360,59 @@ class IndependentValidatorMutationTests(unittest.TestCase):
         assert plan is not None
         object.__setattr__(plan.lines[0], "supplier_id", "supplier-missing")
         self.assertIn("CATALOG_ROUTE_MISMATCH", self.validate_mutation(self.decision))
+
+    def test_route_quarantine_is_reconstructed_without_planner_helpers(self) -> None:
+        malformed = _supplier("supplier-malformed")
+        valid = _supplier("supplier-valid")
+        snapshot = _snapshot(
+            suppliers=(malformed, valid),
+            catalogs=(
+                SupplierCatalogLine(
+                    valid.supplier_id,
+                    "component-a",
+                    Decimal("3"),
+                    3,
+                    Decimal("1"),
+                ),
+            ),
+        )
+        issue = RouteInputIssue(
+            source_table="supplier_catalog",
+            supplier_id=malformed.supplier_id,
+            component_id="component-a",
+            affected_component_ids=("component-a",),
+            field="unit_price",
+            reason_code="INVALID_DECIMAL",
+            safe_reason="the value is not a finite decimal",
+            blast_radius=RouteQuarantineScope.CATALOG_OFFER,
+            action="quarantined only this catalog offer and used no substitute value",
+            remediation="correct the source field and rerun from a fresh snapshot",
+            raw_value_type="text",
+            raw_value_sha256="0" * 64,
+        )
+        snapshot = replace(snapshot, route_input_issues=(issue,))
+        decision, results, validator = _decision_and_results(snapshot)
+
+        missing = validator.validate(snapshot, (decision,), results)
+        self.assertIn("QUARANTINE_ALERT_MISSING", _codes(missing))
+
+        disclosed = replace(
+            decision,
+            alert_categories=tuple(
+                sorted(
+                    {*decision.alert_categories, AlertCategory.DATA_QUALITY},
+                    key=lambda item: item.value,
+                )
+            ),
+        )
+        validated = validator.validate(snapshot, (disclosed,), results)
+        self.assertTrue(validated.is_valid, validated.issues)
+
+        forged_issue = replace(issue, supplier_id=valid.supplier_id)
+        forged_snapshot = replace(snapshot, route_input_issues=(forged_issue,))
+        rejected = validator.validate(forged_snapshot, (disclosed,), results)
+        self.assertIn("QUARANTINED_CATALOG_PRESENT", _codes(rejected))
+        self.assertIn("QUARANTINED_ROUTE_SELECTED", _codes(rejected))
 
     def test_price_mutation_is_caught(self) -> None:
         plan = self.decision.selected_plan

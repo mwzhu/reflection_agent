@@ -25,6 +25,8 @@ from .domain import (
     EvidenceStatus,
     PlanDisposition,
     PlanLine,
+    RouteInputIssue,
+    RouteQuarantineScope,
     RuleSeverity,
     ZERO,
 )
@@ -712,6 +714,25 @@ def _late_alert(decision: DecisionRecord, due_date: date) -> str:
     )
 
 
+def _route_input_data_quality_alert(issue: RouteInputIssue) -> str:
+    logical_key = f"supplier_id={issue.supplier_id}"
+    if issue.component_id is not None:
+        logical_key += f", component_id={issue.component_id}"
+    blast_radius = (
+        "only this supplier/component catalog offer"
+        if issue.blast_radius is RouteQuarantineScope.CATALOG_OFFER
+        else "all catalog routes for this supplier"
+    )
+    affected = ", ".join(issue.affected_component_ids) or "none"
+    return (
+        f"Source table {issue.source_table}, logical key ({logical_key}), field "
+        f"{issue.field} failed the route-input contract because {issue.safe_reason} "
+        f"(reason {issue.reason_code}). Blast radius: {blast_radius}; affected "
+        f"component IDs: [{affected}]. The agent {issue.action}. Human remediation: "
+        f"{issue.remediation}."
+    )
+
+
 def render_alerts(
     decisions: Sequence[DecisionRecord],
     *,
@@ -719,6 +740,7 @@ def render_alerts(
     active_directives: Sequence[str] = (),
     inactive_directives: Sequence[str] = (),
     visible_prefixes: bool = False,
+    route_input_issues: Sequence[RouteInputIssue] = (),
 ) -> tuple[RenderedAlert, ...]:
     """Render the complete, deterministic owned-alert target set."""
 
@@ -730,6 +752,15 @@ def render_alerts(
         raise ExplanationError("managed decisions contain duplicate requirement IDs")
     registry = policy_registry
     rendered: list[RenderedAlert] = []
+    source_issues = tuple(route_input_issues)
+    if any(not isinstance(item, RouteInputIssue) for item in source_issues):
+        raise TypeError("route_input_issues must contain RouteInputIssue values")
+    source_issues = tuple(sorted(source_issues, key=lambda item: item.issue_id))
+    quarantine_components = frozenset(
+        component_id
+        for issue in source_issues
+        for component_id in issue.affected_component_ids
+    )
 
     def add(
         category: AlertCategory,
@@ -742,6 +773,13 @@ def render_alerts(
             body += _economic_autonomy_disclosure(decision)
         rendered.append(
             make_owned_alert(category, scope, body, visible_prefix=visible_prefixes)
+        )
+
+    for issue in source_issues:
+        add(
+            AlertCategory.DATA_QUALITY,
+            f"source-route-input:{issue.issue_id}",
+            _route_input_data_quality_alert(issue),
         )
 
     for decision in records:
@@ -830,6 +868,10 @@ def render_alerts(
             AlertCategory.SOLVER_UNPROVEN,
             AlertCategory.RUN_ACCOUNTING,
         }
+        if decision.component_id in quarantine_components:
+            # The source-scoped alert above carries the table/key/field and
+            # remediation facts; do not dilute it with a generic duplicate.
+            special.add(AlertCategory.DATA_QUALITY)
         if decision.deadline_lateness:
             if AlertCategory.LATE_ARRIVAL not in decision.alert_categories:
                 raise ExplanationError(

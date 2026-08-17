@@ -814,7 +814,12 @@ class CandidateBuilder:
         result: list[_OfferFacts] = []
         for catalog in snapshot.catalog_lines:
             component = components[catalog.component_id]
-            supplier = suppliers[catalog.supplier_id]
+            supplier = suppliers.get(catalog.supplier_id)
+            if supplier is None:
+                # A supplier-wide source issue leaves typed catalog facts in
+                # the snapshot for independent blast-radius reconstruction,
+                # but no route may be built from that supplier.
+                continue
             asl_pass = supplier.on_approved_list is True
             asl = _evidence(
                 asl_rule,
@@ -1685,6 +1690,32 @@ class CandidateBuilder:
                 )
         return tuple(result)
 
+    @staticmethod
+    def _quarantine_rejections(
+        snapshot: ScenarioSnapshot,
+    ) -> tuple[CandidateRejection, ...]:
+        """Represent repository-owned route exclusions without inventing routes."""
+
+        result: list[CandidateRejection] = []
+        for issue in snapshot.route_input_issues:
+            for component_id in issue.affected_component_ids:
+                result.append(
+                    CandidateRejection(
+                        route_id=(
+                            f"quarantined-{issue.issue_id[:24]}-{component_id}"
+                        ),
+                        component_id=component_id,
+                        supplier_id=issue.supplier_id,
+                        status=EvidenceStatus.UNKNOWN,
+                        code="DATA_QUARANTINED",
+                        reason=(
+                            f"{issue.source_table}.{issue.field}: "
+                            f"{issue.safe_reason}; the repository {issue.action}."
+                        ),
+                    )
+                )
+        return tuple(result)
+
     def build(
         self, snapshot: ScenarioSnapshot, ledgers: LedgerBuildResult
     ) -> CandidateBuildResult:
@@ -1702,7 +1733,10 @@ class CandidateBuilder:
         routes = self._comparator_traces(snapshot, routes)
         return CandidateBuildResult(
             routes=routes,
-            rejections=self._rejections(routes),
+            rejections=(
+                *self._rejections(routes),
+                *self._quarantine_rejections(snapshot),
+            ),
             alerts=alerts,
         )
 

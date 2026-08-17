@@ -11,6 +11,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from pathlib import Path
 import re
 import sqlite3
@@ -25,6 +26,8 @@ from .domain import (
     InventoryPosition,
     Product,
     ProductionOrder,
+    RouteInputIssue,
+    RouteQuarantineScope,
     ScenarioConfiguration,
     ScenarioSnapshot,
     Supplier,
@@ -33,7 +36,11 @@ from .domain import (
 from .snapshot import build_snapshot
 
 
-class ScenarioLoadError(ValueError):
+class RepositoryLoadError(ValueError):
+    """Base class for repository failures that make planning unsafe."""
+
+
+class ScenarioLoadError(RepositoryLoadError):
     """Base class for deterministic scenario-loading failures."""
 
 
@@ -47,6 +54,21 @@ class ScenarioSchemaError(ScenarioLoadError):
 
 class ScenarioDataError(ScenarioLoadError):
     """A known scenario field or semantic reference is invalid."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        table: str | None = None,
+        key: tuple[tuple[str, object], ...] = (),
+        column: str | None = None,
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.table = table
+        self.key = key
+        self.column = column
+        self.detail = detail
 
 
 MAX_SCENARIO_BYTES = 256 * 1024 * 1024
@@ -154,6 +176,7 @@ _DECIMAL_PATTERN = re.compile(
     re.ASCII,
 )
 _IDENTIFIER_PATTERN = re.compile(r"[a-z_]+\Z")
+_RATING_PATTERN = re.compile(r"[A-F][+-]?\Z", re.ASCII)
 _SQLITE_INTEGER_MIN = Decimal("-9223372036854775808")
 _SQLITE_INTEGER_MAX = Decimal("9223372036854775807")
 _DANGEROUS_FORMAT_CONTROLS = frozenset(
@@ -264,7 +287,110 @@ def _data_error(
     detail: str,
 ) -> ScenarioDataError:
     return ScenarioDataError(
-        f"scenario data error: {_row_location(table, key)} column '{column}' {detail}"
+        f"scenario data error: {_row_location(table, key)} column '{column}' {detail}",
+        table=table,
+        key=key,
+        column=column,
+        detail=detail,
+    )
+
+
+def _raw_value_fingerprint(value: object) -> tuple[str, str]:
+    """Return SQLite storage-class provenance without retaining unsafe text."""
+
+    if value is None:
+        value_type, payload = "null", b""
+    elif isinstance(value, str):
+        value_type, payload = "text", value.encode("utf-8", errors="surrogatepass")
+    elif isinstance(value, bool):
+        value_type, payload = "integer", b"1" if value else b"0"
+    elif isinstance(value, int):
+        value_type, payload = "integer", str(value).encode("ascii")
+    elif isinstance(value, float):
+        value_type, payload = "real", repr(value).encode("ascii")
+    elif isinstance(value, bytes):
+        value_type, payload = "blob", value
+    else:
+        value_type = type(value).__name__
+        payload = type(value).__qualname__.encode("utf-8")
+    framed = value_type.encode("ascii", errors="backslashreplace") + b"\0" + payload
+    return value_type, sha256(framed).hexdigest()
+
+
+def _safe_route_reason(error: ScenarioDataError) -> tuple[str, str]:
+    """Map parser diagnostics to fixed prose that never includes the raw value."""
+
+    detail = error.detail or ""
+    if "must not be NULL" in detail:
+        return "MISSING_REQUIRED_VALUE", "the required value is null"
+    if "finite decimal" in detail:
+        return "INVALID_DECIMAL", "the value is not a finite decimal"
+    if "must be an integer" in detail or "signed 64-bit integer" in detail:
+        return "INVALID_INTEGER", "the value is not a supported whole number"
+    if "must be 0 or 1" in detail:
+        return "INVALID_BOOLEAN", "the value is not the required 0-or-1 boolean"
+    if "rating grade" in detail:
+        return "INVALID_RATING", "the value is not a supported rating grade"
+    if "control characters" in detail or "malformed Unicode" in detail:
+        return "UNSAFE_TEXT", "the value contains unsafe text characters"
+    if "maximum supported text size" in detail:
+        return "OVERSIZED_TEXT", "the value exceeds the supported text size"
+    if "empty comma-separated value" in detail or "duplicate values" in detail:
+        return "INVALID_CERTIFICATIONS", "the certification list is malformed"
+    if "positive" in detail or "nonnegative" in detail:
+        return "OUT_OF_RANGE", "the numeric value is outside its permitted range"
+    if "text" in detail:
+        return "INVALID_TEXT", "the value is not valid text"
+    return "INVALID_ROUTE_VALUE", "the value does not satisfy the route input contract"
+
+
+def _route_issue(
+    error: ScenarioDataError,
+    row: dict[str, object],
+    *,
+    supplier_id: str,
+    component_id: str | None,
+    affected_component_ids: tuple[str, ...],
+) -> RouteInputIssue:
+    if error.column is None or error.table not in {"suppliers", "supplier_catalog"}:
+        raise error
+    raw_alias = {
+        "minimum_order_qty": "minimum_order_quantity",
+    }.get(error.column, error.column)
+    raw_type, raw_digest = _raw_value_fingerprint(row.get(raw_alias))
+    reason_code, safe_reason = _safe_route_reason(error)
+    supplier_wide = error.table == "suppliers"
+    action = (
+        "quarantined every catalog route for this supplier and excluded the supplier "
+        "from candidate construction and optimization without substituting attributes"
+        if supplier_wide
+        else "quarantined only this supplier/component catalog offer and excluded it "
+        "from candidate construction and optimization without substituting price, "
+        "lead time, quantity, or dates"
+    )
+    remediation = (
+        f"correct {error.table}.{error.column} for supplier_id {supplier_id} and rerun"
+        if component_id is None
+        else f"correct {error.table}.{error.column} for supplier_id {supplier_id} "
+        f"and component_id {component_id}, then rerun"
+    )
+    return RouteInputIssue(
+        source_table=error.table,
+        supplier_id=supplier_id,
+        component_id=component_id,
+        affected_component_ids=affected_component_ids,
+        field=error.column,
+        reason_code=reason_code,
+        safe_reason=safe_reason,
+        blast_radius=(
+            RouteQuarantineScope.SUPPLIER_ALL_ROUTES
+            if supplier_wide
+            else RouteQuarantineScope.CATALOG_OFFER
+        ),
+        action=action,
+        remediation=remediation,
+        raw_value_type=raw_type,
+        raw_value_sha256=raw_digest,
     )
 
 
@@ -430,6 +556,26 @@ def _text_list(
     return tuple(sorted(items))
 
 
+def _rating_text(
+    value: object,
+    table: str,
+    key: tuple[tuple[str, object], ...],
+    column: str,
+) -> str | None:
+    text = _optional_text(value, table, key, column)
+    if text is None:
+        return None
+    normalized = unicodedata.normalize("NFKC", text).strip().upper()
+    if not _RATING_PATTERN.fullmatch(normalized):
+        raise _data_error(
+            table,
+            key,
+            column,
+            "must be a rating grade A through F with an optional plus or minus",
+        )
+    return text
+
+
 def _raw_sort_key(row: dict[str, object]) -> tuple[tuple[str, str], ...]:
     return tuple((type(value).__name__, _display(value)) for value in row.values())
 
@@ -462,6 +608,24 @@ def _ensure_unique(
             rendered = ", ".join(
                 f"{name}={_display(value)}"
                 for name, value in zip(key_names, values, strict=True)
+            )
+            raise ScenarioDataError(
+                f"scenario data error: table '{table}' has duplicate logical key ({rendered})"
+            )
+        seen.add(logical_key)
+
+
+def _ensure_unique_source_keys(
+    table: str,
+    keys: tuple[tuple[str, ...], ...],
+    key_names: tuple[str, ...],
+) -> None:
+    seen: set[tuple[str, ...]] = set()
+    for logical_key in sorted(keys):
+        if logical_key in seen:
+            rendered = ", ".join(
+                f"{name}={_display(value)}"
+                for name, value in zip(key_names, logical_key, strict=True)
             )
             raise ScenarioDataError(
                 f"scenario data error: table '{table}' has duplicate logical key ({rendered})"
@@ -625,11 +789,7 @@ class SQLiteRepository:
         configuration = self._configuration(rows_by_table["scenario_config"])
         products = tuple(self._product(row) for row in rows_by_table["products"])
         components = tuple(self._component(row) for row in rows_by_table["components"])
-        suppliers = tuple(self._supplier(row) for row in rows_by_table["suppliers"])
         bom_lines = tuple(self._bom_line(row) for row in rows_by_table["bom"])
-        catalog_lines = tuple(
-            self._catalog_line(row) for row in rows_by_table["supplier_catalog"]
-        )
         production_orders = tuple(
             self._production_order(row) for row in rows_by_table["production_schedule"]
         )
@@ -640,6 +800,113 @@ class SQLiteRepository:
             self._purchase_order(row) for row in rows_by_table["purchase_orders"]
         )
         alerts = tuple(self._alert(row) for row in rows_by_table["alerts"])
+
+        supplier_rows = rows_by_table["suppliers"]
+        supplier_source_ids = tuple(
+            _required_text(
+                row["supplier_id"],
+                "suppliers",
+                (("supplier_id", row["supplier_id"]),),
+                "supplier_id",
+            )
+            for row in supplier_rows
+        )
+        _ensure_unique_source_keys(
+            "suppliers",
+            tuple((supplier_id,) for supplier_id in supplier_source_ids),
+            ("supplier_id",),
+        )
+
+        catalog_rows = rows_by_table["supplier_catalog"]
+        catalog_source_keys: list[tuple[str, str]] = []
+        for row in catalog_rows:
+            raw_key = (
+                ("supplier_id", row["supplier_id"]),
+                ("component_id", row["component_id"]),
+            )
+            catalog_source_keys.append(
+                (
+                    _required_text(
+                        row["supplier_id"],
+                        "supplier_catalog",
+                        raw_key,
+                        "supplier_id",
+                    ),
+                    _required_text(
+                        row["component_id"],
+                        "supplier_catalog",
+                        raw_key,
+                        "component_id",
+                    ),
+                )
+            )
+        catalog_key_tuple = tuple(catalog_source_keys)
+        _ensure_unique_source_keys(
+            "supplier_catalog",
+            catalog_key_tuple,
+            ("supplier_id", "component_id"),
+        )
+        component_ids = {item.component_id for item in components}
+        source_supplier_id_set = set(supplier_source_ids)
+        for supplier_id, component_id in catalog_key_tuple:
+            key = (("supplier_id", supplier_id), ("component_id", component_id))
+            if supplier_id not in source_supplier_id_set:
+                raise ScenarioDataError(
+                    f"scenario data error: {_row_location('supplier_catalog', key)} "
+                    f"column 'supplier_id' references missing suppliers.supplier_id "
+                    f"{_display(supplier_id)}"
+                )
+            if component_id not in component_ids:
+                raise ScenarioDataError(
+                    f"scenario data error: {_row_location('supplier_catalog', key)} "
+                    f"column 'component_id' references missing components.component_id "
+                    f"{_display(component_id)}"
+                )
+
+        components_by_supplier: dict[str, set[str]] = {
+            supplier_id: set() for supplier_id in supplier_source_ids
+        }
+        for supplier_id, component_id in catalog_key_tuple:
+            components_by_supplier[supplier_id].add(component_id)
+
+        supplier_values: list[Supplier] = []
+        route_issues: list[RouteInputIssue] = []
+        for row, supplier_id in zip(supplier_rows, supplier_source_ids, strict=True):
+            try:
+                supplier_values.append(self._supplier(row))
+            except ScenarioDataError as error:
+                route_issues.append(
+                    _route_issue(
+                        error,
+                        row,
+                        supplier_id=supplier_id,
+                        component_id=None,
+                        affected_component_ids=tuple(
+                            sorted(components_by_supplier[supplier_id])
+                        ),
+                    )
+                )
+        suppliers = tuple(supplier_values)
+
+        catalog_values: list[SupplierCatalogLine] = []
+        for row, (supplier_id, component_id) in zip(
+            catalog_rows,
+            catalog_key_tuple,
+            strict=True,
+        ):
+            try:
+                catalog_values.append(self._catalog_line(row))
+            except ScenarioDataError as error:
+                route_issues.append(
+                    _route_issue(
+                        error,
+                        row,
+                        supplier_id=supplier_id,
+                        component_id=component_id,
+                        affected_component_ids=(component_id,),
+                    )
+                )
+        catalog_lines = tuple(catalog_values)
 
         self._validate_unique_keys(
             products,
@@ -661,6 +928,7 @@ class SQLiteRepository:
             production_orders,
             inventory,
             purchase_orders,
+            source_supplier_ids=source_supplier_id_set,
         )
         return build_snapshot(
             configuration=configuration,
@@ -673,6 +941,7 @@ class SQLiteRepository:
             inventory=inventory,
             purchase_orders=purchase_orders,
             alerts=alerts,
+            route_input_issues=tuple(route_issues),
         )
 
     @staticmethod
@@ -771,7 +1040,7 @@ class SQLiteRepository:
             certifications=_text_list(
                 row["certifications"], "suppliers", key, "certifications"
             ),
-            sustainability_rating=_optional_text(
+            sustainability_rating=_rating_text(
                 row["sustainability_rating"],
                 "suppliers",
                 key,
@@ -1044,10 +1313,16 @@ class SQLiteRepository:
         production_orders: tuple[ProductionOrder, ...],
         inventory: tuple[InventoryPosition, ...],
         purchase_orders: tuple[ExistingPurchaseOrder, ...],
+        *,
+        source_supplier_ids: set[str] | None = None,
     ) -> None:
         product_ids = {item.product_id for item in products}
         component_ids = {item.component_id for item in components}
-        supplier_ids = {item.supplier_id for item in suppliers}
+        supplier_ids = (
+            set(source_supplier_ids)
+            if source_supplier_ids is not None
+            else {item.supplier_id for item in suppliers}
+        )
 
         def require_reference(
             table: str,
@@ -1145,6 +1420,7 @@ __all__ = [
     "MAX_TABLE_ROWS",
     "MAX_TEXT_BYTES",
     "MAX_TOTAL_ROWS",
+    "RepositoryLoadError",
     "SQLiteRepository",
     "ScenarioDataError",
     "ScenarioLoadError",
