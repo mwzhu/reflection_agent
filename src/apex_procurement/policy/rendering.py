@@ -58,8 +58,8 @@ class ContractDisposition(str, Enum):
 class TerminalRenderingPath(str, Enum):
     """Reviewed terminal output path, or an internal rejection boundary."""
 
-    ASSUMPTION_ALERT_AND_EXECUTABLE_DECISION = (
-        "assumption_alert_and_executable_decision"
+    AUDITED_ASSUMPTION_AND_EXECUTABLE_DECISION = (
+        "audited_assumption_and_executable_decision"
     )
     COMPLETE_APPROVAL_PROPOSAL = "complete_approval_proposal"
     DECISION_REQUIRED_ALERT = "decision_required_alert"
@@ -111,7 +111,7 @@ def _paths_for(rule_kind: RuleKind) -> Mapping[ContractDisposition, TerminalRend
             # UNKNOWN evidence may never authorize unconditional execution.
             ContractDisposition.EXECUTE: TerminalRenderingPath.INTERNAL_ERROR,
             ContractDisposition.EXECUTE_WITH_ASSUMPTION: (
-                TerminalRenderingPath.ASSUMPTION_ALERT_AND_EXECUTABLE_DECISION
+                TerminalRenderingPath.AUDITED_ASSUMPTION_AND_EXECUTABLE_DECISION
             ),
             ContractDisposition.RECOMMEND_APPROVAL: (
                 TerminalRenderingPath.COMPLETE_APPROVAL_PROPOSAL

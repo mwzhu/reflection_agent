@@ -26,7 +26,6 @@ from .domain import (
     InternalFailureExclusion,
     PlanDisposition,
     PlanLine,
-    ResolutionStatus,
     RouteInputIssue,
     RouteQuarantineScope,
     RuleSeverity,
@@ -44,6 +43,9 @@ from .serialization import canonical_dumps, sanitize_control_characters
 
 
 ALERT_MARKER_VERSION = 2
+AUDIT_ONLY_ALERT_CATEGORIES = frozenset(
+    {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+)
 _SUPPORTED_ALERT_MARKER_VERSIONS = frozenset({1, ALERT_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
 _ALERT_MARKER = re.compile(
@@ -661,8 +663,9 @@ def _concise_alert_body(category: AlertCategory, scope: str, body: str) -> str:
         components = sorted(set(re.findall(r"CMP-[0-9]+", body)))
         affected = ", ".join(components) if components else "one or more components"
         return (
-            f"Missing benchmark evidence affected {affected}. "
-            "Provide the cited authoritative evidence and rerun."
+            f"Required policy evidence is incomplete for {affected}. "
+            "Verify the cited source records and rerun before releasing or revising "
+            "the affected procurement actions."
         )
 
     assumption = re.match(
@@ -924,24 +927,6 @@ def _evidence_contract_alert(decision: DecisionRecord) -> str:
     )
 
 
-def _assumption_alert(decision: DecisionRecord, code: str) -> str:
-    if code == "PROVISIONAL_ECONOMIC_AUTONOMY":
-        return (
-            f"Component {decision.component_id}, requirement {decision.requirement_id} uses "
-            "reviewed but provisional economic-autonomy parameters from the policy pack. "
-            f"The managed record retains assumption code {code}; this classification concerns "
-            "governance of pack-owned thresholds, not the evidence contract. Human action: "
-            "approve or replace the provisional values in a reviewed policy pack and rerun if "
-            "they change."
-        )
-    return (
-        f"Component {decision.component_id}, requirement {decision.requirement_id} relied on "
-        f"assumption {code} under the {decision.evidence_contract.value} evidence contract. "
-        f"The agent retained the assumption in the managed record. Human action: verify the "
-        f"missing evidence and rerun if it changes."
-    )
-
-
 def _source_entity_normalization_alert(
     decision: DecisionRecord,
     disclosure: SourceEntityNormalizationDisclosure,
@@ -1059,8 +1044,10 @@ def render_alerts(
     route_input_issues: Sequence[RouteInputIssue] = (),
     internal_failure_exclusions: Sequence[InternalFailureExclusion] = (),
 ) -> tuple[RenderedAlert, ...]:
-    """Render the complete, deterministic owned-alert target set."""
+    """Render actionable problems and recommendations for the alerts table."""
 
+    # Directive accounting remains part of the run audit/CLI contract, not the
+    # operational alerts table. Keep accepting these arguments for API stability.
     records = tuple(sorted(decisions, key=lambda item: (item.requirement_id, item.component_id)))
     if any(not isinstance(item, DecisionRecord) for item in records):
         raise TypeError("decisions must contain DecisionRecord values")
@@ -1092,7 +1079,6 @@ def render_alerts(
         for issue in source_issues
         for component_id in issue.affected_component_ids
     )
-    provisional_requirements: list[str] = []
     evidence_contract_requirements: list[tuple[str, str, tuple[str, ...]]] = []
     terminal_requirements: set[str] = set()
 
@@ -1154,35 +1140,6 @@ def render_alerts(
                 decision=decision,
             )
 
-        assumptions: set[str] = set()
-        plans = tuple(
-            item
-            for item in (decision.selected_plan, *decision.alternatives)
-            if item is not None
-        )
-        if decision.evidence_contract is EvidenceContract.BENCHMARK:
-            for plan in plans:
-                assumptions.update(plan.assumption_codes)
-                for evidence in plan.evidence:
-                    assumptions.update(evidence.assumption_codes)
-            for evidence in decision.evidence:
-                assumptions.update(evidence.assumption_codes)
-        if (
-            decision.economic_autonomy is not None
-            and decision.economic_autonomy.provisional
-        ):
-            provisional_requirements.append(
-                f"{decision.component_id}/{decision.requirement_id}"
-            )
-        assumptions.discard("PROVISIONAL_ECONOMIC_AUTONOMY")
-        for code in sorted(assumptions):
-            add(
-                AlertCategory.ASSUMPTION,
-                f"{scope}:assumption:{code}",
-                _assumption_alert(decision, code),
-                decision=decision,
-            )
-
         for index, disclosure in enumerate(
             decision.normalization_disclosures, start=1
         ):
@@ -1195,7 +1152,7 @@ def render_alerts(
                 )
             elif isinstance(disclosure, UnitNormalizationDisclosure):
                 add(
-                    AlertCategory.ASSUMPTION,
+                    AlertCategory.DATA_QUALITY,
                     f"{scope}:normalization:unit:{index}",
                     _unit_normalization_alert(decision, disclosure),
                     decision=decision,
@@ -1351,25 +1308,6 @@ def render_alerts(
             f"explanation: [{_list(unexplained)}]"
         )
 
-    if provisional_requirements:
-        parameters = next(
-            item.economic_autonomy
-            for item in records
-            if item.economic_autonomy is not None
-            and item.economic_autonomy.provisional
-        )
-        assert parameters is not None
-        add(
-            AlertCategory.ASSUMPTION,
-            "run:assumption:PROVISIONAL_ECONOMIC_AUTONOMY",
-            "Run-global policy assumption PROVISIONAL_ECONOMIC_AUTONOMY applies to "
-            f"components/requirements [{_list(provisional_requirements)}]. The agent used "
-            "the reviewed provisional thresholds consistently and retained component "
-            "traceability in each managed decision. Human action: approve or replace the "
-            "values in a reviewed policy pack and rerun if they change. Active values: "
-            f"{parameters.disclosure()}.",
-        )
-
     if evidence_contract_requirements:
         contract = records[0].evidence_contract.value if records else "none"
         listing = "; ".join(
@@ -1389,92 +1327,14 @@ def render_alerts(
             "fresh snapshot.",
         )
 
-    po_count = sum(
-        len(item.selected_plan.lines) if item.selected_plan is not None else 0
-        for item in records
-    )
-    ordered_cost = sum(
-        (
-            item.selected_plan.total_cost
-            if item.selected_plan is not None
-            else ZERO
-        )
-        for item in records
-    )
-    buckets = {
-        "AGENT_ORDERED_RESOLVED": 0,
-        "AGENT_ORDERED_WITH_RESIDUAL": 0,
-        "APPROVAL_WITHHELD": 0,
-        "DECISION_DEFERRED": 0,
-        "PROVEN_INFEASIBLE": 0,
-        "COVERED_WITHOUT_NEW_ORDER": 0,
-        "OTHER_UNRESOLVED": 0,
-    }
-    if exclusions:
-        buckets["INTERNAL_FAILURE_EXCLUDED"] = len(exclusions)
-    for decision in records:
-        if decision.selected_plan is not None:
-            key = (
-                "AGENT_ORDERED_RESOLVED"
-                if decision.residual_gap == ZERO
-                else "AGENT_ORDERED_WITH_RESIDUAL"
-            )
-        elif decision.residual_gap == ZERO:
-            key = "COVERED_WITHOUT_NEW_ORDER"
-        elif (
-            AlertCategory.APPROVAL_REQUIRED in decision.alert_categories
-            or any(
-                plan.disposition is PlanDisposition.RECOMMEND_APPROVAL
-                for plan in decision.alternatives
-            )
-        ):
-            key = "APPROVAL_WITHHELD"
-        elif (
-            AlertCategory.DECISION_REQUIRED in decision.alert_categories
-            or any(
-                plan.disposition is PlanDisposition.DECISION_REQUIRED
-                for plan in decision.alternatives
-            )
-        ):
-            key = "DECISION_DEFERRED"
-        elif decision.requirement_state.resolution is ResolutionStatus.INFEASIBLE:
-            key = "PROVEN_INFEASIBLE"
-        else:
-            key = "OTHER_UNRESOLVED"
-        buckets[key] += 1
-    managed_count = len(records) + len(exclusions)
-    bucket_sum = sum(buckets.values())
-    if bucket_sum != managed_count:
-        raise AssertionError("run-accounting buckets do not reconcile")
-    bucket_text = ", ".join(
-        f"{name}={count}" for name, count in buckets.items()
-    )
-    no_eligible = sum(
-        AlertCategory.NO_ELIGIBLE_SUPPLIER in item.alert_categories
-        for item in records
-    )
-    accounting = (
-        f"Managed {managed_count} component requirements in mutually exclusive buckets "
-        f"[{bucket_text}]; bucket sum {bucket_sum}. Agent purchase orders: {po_count}; "
-        f"ordered cost: {_number(ordered_cost)}; requirements with a NO_ELIGIBLE_SUPPLIER "
-        f"diagnostic: {no_eligible}. Evidence contract: "
-        f"{records[0].evidence_contract.value if records else 'none'}. Active directives: "
-        f"{_list(active_directives)}. Inactive directives: {_list(inactive_directives)}."
-    )
-    if exclusions:
-        accounting += (
-            " Engineering-owned internal-failure exclusions: components "
-            f"[{_list(item.component_id for item in exclusions)}], requirements "
-            f"[{_list(item.requirement_id for item in exclusions)}], validation codes "
-            f"[{_list(issue.code for item in exclusions for issue in item.issues)}]."
-        )
-    add(AlertCategory.RUN_ACCOUNTING, "run:accounting", accounting)
-
     descriptions = tuple(item.description for item in rendered)
     if len(descriptions) != len(set(descriptions)):
         raise ExplanationError("rendered alerts contain duplicate descriptions")
-    if sum(item.category is AlertCategory.RUN_ACCOUNTING for item in rendered) != 1:
-        raise AssertionError("exactly one run-accounting alert must be rendered")
+    if any(
+        item.category in AUDIT_ONLY_ALERT_CATEGORIES
+        for item in rendered
+    ):
+        raise AssertionError("audit-only categories must not be rendered as operational alerts")
     if any(not validate_owned_alert(item) for item in rendered):
         raise AssertionError("rendered alert ownership marker failed validation")
     return tuple(sorted(rendered, key=lambda item: (item.category.value, item.key)))
@@ -1482,6 +1342,7 @@ def render_alerts(
 
 __all__ = [
     "ALERT_MARKER_VERSION",
+    "AUDIT_ONLY_ALERT_CATEGORIES",
     "ApprovalRule",
     "ExplanationError",
     "ParsedAlertMarker",

@@ -72,7 +72,7 @@ def test_reviewed_rendering_matrix_is_typed_and_complete() -> None:
         )
         assert (
             contract.path_for(ContractDisposition.EXECUTE_WITH_ASSUMPTION)
-            is TerminalRenderingPath.ASSUMPTION_ALERT_AND_EXECUTABLE_DECISION
+            is TerminalRenderingPath.AUDITED_ASSUMPTION_AND_EXECUTABLE_DECISION
         )
         assert (
             contract.path_for(ContractDisposition.DECISION_REQUIRED)

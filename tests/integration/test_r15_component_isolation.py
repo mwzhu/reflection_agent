@@ -196,14 +196,13 @@ class R15ComponentIsolationTests(unittest.TestCase):
                 for item in parsed_alerts
             )
         )
-        accounting = next(
-            item
-            for item in parsed_alerts
-            if item.category is AlertCategory.RUN_ACCOUNTING
+        self.assertFalse(
+            any(
+                item.category
+                in {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+                for item in parsed_alerts
+            )
         )
-        self.assertIn("INTERNAL_FAILURE_EXCLUDED=1", accounting.body)
-        self.assertIn(self.affected_component, accounting.body)
-        self.assertIn(LOCAL_CODE, accounting.body)
 
         second_seen: list[int] = []
         second = run(

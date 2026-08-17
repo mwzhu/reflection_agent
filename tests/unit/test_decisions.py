@@ -475,7 +475,7 @@ class IdentityAndRenderingTests(unittest.TestCase):
         ):
             reconstruct_managed_decisions(incomplete)
 
-    def test_residual_assumption_decision_and_solver_alerts_are_all_owned(self) -> None:
+    def test_operational_alerts_exclude_assumption_and_run_audit_rows(self) -> None:
         selected = make_plan(
             disposition=PlanDisposition.EXECUTE_WITH_ASSUMPTION,
             covered=Decimal("10"),
@@ -496,27 +496,17 @@ class IdentityAndRenderingTests(unittest.TestCase):
         alerts = render_alerts((decision,))
         categories = {item.category for item in alerts}
 
-        self.assertTrue(
+        self.assertEqual(
+            categories,
             {
                 AlertCategory.UNMET_DEMAND,
-                AlertCategory.ASSUMPTION,
                 AlertCategory.DECISION_REQUIRED,
                 AlertCategory.SOLVER_UNPROVEN,
-                AlertCategory.RUN_ACCOUNTING,
-            }.issubset(categories)
+            },
         )
-        self.assertEqual(
-            sum(item.category is AlertCategory.RUN_ACCOUNTING for item in alerts),
-            1,
+        self.assertFalse(
+            categories & {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
         )
-        accounting = next(
-            item for item in alerts if item.category is AlertCategory.RUN_ACCOUNTING
-        )
-        parsed_accounting = parse_owned_alert(accounting.description)
-        assert parsed_accounting is not None
-        self.assertIn("AGENT_ORDERED_WITH_RESIDUAL=1", accounting.audit_description)
-        self.assertIn("DECISION_DEFERRED=0", accounting.audit_description)
-        self.assertIn("bucket sum 1", accounting.audit_description)
         self.assertTrue(all("[APEX_ALERT:v2" in item.description for item in alerts))
 
     def test_approval_alert_is_a_complete_proposal_from_policy_facts(self) -> None:
@@ -716,7 +706,9 @@ class AtomicCommitTests(TemporaryScenarioTestCase):
         self.assertEqual(parsed.decision, legacy)
 
     def test_alert_reconciliation_inserts_missing_deletes_obsolete_and_preserves_external(self) -> None:
-        decision = make_decision(alerts=(AlertCategory.DATA_QUALITY,))
+        decision = make_decision(
+            alerts=(AlertCategory.DATA_QUALITY, AlertCategory.CAPACITY_UNKNOWN)
+        )
         writer = AtomicDecisionWriter(self.path, "policy-version-one")
         writer.commit(SQLiteRepository().load_snapshot(self.path), (decision,), valid_validation())
         original = SQLiteRepository().load_snapshot(self.path)

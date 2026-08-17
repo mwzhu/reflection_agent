@@ -254,15 +254,39 @@ class AssembledCliTests(unittest.TestCase):
                 self.assertIn('"no_op":true', second.stdout)
 
                 with closing(sqlite3.connect(scenario)) as connection:
-                    accounting_count = connection.execute(
+                    audit_only_count = connection.execute(
                         "SELECT COUNT(*) FROM apex_alert_metadata "
-                        "WHERE category = 'RUN_ACCOUNTING'"
+                        "WHERE category IN ('ASSUMPTION', 'RUN_ACCOUNTING')"
                     ).fetchone()[0]
                     order_counts = connection.execute(
                         "SELECT COUNT(*), COUNT(DISTINCT po_number) FROM purchase_orders"
                     ).fetchone()
-                self.assertEqual(accounting_count, 1)
+                    operational_categories = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT category FROM apex_alert_metadata ORDER BY alert_id"
+                        )
+                    )
+                    visible_descriptions = tuple(
+                        row[0]
+                        for row in connection.execute(
+                            "SELECT description FROM alerts ORDER BY alert_id"
+                        )
+                    )
+                self.assertEqual(audit_only_count, 0)
                 self.assertEqual(order_counts[0], order_counts[1])
+                self.assertFalse(
+                    any(
+                        description.startswith("Run completed")
+                        or " used assumption " in description
+                        for description in visible_descriptions
+                    )
+                )
+                if source == SOURCE:
+                    self.assertEqual(
+                        operational_categories,
+                        (AlertCategory.EVIDENCE_CONTRACT.value,),
+                    )
 
     def test_compact_rationales_are_at_most_45_percent_of_v3_on_all_scenarios(self) -> None:
         observed: list[tuple[str, int, int]] = []
@@ -309,31 +333,19 @@ class AssembledCliTests(unittest.TestCase):
                     )
                     self.assertEqual(sum(item.decisive for item in path), 1)
                     stage_two_outcomes.add(path[1].outcome)
-            provisional = tuple(
+            audit_only = tuple(
                 item
                 for item in artifacts.outputs.alerts
-                if item.category is AlertCategory.ASSUMPTION
-                and "PROVISIONAL_ECONOMIC_AUTONOMY" in item.description
+                if item.category
+                in {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
             )
             evidence_contract = tuple(
                 item
                 for item in artifacts.outputs.alerts
                 if item.category is AlertCategory.EVIDENCE_CONTRACT
             )
-            self.assertEqual(len(provisional), 1)
+            self.assertFalse(audit_only)
             self.assertLessEqual(len(evidence_contract), 1)
-            accounting = next(
-                item
-                for item in artifacts.outputs.alerts
-                if item.category is AlertCategory.RUN_ACCOUNTING
-            )
-            managed = int(
-                accounting.audit_description.split("Managed ", 1)[1].split(" ", 1)[0]
-            )
-            bucket_sum = int(
-                accounting.audit_description.split("bucket sum ", 1)[1].split(".", 1)[0]
-            )
-            self.assertEqual(bucket_sum, managed)
 
             for target in artifacts.outputs.purchase_orders:
                 decision = replace(
@@ -679,41 +691,11 @@ class AssembledCliTests(unittest.TestCase):
                     sequence_after_first = connection.execute(
                         "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
                     ).fetchone()
-                self.assertEqual(
-                    sum(
-                        item.category is AlertCategory.RUN_ACCOUNTING
-                        for item in alert_audits
-                    ),
-                    1,
-                )
-                accounting = next(
-                    item
-                    for item in alert_audits
-                    if item.category is AlertCategory.RUN_ACCOUNTING
-                )
-                managed = int(
-                    accounting.body.split("Managed ", 1)[1].split(" ", 1)[0]
-                )
-                bucket_sum = int(
-                    accounting.body.split("bucket sum ", 1)[1].split(".", 1)[0]
-                )
-                self.assertEqual(bucket_sum, managed)
-                assumption_alerts = tuple(
-                    item
-                    for item in alert_audits
-                    if item.category is AlertCategory.ASSUMPTION
-                )
-                self.assertEqual(len(assumption_alerts), 1)
-                self.assertTrue(
-                    all(
-                        "PROVISIONAL_ECONOMIC_AUTONOMY" in item.body
-                        for item in assumption_alerts
-                    )
-                )
                 self.assertFalse(
                     any(
-                        "ROLLING_HISTORY_UNKNOWN" in item.body
-                        for item in assumption_alerts
+                        item.category
+                        in {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+                        for item in alert_audits
                     )
                 )
                 self.assertEqual(
@@ -743,15 +725,6 @@ class AssembledCliTests(unittest.TestCase):
                         if item.category is AlertCategory.EVIDENCE_CONTRACT
                     )
                     self.assertIn(component_id, global_evidence.body)
-                self.assertFalse(
-                    any(
-                        "relied on assumption" in item.body
-                        or "missing evidence" in item.body
-                        or "unavailable evidence" in item.body
-                        for item in assumption_alerts
-                    )
-                )
-
                 second = self.command(*arguments)
                 self.assertEqual(second.returncode, 0, second.stderr)
                 self.assertEqual(output_rows(scenario), rows_after_first)
@@ -1354,9 +1327,12 @@ class AssembledCliTests(unittest.TestCase):
         )
         parsed_alerts = owned_alert_audits(scenario)
         self.assertTrue(parsed_alerts)
-        self.assertEqual(
-            sum(item.category is AlertCategory.RUN_ACCOUNTING for item in parsed_alerts),
-            1,
+        self.assertFalse(
+            any(
+                item.category
+                in {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+                for item in parsed_alerts
+            )
         )
 
     def test_installed_runtime_layout_executes_scenario_six(self) -> None:

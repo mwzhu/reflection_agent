@@ -579,16 +579,16 @@ class PolicyAuthorityTests(unittest.TestCase):
         self.assertTrue(validation.is_valid, validation.issues)
         self.assertIn("economic_autonomy(provisional=true", decision.rationale)
         alerts = render_alerts((decision,), policy_registry=load_policy_registry())
-        provisional = tuple(
-            item
-            for item in alerts
-            if item.category is AlertCategory.ASSUMPTION
-            and "PROVISIONAL_ECONOMIC_AUTONOMY" in item.description
+        self.assertFalse(
+            any(
+                item.category
+                in {AlertCategory.ASSUMPTION, AlertCategory.RUN_ACCOUNTING}
+                for item in alerts
+            )
         )
-        self.assertEqual(len(provisional), 1)
         self.assertIn(
             "economic_autonomy(provisional=true",
-            provisional[0].audit_description,
+            decision.rationale,
         )
         validator_source = inspect.getsource(validator_module)
         self.assertNotIn("from .optimizer import", validator_source)

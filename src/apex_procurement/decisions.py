@@ -31,6 +31,7 @@ from .domain import (
 )
 from .isolation import exclusion_validation_invariant
 from .explanations import (
+    AUDIT_ONLY_ALERT_CATEGORIES,
     ExplanationError,
     RenderedAlert,
     parse_owned_alert,
@@ -2089,13 +2090,13 @@ class AtomicDecisionWriter:
         for description, old_id in prior_owned.items():
             if description in target_descriptions and owned_after[description] != old_id:
                 raise CommitPostconditionError("unchanged owned alert did not preserve its ID")
-        accounting = [
-            item
+        if any(
+            item.category in AUDIT_ONLY_ALERT_CATEGORIES
             for item in outputs.alerts
-            if item.category is AlertCategory.RUN_ACCOUNTING
-        ]
-        if len(accounting) != 1 or accounting[0].description not in owned_after:
-            raise CommitPostconditionError("exactly one current RUN_ACCOUNTING alert is required")
+        ):
+            raise CommitPostconditionError(
+                "audit-only categories were written to the operational alerts table"
+            )
 
 
 def commit_decisions(

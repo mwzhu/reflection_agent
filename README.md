@@ -69,6 +69,8 @@ Human-facing business columns now contain only readable summaries. `purchase_ord
 - `apex_alert_metadata` holds alert ownership plus the full diagnostic description.
 - `apex_decision_audit` holds one structured decision record per evaluated requirement and component.
 
+The `alerts` table is intentionally operational and sparse: each agent-owned row must describe a problem that merits attention or recommend a human action. Successful-run accounting and raw assumption codes are audit facts, so they are excluded from `alerts`. When missing evidence materially affects procurement, the agent emits one consolidated, plain-language evidence alert while retaining component-level assumption details in `apex_decision_audit`.
+
 New managed POs use metadata version 5. Before a managed PO is temporarily removed for fresh reconstruction, the planner must reproduce the complete component source fingerprint, including relevant supplier, catalog, external-PO evidence, contract, and policy facts. If any competing route or source fact changed, the old PO remains physical inbound and cannot be silently replaced by a duplicate full-demand order.
 
 Embedded markers from versions 1 through 4 remain strictly parseable and fail closed on malformed markers, APX prefix collisions, forged payloads, incomplete line groups, or changed stored business fields. Eligible version 4 rows are migrated in place to version 5 metadata and concise prose; older rows without the all-candidate source digest remain physical commitments. Exact unchanged version 5 reruns preserve PO rows, alert IDs, metadata, audit records, and SQLite sequences. Dry runs do not create or modify these tables.

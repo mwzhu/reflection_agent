@@ -233,7 +233,7 @@ def test_r14_unknown_uom_discloses_discrete_rounding(
     disclosures = tuple(
         alert
         for alert in owned_alerts(fixture.scenario_path)
-        if alert.category is AlertCategory.ASSUMPTION
+        if alert.category is AlertCategory.DATA_QUALITY
         and source_unit in alert.body.lower()
         and "discrete" in alert.body.lower()
     )
