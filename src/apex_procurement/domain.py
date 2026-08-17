@@ -179,6 +179,60 @@ class AlertCategory(str, Enum):
     RUN_ACCOUNTING = "RUN_ACCOUNTING"
 
 
+@dataclass(frozen=True, slots=True)
+class SourceEntityNormalizationDisclosure:
+    """Auditable resolution of one stale policy source ID by legal name."""
+
+    source_id: str
+    legal_name: str
+    resolved_supplier_id: str
+    rule_id: str
+    source_document: str
+    reference_path: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_id",
+            "legal_name",
+            "resolved_supplier_id",
+            "rule_id",
+            "source_document",
+            "reference_path",
+        ):
+            _require_text(getattr(self, name), name)
+        if self.source_id == self.resolved_supplier_id:
+            raise ValueError(
+                "a stale source-ID disclosure requires different source and resolved IDs"
+            )
+
+
+class UnitRoundingRule(str, Enum):
+    """Reviewed fallback rule for a source unit without configured semantics."""
+
+    DISCRETE_CEILING_AFTER_AGGREGATION = (
+        "DISCRETE_CEILING_AFTER_AGGREGATION"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class UnitNormalizationDisclosure:
+    """Auditable discrete-rounding default for an unrecognised source unit."""
+
+    source_unit: str
+    increment: Decimal
+    rounding_rule: UnitRoundingRule
+    source_table: str = "components"
+    source_field: str = "unit_of_measure"
+
+    def __post_init__(self) -> None:
+        _require_text(self.source_unit, "source_unit")
+        _require_decimal(self.increment, "increment", positive=True)
+        if not isinstance(self.rounding_rule, UnitRoundingRule):
+            raise TypeError("rounding_rule must be UnitRoundingRule")
+        _require_text(self.source_table, "source_table")
+        _require_text(self.source_field, "source_field")
+
+
 class RouteQuarantineScope(str, Enum):
     """The largest commercial route set invalidated by one source issue."""
 
@@ -1273,6 +1327,9 @@ class DecisionRecord:
     source_fingerprint: str | None = None
     comparator_facts: tuple[DecisionComparatorFact, ...] = ()
     material_rejections: tuple[MaterialRouteRejection, ...] = ()
+    normalization_disclosures: tuple[
+        SourceEntityNormalizationDisclosure | UnitNormalizationDisclosure, ...
+    ] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.requirement_id, "requirement_id")
@@ -1436,6 +1493,34 @@ class DecisionRecord:
             self,
             "material_rejections",
             tuple(sorted(rejections, key=lambda item: (item.supplier_id, item.route_id))),
+        )
+        disclosures = _tuple(
+            self.normalization_disclosures, "normalization_disclosures"
+        )
+        if any(
+            not isinstance(
+                item,
+                (
+                    SourceEntityNormalizationDisclosure,
+                    UnitNormalizationDisclosure,
+                ),
+            )
+            for item in disclosures
+        ):
+            raise TypeError(
+                "normalization_disclosures contains an invalid item"
+            )
+        if len(disclosures) != len(set(disclosures)):
+            raise ValueError("normalization_disclosures contains duplicates")
+        object.__setattr__(
+            self,
+            "normalization_disclosures",
+            tuple(
+                sorted(
+                    disclosures,
+                    key=lambda item: (type(item).__name__, repr(item)),
+                )
+            ),
         )
 
 
@@ -1672,6 +1757,9 @@ __all__ = [
     "Supplier",
     "SupplierCatalogLine",
     "SupplyLedger",
+    "SourceEntityNormalizationDisclosure",
+    "UnitNormalizationDisclosure",
+    "UnitRoundingRule",
     "VALID_REQUIREMENT_STATES",
     "ValidationIssue",
     "ValidationResult",

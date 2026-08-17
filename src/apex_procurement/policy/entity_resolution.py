@@ -555,10 +555,13 @@ class EntityResolver:
                 EvidenceStatus.PASS, source_id, legal_name, id_matches[0], ()
             )
         if not id_matches and len(name_matches) == 1:
+            resolved_id = name_matches[0].supplier_id
             alert = ResolutionAlert(
                 AlertCategory.DATA_QUALITY,
                 "STALE_SOURCE_ID",
-                f"Source ID {source_id!r} is stale; resolved {legal_name!r} by one exact normalized legal-name match",
+                f"Source ID {source_id!r} is stale; resolved current supplier ID "
+                f"{resolved_id!r} for {legal_name!r} by one unique exact normalized "
+                "legal-name match",
             )
             return NamedEntityResolution(
                 EvidenceStatus.PASS, source_id, legal_name, name_matches[0], (alert,)

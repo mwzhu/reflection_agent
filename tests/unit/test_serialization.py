@@ -14,7 +14,10 @@ from apex_procurement.domain import (
     RequirementState,
     ResolutionStatus,
     ScenarioConfiguration,
+    SourceEntityNormalizationDisclosure,
     SupplyLedger,
+    UnitNormalizationDisclosure,
+    UnitRoundingRule,
 )
 from apex_procurement.policy import load_policy_registry
 from apex_procurement.serialization import (
@@ -84,6 +87,23 @@ class SerializationTests(unittest.TestCase):
         record = replace(
             make_record(),
             economic_autonomy=registry.economic_autonomy,
+            normalization_disclosures=(
+                SourceEntityNormalizationDisclosure(
+                    source_id="source-old",
+                    legal_name="Example Legal Name",
+                    resolved_supplier_id="source-current",
+                    rule_id="RULE.source-reference",
+                    source_document="reviewed-policy.md",
+                    reference_path="directive.supplier",
+                ),
+                UnitNormalizationDisclosure(
+                    source_unit="box",
+                    increment=Decimal("1"),
+                    rounding_rule=(
+                        UnitRoundingRule.DISCRETE_CEILING_AFTER_AGGREGATION
+                    ),
+                ),
+            ),
         )
 
         first = canonical_dumps(record)
@@ -93,6 +113,10 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(restored, record)
         self.assertEqual(restored.economic_autonomy, registry.economic_autonomy)
+        self.assertEqual(
+            restored.normalization_disclosures,
+            record.normalization_disclosures,
+        )
         self.assertIsInstance(restored.total_requirement, Decimal)
         self.assertEqual(str(restored.total_requirement), "2.00")
         self.assertIsInstance(restored.demand_buckets[0].due_date, date)

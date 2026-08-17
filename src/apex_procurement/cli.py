@@ -57,11 +57,13 @@ from .domain import (
     ResolutionStatus,
     RuleSeverity,
     ScenarioSnapshot,
+    SourceEntityNormalizationDisclosure,
     SolveKind,
     SolverResult,
     SolverStatus,
     ValidationResult,
     ValidationSeverity,
+    UnitNormalizationDisclosure,
     ZERO,
 )
 from .explanations import render_decision_rationale
@@ -682,6 +684,35 @@ def _decision_categories(
     return tuple(sorted(categories, key=lambda item: item.value))
 
 
+def _normalization_disclosures(
+    ledgers: LedgerBuildResult,
+    batch: EvaluationBatch,
+    component_id: str,
+) -> tuple[
+    SourceEntityNormalizationDisclosure | UnitNormalizationDisclosure, ...
+]:
+    """Collect typed component disclosures without flattening their source facts."""
+
+    disclosures = {
+        item.normalization_disclosure
+        for item in ledgers.alerts
+        if item.component_id == component_id
+        and item.normalization_disclosure is not None
+    }
+    disclosures.update(
+        item.normalization_disclosure
+        for item in batch.alerts
+        if item.entity_id == component_id
+        and item.normalization_disclosure is not None
+    )
+    return tuple(
+        sorted(
+            disclosures,
+            key=lambda item: (type(item).__name__, repr(item)),
+        )
+    )
+
+
 def _closed_decision(
     snapshot: ScenarioSnapshot,
     contract: EvidenceContract,
@@ -728,6 +759,9 @@ def _closed_decision(
         ),
         economic_autonomy=registry.economic_autonomy,
         source_fingerprint=source_fingerprint,
+        normalization_disclosures=_normalization_disclosures(
+            ledgers, batch, component_id
+        ),
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -820,6 +854,9 @@ def _planned_decision(
         ),
         comparator_facts=comparator_facts,
         material_rejections=material_rejections,
+        normalization_disclosures=_normalization_disclosures(
+            ledgers, batch, component_id
+        ),
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 

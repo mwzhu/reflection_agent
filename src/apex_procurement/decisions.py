@@ -424,6 +424,7 @@ def _legacy_v1_record(decision: DecisionRecord) -> str:
     primitive = canonical_loads(canonical_dumps(decision), dict)
     primitive.pop("comparator_facts", None)
     primitive.pop("material_rejections", None)
+    primitive.pop("normalization_disclosures", None)
     primitive.pop("source_fingerprint", None)
     primitive.pop("deadline_lateness", None)
     ledger = primitive.get("supply_ledger")
@@ -456,6 +457,7 @@ def _legacy_v2_record(decision: DecisionRecord) -> str:
     primitive = canonical_loads(canonical_dumps(decision), dict)
     primitive.pop("comparator_facts", None)
     primitive.pop("material_rejections", None)
+    primitive.pop("normalization_disclosures", None)
     primitive.pop("source_fingerprint", None)
     plans = [primitive.get("selected_plan")]
     alternatives = primitive.get("alternatives")
@@ -479,6 +481,7 @@ def _legacy_v3_record(decision: DecisionRecord) -> str:
     primitive = canonical_loads(canonical_dumps(decision), dict)
     primitive.pop("comparator_facts", None)
     primitive.pop("material_rejections", None)
+    primitive.pop("normalization_disclosures", None)
     primitive.pop("source_fingerprint", None)
     return canonical_dumps(primitive)
 

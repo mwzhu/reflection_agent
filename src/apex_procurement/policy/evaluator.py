@@ -25,6 +25,7 @@ from ..domain import (
     ExistingPurchaseOrder,
     PlanDisposition,
     RuleSeverity,
+    SourceEntityNormalizationDisclosure,
     Supplier,
     SupplierCatalogLine,
     ZERO,
@@ -113,6 +114,7 @@ class EvaluationAlert:
     message: str
     rule_id: str
     entity_id: str | None = None
+    normalization_disclosure: SourceEntityNormalizationDisclosure | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +409,18 @@ class PolicyEvaluator:
         for path, reference in references.items():
             result = self.resolver.resolve_named_supplier(reference, context.suppliers)
             resolved[path] = result
-            alerts.extend(self._convert_resolution_alerts(rule, result.alerts, result.resolved_supplier_id))
+            entity_id = (
+                self._conditional_scope_entity_id(rule, context)
+                or result.resolved_supplier_id
+            )
+            alerts.extend(
+                self._convert_named_resolution_alerts(
+                    rule,
+                    path,
+                    result,
+                    entity_id,
+                )
+            )
         return resolved, tuple(alerts)
 
     @staticmethod
@@ -440,13 +453,53 @@ class PolicyEvaluator:
         )
 
     @staticmethod
+    def _convert_named_resolution_alerts(
+        rule: PolicyRule,
+        reference_path: str,
+        resolution: NamedEntityResolution,
+        entity_id: str | None,
+    ) -> tuple[EvaluationAlert, ...]:
+        converted: list[EvaluationAlert] = []
+        for alert in resolution.alerts:
+            disclosure = None
+            if (
+                alert.code == "STALE_SOURCE_ID"
+                and resolution.resolved_supplier_id is not None
+            ):
+                disclosure = SourceEntityNormalizationDisclosure(
+                    source_id=resolution.source_id,
+                    legal_name=resolution.legal_name,
+                    resolved_supplier_id=resolution.resolved_supplier_id,
+                    rule_id=rule.rule_id,
+                    source_document=rule.source_document,
+                    reference_path=reference_path,
+                )
+            converted.append(
+                EvaluationAlert(
+                    alert.category,
+                    alert.code,
+                    alert.message,
+                    rule.rule_id,
+                    entity_id,
+                    disclosure,
+                )
+            )
+        return tuple(converted)
+
+    @staticmethod
     def _convert_resolution_alerts(
         rule: PolicyRule,
         alerts: Iterable[ResolutionAlert],
         entity_id: str | None,
     ) -> tuple[EvaluationAlert, ...]:
         return tuple(
-            EvaluationAlert(alert.category, alert.code, alert.message, rule.rule_id, entity_id)
+            EvaluationAlert(
+                alert.category,
+                alert.code,
+                alert.message,
+                rule.rule_id,
+                entity_id,
+            )
             for alert in alerts
         )
 
