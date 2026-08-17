@@ -158,6 +158,18 @@ class ValidationSeverity(str, Enum):
     ERROR = "ERROR"
 
 
+class ValidationFailureScope(str, Enum):
+    """Reviewed blast radius for an independent-validation issue.
+
+    ``component_id`` remains diagnostic metadata only.  Containment requires
+    both an explicitly component-local scope and a reviewed allowlisted code.
+    """
+
+    GLOBAL = "GLOBAL"
+    COMPONENT_LOCAL = "COMPONENT_LOCAL"
+    UNKNOWN = "UNKNOWN"
+
+
 class AlertCategory(str, Enum):
     UNMET_DEMAND = "UNMET_DEMAND"
     LATE_ARRIVAL = "LATE_ARRIVAL"
@@ -176,6 +188,7 @@ class AlertCategory(str, Enum):
     RECOVERY_SURPLUS = "RECOVERY_SURPLUS"
     FORCED_SURPLUS = "FORCED_SURPLUS"
     SOLVER_UNPROVEN = "SOLVER_UNPROVEN"
+    INTERNAL_FAILURE = "INTERNAL_FAILURE"
     RUN_ACCOUNTING = "RUN_ACCOUNTING"
 
 
@@ -1642,6 +1655,7 @@ class ValidationIssue:
     component_id: str | None = None
     plan_id: str | None = None
     rule_ids: tuple[str, ...] = ()
+    failure_scope: ValidationFailureScope = ValidationFailureScope.UNKNOWN
 
     def __post_init__(self) -> None:
         _require_text(self.code, "code")
@@ -1651,6 +1665,51 @@ class ValidationIssue:
         _require_optional_text(self.component_id, "component_id")
         _require_optional_text(self.plan_id, "plan_id")
         object.__setattr__(self, "rule_ids", _text_tuple(self.rule_ids, "rule_ids"))
+        if not isinstance(self.failure_scope, ValidationFailureScope):
+            raise TypeError("failure_scope must be ValidationFailureScope")
+
+
+@dataclass(frozen=True, slots=True)
+class InternalFailureExclusion:
+    """Engineering-owned record for one component removed after validation.
+
+    This is deliberately separate from ``DecisionRecord`` and carries no plan
+    disposition, supplier proposal, or approval semantics.
+    """
+
+    component_id: str
+    requirement_id: str
+    issues: tuple[ValidationIssue, ...]
+    owner: str = "PROCUREMENT_ENGINEERING"
+
+    def __post_init__(self) -> None:
+        _require_text(self.component_id, "component_id")
+        _require_text(self.requirement_id, "requirement_id")
+        _require_text(self.owner, "owner")
+        if self.owner != "PROCUREMENT_ENGINEERING":
+            raise ValueError("internal failure exclusions must be engineering-owned")
+        issues = _tuple(self.issues, "issues")
+        if not issues or any(not isinstance(item, ValidationIssue) for item in issues):
+            raise ValueError("issues must contain ValidationIssue values")
+        if any(item.severity is not ValidationSeverity.ERROR for item in issues):
+            raise ValueError("internal failure exclusions may contain only errors")
+        if any(item.component_id != self.component_id for item in issues):
+            raise ValueError("every excluded issue must match the affected component")
+        if any(
+            item.failure_scope is not ValidationFailureScope.COMPONENT_LOCAL
+            for item in issues
+        ):
+            raise ValueError("every excluded issue must be explicitly component-local")
+        object.__setattr__(
+            self,
+            "issues",
+            tuple(
+                sorted(
+                    issues,
+                    key=lambda item: (item.code, item.plan_id or "", item.message),
+                )
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1737,6 +1796,7 @@ __all__ = [
     "ExistingPurchaseOrder",
     "FulfillmentStatus",
     "InboundSupply",
+    "InternalFailureExclusion",
     "InventoryPosition",
     "MaterialRouteRejection",
     "PlanDisposition",
@@ -1762,6 +1822,7 @@ __all__ = [
     "UnitRoundingRule",
     "VALID_REQUIREMENT_STATES",
     "ValidationIssue",
+    "ValidationFailureScope",
     "ValidationResult",
     "ValidationSeverity",
     "ZERO",

@@ -23,6 +23,7 @@ from .domain import (
     DecisionRecord,
     EvidenceResult,
     EvidenceStatus,
+    InternalFailureExclusion,
     PlanDisposition,
     PlanLine,
     ResolutionStatus,
@@ -935,6 +936,20 @@ def _route_input_data_quality_alert(
     )
 
 
+def _internal_failure_alert(exclusion: InternalFailureExclusion) -> str:
+    codes = _list(item.code for item in exclusion.issues)
+    return (
+        f"Internal validation failure for component {exclusion.component_id}, "
+        f"requirement {exclusion.requirement_id}: reviewed component-local codes "
+        f"[{codes}]. The agent removed every executable action and solver result "
+        "for this component before a fresh independent validation of all survivors; "
+        "no purchase order or procurement approval/decision request was produced for "
+        f"the excluded component. Owner: {exclusion.owner}. Engineering action: "
+        "diagnose and correct the internal validation defect, then rerun from a fresh "
+        "snapshot."
+    )
+
+
 def render_alerts(
     decisions: Sequence[DecisionRecord],
     *,
@@ -943,6 +958,7 @@ def render_alerts(
     inactive_directives: Sequence[str] = (),
     visible_prefixes: bool = False,
     route_input_issues: Sequence[RouteInputIssue] = (),
+    internal_failure_exclusions: Sequence[InternalFailureExclusion] = (),
 ) -> tuple[RenderedAlert, ...]:
     """Render the complete, deterministic owned-alert target set."""
 
@@ -958,6 +974,20 @@ def render_alerts(
     if any(not isinstance(item, RouteInputIssue) for item in source_issues):
         raise TypeError("route_input_issues must contain RouteInputIssue values")
     source_issues = tuple(sorted(source_issues, key=lambda item: item.issue_id))
+    exclusions = tuple(internal_failure_exclusions)
+    if any(not isinstance(item, InternalFailureExclusion) for item in exclusions):
+        raise TypeError(
+            "internal_failure_exclusions must contain InternalFailureExclusion values"
+        )
+    exclusions = tuple(sorted(exclusions, key=lambda item: item.component_id))
+    if len({item.component_id for item in exclusions}) != len(exclusions):
+        raise ExplanationError("internal-failure exclusions contain duplicate components")
+    if {item.component_id for item in exclusions} & {
+        item.component_id for item in records
+    }:
+        raise ExplanationError(
+            "an internal-failure component cannot also have a managed decision"
+        )
     quarantine_components = frozenset(
         component_id
         for issue in source_issues
@@ -986,6 +1016,13 @@ def render_alerts(
             terminal_requirements.add(decision.requirement_id)
         rendered.append(
             make_owned_alert(category, scope, body, visible_prefix=visible_prefixes)
+        )
+
+    for exclusion in exclusions:
+        add(
+            AlertCategory.INTERNAL_FAILURE,
+            f"requirement:{exclusion.requirement_id}:internal-failure",
+            _internal_failure_alert(exclusion),
         )
 
     for issue in source_issues:
@@ -1274,6 +1311,8 @@ def render_alerts(
         "COVERED_WITHOUT_NEW_ORDER": 0,
         "OTHER_UNRESOLVED": 0,
     }
+    if exclusions:
+        buckets["INTERNAL_FAILURE_EXCLUDED"] = len(exclusions)
     for decision in records:
         if decision.selected_plan is not None:
             key = (
@@ -1304,8 +1343,9 @@ def render_alerts(
         else:
             key = "OTHER_UNRESOLVED"
         buckets[key] += 1
+    managed_count = len(records) + len(exclusions)
     bucket_sum = sum(buckets.values())
-    if bucket_sum != len(records):
+    if bucket_sum != managed_count:
         raise AssertionError("run-accounting buckets do not reconcile")
     bucket_text = ", ".join(
         f"{name}={count}" for name, count in buckets.items()
@@ -1315,13 +1355,20 @@ def render_alerts(
         for item in records
     )
     accounting = (
-        f"Managed {len(records)} component requirements in mutually exclusive buckets "
+        f"Managed {managed_count} component requirements in mutually exclusive buckets "
         f"[{bucket_text}]; bucket sum {bucket_sum}. Agent purchase orders: {po_count}; "
         f"ordered cost: {_number(ordered_cost)}; requirements with a NO_ELIGIBLE_SUPPLIER "
         f"diagnostic: {no_eligible}. Evidence contract: "
         f"{records[0].evidence_contract.value if records else 'none'}. Active directives: "
         f"{_list(active_directives)}. Inactive directives: {_list(inactive_directives)}."
     )
+    if exclusions:
+        accounting += (
+            " Engineering-owned internal-failure exclusions: components "
+            f"[{_list(item.component_id for item in exclusions)}], requirements "
+            f"[{_list(item.requirement_id for item in exclusions)}], validation codes "
+            f"[{_list(issue.code for item in exclusions for issue in item.issues)}]."
+        )
     add(AlertCategory.RUN_ACCOUNTING, "run:accounting", accounting)
 
     descriptions = tuple(item.description for item in rendered)

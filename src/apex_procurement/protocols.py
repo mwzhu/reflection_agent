@@ -10,6 +10,7 @@ from typing import Protocol, TypeVar, runtime_checkable
 from .domain import (
     CommitResult,
     DecisionRecord,
+    InternalFailureExclusion,
     ScenarioSnapshot,
     SolverResult,
     ValidationResult,
@@ -81,6 +82,8 @@ class PlanValidator(Protocol):
         decisions: Sequence[DecisionRecord],
         solver_results: Sequence[SolverResult],
         /,
+        *,
+        exclusions: Sequence[InternalFailureExclusion] = (),
     ) -> ValidationResult:
         """Recompute invariants independently from source facts."""
 
