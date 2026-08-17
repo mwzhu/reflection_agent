@@ -1107,6 +1107,7 @@ class IndependentPlanValidator:
         contract: EvidenceContract,
         *,
         allow_contract_blocked: bool = False,
+        allow_review_pending: bool = False,
     ) -> tuple[bool, bool]:
         if supplier.on_approved_list is not True:
             return False, False
@@ -1149,7 +1150,9 @@ class IndependentPlanValidator:
             return False, assumption
         if rating < _rating("B"):
             named = self._named_primary(snapshot, requirement.component)
-            if named is None or named.supplier_id != supplier.supplier_id:
+            if (
+                named is None or named.supplier_id != supplier.supplier_id
+            ) and not allow_review_pending:
                 return False, assumption
             assumption = True
         return True, assumption
@@ -1672,6 +1675,9 @@ class IndependentPlanValidator:
                 catalog,
                 contract,
                 allow_contract_blocked=include_evidence_blocked,
+                allow_review_pending=(
+                    include_unapproved and include_evidence_blocked
+                ),
             )
             if allowed:
                 eligible.append((supplier, catalog, assumption))
@@ -5055,6 +5061,13 @@ class IndependentPlanValidator:
                 catalog,
                 decision.evidence_contract,
                 allow_contract_blocked=evidence_contract_diagnostic,
+                allow_review_pending=(
+                    not plan.disposition.writes_purchase_order
+                    and any(
+                        rule_id.endswith(":additional-review")
+                        for rule_id in line.approval_rule_ids
+                    )
+                ),
             )
             if not eligible:
                 sink.error(
@@ -5303,7 +5316,7 @@ class IndependentPlanValidator:
             for line in plan.lines
             if line.supplier_id in suppliers
         )
-        if plan.disposition.writes_purchase_order and uses_below_b:
+        if uses_below_b:
             no_alternative = self.independently_check_b_or_better(
                 snapshot,
                 component_id,
@@ -5319,6 +5332,37 @@ class IndependentPlanValidator:
                     component_id=component_id,
                     plan_id=plan_id,
                 )
+            below_b_rules = self._rules(
+                snapshot.configuration.current_date,
+                "below_rating_review",
+            )
+            pending_review_ids = {
+                f"{rule.rule_id}:additional-review" for rule in below_b_rules
+            }
+            named = self._named_primary(snapshot, requirement.component)
+            for line in plan.lines:
+                supplier = suppliers.get(line.supplier_id)
+                rating = (
+                    _rating(supplier.sustainability_rating)
+                    if supplier is not None
+                    else None
+                )
+                if rating is None or rating >= boundary:
+                    continue
+                memo_discharged = (
+                    named is not None
+                    and named.resolved
+                    and named.supplier_id == line.supplier_id
+                )
+                represented = set(line.approval_rule_ids) & pending_review_ids
+                if not memo_discharged and represented != pending_review_ids:
+                    sink.error(
+                        "BELOW_B_REVIEW_UNREPRESENTED",
+                        "A below-B proposal without a memo discharge must retain the complete additional-review requirement.",
+                        component_id=component_id,
+                        plan_id=plan_id,
+                        rule_ids=tuple(sorted(pending_review_ids ^ represented)),
+                    )
         self._check_evidence(snapshot, decision, plan, sink)
 
     def _check_time_phased_ledger(

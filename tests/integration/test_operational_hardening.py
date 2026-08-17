@@ -122,6 +122,8 @@ class OperationalHardeningTests(unittest.TestCase):
         payload = json.loads(lines[0])
         self.assertEqual(payload["event"], "run_completed")
         self.assertEqual(payload["contract"], "benchmark")
+        self.assertEqual(payload["model_mode"], "off")
+        self.assertEqual(payload["model_status"], "disabled")
         self.assertIn("scenario_file", payload["hashes"])
         self.assertIn("policy_pack", payload["hashes"])
         self.assertIn("rules", payload["rule_versions"])

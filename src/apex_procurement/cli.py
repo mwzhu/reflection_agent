@@ -159,6 +159,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent.py",
         description="Plan procurement deterministically from a SQLite scenario snapshot.",
+        epilog=(
+            "Evidence/exit contract: benchmark may execute with named UNKNOWN "
+            "rolling-history assumptions; production withholds every action that "
+            "still requires UNKNOWN evidence. Successful validated, alert-only, "
+            "partial-survivor, dry-run, and no-op outcomes exit 0; CLI/path 2; "
+            "scenario 3; policy or required-model unavailability 4; solver or "
+            "validator 5; concurrency 6; atomic commit 7. Non-strict partial "
+            "survivors require a second independent validation; --strict is "
+            "all-or-nothing. JSON and audit output report contract, model_mode, "
+            "model_status, commit accounting, and any partial-run exclusions."
+        ),
     )
     parser.add_argument(
         "--scenario",
@@ -177,7 +188,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm",
         choices=tuple(item.value for item in ModelMode),
         default=ModelMode.OFF.value,
-        help="optional model behavior (default: off)",
+        help=(
+            "optional non-load-bearing model seam: off is deterministic; auto "
+            "uses the same deterministic offline plan and reports "
+            "unavailable_deterministic_fallback because no live provider is "
+            "configured; required exits 4 (default: off)"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -1400,6 +1416,7 @@ def _successful_audit_line(
         "replan_count": attempt,
         "contract": config.contract.value,
         "model_mode": config.model_mode.value,
+        "model_status": _model_status(config.model_mode),
         "hashes": {
             "scenario_file": input_hash,
             "snapshot": f"sha256:{snapshot.state_digest}",
@@ -1996,6 +2013,16 @@ def run(
     raise AssertionError("unreachable concurrency retry state")
 
 
+def _model_status(model_mode: ModelMode) -> str:
+    """Describe the configured non-load-bearing model seam without probing it."""
+
+    if model_mode is ModelMode.OFF:
+        return "disabled"
+    if model_mode is ModelMode.AUTO:
+        return "unavailable_deterministic_fallback"
+    return "required_unavailable"
+
+
 def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str, object]:
     explained = (
         tuple(
@@ -2019,6 +2046,7 @@ def _result_payload(config: RuntimeConfig, artifacts: RunArtifacts) -> dict[str,
         ),
         "contract": config.contract,
         "model_mode": config.model_mode,
+        "model_status": _model_status(config.model_mode),
         "policy_pack_id": artifacts.registry.pack_id,
         "policy_pack_hash": artifacts.registry.content_hash,
         "snapshot_digest": artifacts.snapshot.state_digest,
@@ -2059,6 +2087,7 @@ def render_result(config: RuntimeConfig, artifacts: RunArtifacts) -> str:
         f"contract={config.contract.value}; decisions={len(artifacts.decisions)}; "
         f"purchase_orders={len(artifacts.outputs.purchase_orders)}; "
         f"alerts={len(artifacts.outputs.alerts)}; "
+        f"model_status={_model_status(config.model_mode)}; "
         f"status={status}."
     ]
     if partial:
@@ -2084,6 +2113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI boundary with the operations exit-code contract from section 14."""
 
     error_type = "UnknownError"
+    config: RuntimeConfig | None = None
     try:
         config = parse_config(argv)
         artifacts = run(config)
@@ -2119,16 +2149,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         code = ExitCode.SOLVER_OR_VALIDATOR
         message = str(error)
         error_type = type(error).__name__
-    print(
-        audit_json_line(
-            "run_failed",
+    failure_fields: dict[str, object] = {
+        "exit_code": int(code),
+        "error_type": error_type,
+    }
+    if config is not None:
+        failure_fields.update(
             {
-                "exit_code": int(code),
-                "error_type": error_type,
-            },
-        ),
-        file=sys.stderr,
-    )
+                "contract": config.contract.value,
+                "model_mode": config.model_mode.value,
+                "model_status": _model_status(config.model_mode),
+            }
+        )
+    print(audit_json_line("run_failed", failure_fields), file=sys.stderr)
     print(f"error: {sanitize_control_characters(message)}", file=sys.stderr)
     return code
 

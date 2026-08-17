@@ -37,6 +37,11 @@ class CliContractTests(unittest.TestCase):
         self.assertNotIn("--recompile-policy", completed.stdout)
         self.assertIn("{benchmark,production}", completed.stdout)
         self.assertIn("{off,auto,required}", completed.stdout)
+        self.assertIn("unavailable_deterministic_fallback", completed.stdout)
+        self.assertIn("required exits 4", completed.stdout)
+        self.assertIn("partial-survivor", completed.stdout)
+        self.assertIn("production withholds", completed.stdout)
+        self.assertIn("atomic commit 7", completed.stdout)
 
     def test_help_does_not_attempt_network_access(self) -> None:
         import agent
@@ -88,6 +93,9 @@ class CliContractTests(unittest.TestCase):
             "benchmark",
             "production",
             "deterministic and offline",
+            "model_status=unavailable_deterministic_fallback",
+            "same deterministic plan and business rows",
+            "partial result",
             "compiled_policy.json",
             "Monday–Friday",
             "no holiday calendar",

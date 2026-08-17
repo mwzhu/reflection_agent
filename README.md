@@ -34,26 +34,26 @@ An installed equivalent is `apex-procurement --scenario SCENARIO.sqlite`. A norm
 - `--contract benchmark` is the default. It applies the assignment's explicit benchmark missing-evidence assumptions and labels them.
 - `--contract production` never converts missing rolling evidence into an assumption. It retains `UNKNOWN`, emits component-specific `DECISION_REQUIRED` signals, and records one run-global `EVIDENCE_CONTRACT` alert with component traceability.
 
-The default execution is deterministic and offline. `--llm off` makes that contract explicit. `--llm auto` permits an optional, non-load-bearing model adapter if one is configured, but this repository has no adapter and planning remains deterministic. `--llm required` therefore exits with code 4; model output can never replace policy evaluation, exact optimization, or independent validation.
+The default execution is deterministic and offline. `--llm off` makes that contract explicit and reports `model_status=disabled`. This package configures no live planning provider: `--llm auto` therefore performs no provider or network probe, uses the same deterministic plan and business rows as `--llm off`, and reports exactly `model_status=unavailable_deterministic_fallback` in result JSON and the audit event. `--llm required` exits with code 4 before planning or writes. Model output can never replace policy evaluation, exact optimization, independent validation, or the commit boundary.
 
 ### Flags
 
 - `--scenario PATH` selects one readable, regular SQLite snapshot and is required.
 - `--contract {benchmark,production}` selects the missing-evidence contract.
-- `--llm {off,auto,required}` controls optional model behavior; the default is `off`.
+- `--llm {off,auto,required}` controls the non-load-bearing model seam; `off` is the default, `auto` is an explicitly reported deterministic fallback in this package, and `required` exits 4 because no provider is configured.
 - `--dry-run` validates and renders without database writes.
 - `--explain COMPONENT_ID` prints the canonical rationale for one demanded component.
 - `--strict` turns independent-validation warnings into a failed run.
 - `--alert-prefixes` includes visible category prefixes in alert prose.
 - `--json` writes a deterministic result object to stdout.
 
-Every run writes one structured audit line to stderr. Human output or the result JSON goes to stdout. In commit mode, verified POs are inserted and owned alerts are reconciled in one transaction. External rows are never updated or deleted.
+Every run writes one structured success or failure audit line to stderr. Human output or the result JSON goes to stdout. Successful JSON/audit output names the evidence contract, model mode, model status, commit accounting, and any partial-run exclusions; post-parse failures retain the contract and model fields in the failure audit. In commit mode, independently verified POs are inserted and owned alerts are reconciled in one transaction. External rows are never updated or deleted. A safe component-local internal failure may produce a structured partial result only after all affected actions are removed and the survivors pass a fresh independent validation; `--strict` instead preserves all-or-nothing behavior.
 
 ### Exit codes
 
 | Code | Meaning |
 |---:|---|
-| 0 | Run validated and completed (including a no-op or dry run). |
+| 0 | Run validated and completed (including alert-only production outcomes, partial survivor commits, no-ops, and dry runs). |
 | 2 | Invalid CLI scope or unsafe/missing scenario path. |
 | 3 | Scenario schema or source data cannot be read safely. |
 | 4 | Reviewed policy pack is invalid, or a required optional model is unavailable. |

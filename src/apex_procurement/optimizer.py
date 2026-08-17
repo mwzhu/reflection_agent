@@ -590,28 +590,80 @@ def _evidence_diagnostic_routes(
     """Admit evidence-blocked routes only to a non-executable diagnostic solve.
 
     The copied routes retain every ``UNKNOWN`` evidence row and its contract
-    disposition.  Only the model-membership flag changes, so the solver can
-    quantify a possible plan without converting missing evidence into either
-    supplier ineligibility or authorization to execute.
+    disposition.  Model membership is opened and approval membership is
+    temporarily cleared solely so the solver can quantify a possible plan;
+    approval facts are restored on the resulting diagnostic before it leaves
+    the optimizer.  Nothing from this path is authorized to execute.
     """
 
     result: list[CandidateRoute] = []
     for route in problem.routes:
         blockers = route.blocking_hard_evidence
+        dispositions = {
+            item.contract_disposition
+            for item in blockers
+            if item.status is EvidenceStatus.UNKNOWN
+        }
         if (
             not blockers
-            or route.approval_requirements
             or any(item.status is EvidenceStatus.FAIL for item in blockers)
             or any(
                 item.status is not EvidenceStatus.UNKNOWN
                 or item.contract_disposition
-                is not PlanDisposition.DECISION_REQUIRED
+                not in {
+                    PlanDisposition.DECISION_REQUIRED,
+                    PlanDisposition.RECOMMEND_APPROVAL,
+                }
                 for item in blockers
             )
+            or PlanDisposition.DECISION_REQUIRED not in dispositions
         ):
             continue
-        result.append(replace(route, eligibility=EvidenceStatus.PASS))
+        # This copied route exists only in the non-executable diagnostic
+        # solve.  Clear approval membership so multiple independently unknown
+        # routes can quantify the plan required by a prospective allocation
+        # rule; _restore_evidence_diagnostic_approvals immediately restores
+        # every original approval fact on the resulting proposal.
+        result.append(
+            replace(
+                route,
+                eligibility=EvidenceStatus.PASS,
+                approval_requirements=(),
+            )
+        )
     return tuple(result)
+
+
+def _restore_evidence_diagnostic_approvals(
+    plan: CandidatePlan,
+    original_routes: Sequence[CandidateRoute],
+) -> CandidatePlan:
+    """Restore facts cleared only to construct a non-executable diagnostic."""
+
+    approvals_by_route = {
+        route.route_id: route.approval_requirements for route in original_routes
+    }
+    lines = tuple(
+        replace(
+            line,
+            approval_rule_ids=approvals_by_route.get(line.route_id, ()),
+        )
+        for line in plan.lines
+    )
+    unresolved = tuple(
+        sorted(
+            {
+                rule_id
+                for line in lines
+                for rule_id in line.approval_rule_ids
+            }
+        )
+    )
+    return replace(
+        plan,
+        lines=lines,
+        unresolved_approval_ids=unresolved,
+    )
 
 
 def _allocation_floor(
@@ -2680,6 +2732,10 @@ class ProcurementOptimizer:
             evidence_result = self.solver.solve(diagnostic_problem)
             diagnostic_plan = evidence_result.candidate_plan
             if diagnostic_plan is not None:
+                diagnostic_plan = _restore_evidence_diagnostic_approvals(
+                    diagnostic_plan,
+                    problem.routes,
+                )
                 diagnostic_plan = replace(
                     diagnostic_plan,
                     assumption_codes=(),
