@@ -38,9 +38,11 @@ class QueueClient:
     def __init__(self, *responses: object) -> None:
         self.responses = list(responses)
         self.calls = 0
+        self.requests: list[dict[str, object]] = []
 
-    def generate_structured(self, **_: object) -> object:
+    def generate_structured(self, **request: object) -> object:
         self.calls += 1
+        self.requests.append(request)
         if not self.responses:
             raise AssertionError("unexpected model call")
         response = self.responses.pop(0)
@@ -70,6 +72,13 @@ class ModelAdapterTests(unittest.TestCase):
         self.assertTrue(second.trace.accepted)
         self.assertEqual(first.trace.cache_key, second.trace.cache_key)
         self.assertEqual(client.calls, 1)
+        messages = client.requests[0]["messages"]
+        self.assertIsInstance(messages, tuple)
+        system_prompt = messages[0].content
+        self.assertIn("Every limiting qualifier", system_prompt)
+        self.assertIn("generic sensor or transducer", system_prompt)
+        self.assertIn("industry-standard grade", system_prompt)
+        self.assertIn("confidence below 0.85", system_prompt)
 
     def test_malformed_and_numerically_invalid_responses_are_rejected(self) -> None:
         malformed = QueueClient(
@@ -278,6 +287,45 @@ class ModelAdapterTests(unittest.TestCase):
         )
         self.assertTrue(result.classification.member)
         self.assertEqual(len(calls), 1)
+
+    def test_openai_client_omits_unsupported_temperature_for_gpt_5_6(self) -> None:
+        calls: list[Mapping[str, object]] = []
+
+        def transport(
+            _url: str,
+            _headers: Mapping[str, str],
+            payload: Mapping[str, object],
+            _timeout: float,
+        ) -> Mapping[str, object]:
+            calls.append(payload)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"member":false,"confidence":"0.95",'
+                            '"reason":"bounded evidence excludes membership"}'
+                        }
+                    }
+                ]
+            }
+
+        client = OpenAICompatibleModelClient(
+            base_url="https://api.openai.com",
+            model="gpt-5.6-sol",
+            transport=transport,
+        )
+        result = ModelAdapter(client).resolve_residual(
+            concept_id="component_class",
+            component_fingerprint="a" * 64,
+            document_hash=DIGEST_B,
+            entity_label="label",
+            evidence_text="evidence",
+        )
+
+        self.assertFalse(result.classification.member)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("temperature", calls[0])
+        self.assertEqual(calls[0]["seed"], 0)
 
     def test_held_out_evaluations_report_measured_accuracy(self) -> None:
         client = QueueClient(

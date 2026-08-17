@@ -157,12 +157,13 @@ The planner can optionally classify policy-concept membership that structured at
 | `--llm auto` | Uses a configured provider for active residual component concepts. Missing configuration, provider failure, malformed output, or insufficient confidence falls back visibly to deterministic `UNKNOWN` behavior. |
 | `--llm required` | Requires provider configuration and accepted responses for residual calls; otherwise exits 4 before optimization or writes. |
 
-Configure any OpenAI-compatible provider with:
+Configure any OpenAI-compatible provider with the three variables below. This
+OpenAI example uses the current flagship GPT model:
 
 ```bash
-export LLM_BASE_URL="https://your-provider.example"
-export LLM_MODEL="your-model-name"
-export LLM_API_KEY="your-provider-api-key"  # omit for an unauthenticated local server
+export LLM_BASE_URL="https://api.openai.com"
+export LLM_MODEL="gpt-5.6-sol"
+export LLM_API_KEY="your-openai-project-api-key"
 
 cp data/scenarios/scenario_06_simple.sqlite /tmp/apex-model-demo.sqlite
 python3 agent.py \
@@ -172,7 +173,7 @@ python3 agent.py \
   --json
 ```
 
-`LLM_API_KEY` is sent only as a bearer token and is never written to SQLite, stdout, or audit output. The provider receives component name, description, category, unit, hazard/certification flags, and the reviewed concept quote/fixtures; scenario demand, supplier prices, purchase orders, customer names, and database contents are not sent. Requests use temperature 0, seed 0, a five-second timeout, and no retry.
+`LLM_API_KEY` is sent only as a bearer token and is never written to SQLite, stdout, or audit output. The provider receives component name, description, category, unit, hazard/certification flags, and the reviewed concept quote/fixtures; scenario demand, supplier prices, purchase orders, customer names, and database contents are not sent. Requests use seed 0, a 30-second timeout, and no retry. Compatible providers also receive temperature 0; GPT-5.6 requires its default temperature, so that field is omitted while the strict response schema and all downstream guards remain unchanged.
 
 An accepted benchmark classification is recorded as `MODEL_RESIDUAL_CLASSIFICATION` and can change which reviewed rules apply, but it remains `EXECUTE_WITH_ASSUMPTION`. Production converts the same dependency to `DECISION_REQUIRED`. The model cannot create suppliers, prices, lead times, certifications, quantities, approvals, or policy rules. Exact optimization and the independent validator consume the same fingerprint-bound classification, and no plan can commit without the ordinary validation and atomic-write boundary.
 

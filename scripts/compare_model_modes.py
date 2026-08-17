@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import closing
 from decimal import Decimal
 import json
@@ -145,15 +146,27 @@ def main() -> int:
                 for item in on_payload.get("decisions", ())
                 if isinstance(item, dict) and "component_id" in item
             }
-            changed_components = tuple(
-                component_id
-                for component_id in sorted(set(off_decisions) | set(on_decisions))
-                if _selected_signature(off_decisions.get(component_id, {}))
-                != _selected_signature(on_decisions.get(component_id, {}))
-            )
             off_rows = _business_rows(off_path)
             on_rows = _business_rows(on_path)
-            model_resolution = on_payload.get("model_resolution", {})
+            comparable = off_code == 0 and on_code == 0
+            changed_components = (
+                tuple(
+                    component_id
+                    for component_id in sorted(
+                        set(off_decisions) | set(on_decisions)
+                    )
+                    if _selected_signature(off_decisions.get(component_id, {}))
+                    != _selected_signature(on_decisions.get(component_id, {}))
+                )
+                if comparable
+                else None
+            )
+            raw_model_resolution = on_payload.get("model_resolution", {})
+            model_resolution = (
+                raw_model_resolution
+                if isinstance(raw_model_resolution, Mapping)
+                else {}
+            )
             off_cost = Decimal(_known_order_cost(off_rows["purchase_order_actions"]))
             on_cost = Decimal(_known_order_cost(on_rows["purchase_order_actions"]))
             report["scenarios"].append(
@@ -164,19 +177,33 @@ def main() -> int:
                     "model_status": on_payload.get("model_status"),
                     "attempted_count": model_resolution.get("attempted_count"),
                     "accepted_count": model_resolution.get("accepted_count"),
+                    "low_confidence_count": model_resolution.get(
+                        "low_confidence_count"
+                    ),
                     "failure_count": model_resolution.get("failure_count"),
+                    "classifications": model_resolution.get("classifications"),
                     "changed_selected_components": changed_components,
                     "purchase_order_action_rows_equal": (
                         off_rows["purchase_order_actions"]
                         == on_rows["purchase_order_actions"]
+                        if comparable
+                        else None
                     ),
                     "purchase_order_full_rows_equal": (
                         off_rows["purchase_orders"] == on_rows["purchase_orders"]
+                        if comparable
+                        else None
                     ),
-                    "alert_rows_equal": off_rows["alerts"] == on_rows["alerts"],
-                    "off_known_order_cost": str(off_cost),
-                    "on_known_order_cost": str(on_cost),
-                    "known_order_cost_delta_on_minus_off": str(on_cost - off_cost),
+                    "alert_rows_equal": (
+                        off_rows["alerts"] == on_rows["alerts"]
+                        if comparable
+                        else None
+                    ),
+                    "off_known_order_cost": str(off_cost) if comparable else None,
+                    "on_known_order_cost": str(on_cost) if comparable else None,
+                    "known_order_cost_delta_on_minus_off": (
+                        str(on_cost - off_cost) if comparable else None
+                    ),
                     "off_purchase_order_count": len(off_rows["purchase_orders"]),
                     "on_purchase_order_count": len(on_rows["purchase_orders"]),
                     "off_alert_count": len(off_rows["alerts"]),
