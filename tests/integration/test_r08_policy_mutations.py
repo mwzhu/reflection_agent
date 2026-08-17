@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from contextlib import closing
+from decimal import Decimal
+import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -17,10 +21,6 @@ def _component_from_scope(scope: str) -> str | None:
     return next((part for part in scope.split(":") if part.startswith("CMP-")), None)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="R09: selector-scoped shaping containment",
-)
 def test_r09_replaced_named_magnet_suppliers_are_component_scoped(
     tmp_path: Path,
 ) -> None:
@@ -34,11 +34,42 @@ def test_r09_replaced_named_magnet_suppliers_are_component_scoped(
         for alert in owned_alerts(fixture.scenario_path)
         if alert.category is AlertCategory.POLICY_CONFLICT
     }
-    assert conflicts <= {"CMP-003"}
+    assert conflicts == {"CMP-003"}
+
+    # The frozen R08 replacement retains the original primary's below-B
+    # rating.  Once its memo discharge is correctly dropped, that independent
+    # hard gate makes the 20% split infeasible.  Isolate the R09 executability
+    # assertion on a second temporary replacement whose remaining hard facts
+    # are feasible; the source fixture and the R08 baseline stay unchanged.
+    feasible = build_replaced_magnet_suppliers_fixture(tmp_path / "feasible")
+    with closing(sqlite3.connect(feasible.scenario_path)) as connection:
+        connection.execute(
+            "UPDATE suppliers SET sustainability_rating = ? WHERE supplier_id = ?",
+            ("B", "SUP-207"),
+        )
+        connection.commit()
+
+    feasible_observed = run_cli(feasible.scenario_path)
+
+    assert feasible_observed.exit_code == 0, feasible_observed.stderr
     magnet_rows = tuple(
-        row for row in purchase_order_rows(fixture.scenario_path) if row[0] == "CMP-003"
+        row for row in purchase_order_rows(feasible.scenario_path) if row[0] == "CMP-003"
     )
     assert magnet_rows, "remaining hard magnet rules must still permit procurement"
+    payload = json.loads(feasible_observed.stdout)
+    magnet_decision = next(
+        item for item in payload["decisions"] if item["component_id"] == "CMP-003"
+    )
+    assert magnet_decision["selected_plan"] is not None
+    quantities = tuple(
+        Decimal(line["quantity"])
+        for line in magnet_decision["selected_plan"]["lines"]
+    )
+    assert len(quantities) >= 2
+    assert max(quantities) <= Decimal("0.80") * sum(quantities)
+    assert "MEMO-2025-041.magnet_rolling_cap" in {
+        item["rule_id"] for item in magnet_decision["evidence"]
+    }
 
 
 @pytest.mark.xfail(

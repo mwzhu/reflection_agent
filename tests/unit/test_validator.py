@@ -1141,7 +1141,16 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
         )
         current = date(2025, 6, 1)
         due = date(2025, 7, 1)
-        snapshot = _snapshot(component=component, current=current)
+        primary = _supplier(
+            "SUP-107",
+            name="Nanjing Rare Earth Co.",
+            price_rating="B",
+        )
+        snapshot = _snapshot(
+            component=component,
+            suppliers=(primary,),
+            current=current,
+        )
         snapshot = replace(
             snapshot,
             production_orders=(ProductionOrder("order-a", "product-a", Decimal("5"), None, due),),
@@ -1156,6 +1165,25 @@ class IndependentInvariantRecomputationTests(unittest.TestCase):
         )
         result = validator.validate(snapshot, (decision,), results)
         self.assertNotIn("SHAPING_DEGRADATION_MISSING", _codes(result))
+
+        ordinary_component = replace(
+            component,
+            name="Generated General Bracket",
+            description="A general bracket",
+        )
+        ordinary_snapshot = replace(
+            snapshot,
+            components=(ordinary_component,),
+        )
+        ordinary_decision, ordinary_results, ordinary_validator = (
+            _decision_and_results(ordinary_snapshot)
+        )
+        ordinary_result = ordinary_validator.validate(
+            ordinary_snapshot, (ordinary_decision,), ordinary_results
+        )
+        self.assertNotIn(
+            "SHAPING_DEGRADATION_MISSING", _codes(ordinary_result)
+        )
 
     def test_capacity_unknown_is_scoped_to_positive_release_subject_allocation(self) -> None:
         component = Component(
