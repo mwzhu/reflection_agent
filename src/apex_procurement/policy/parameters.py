@@ -230,6 +230,48 @@ class AirFreightPeriodCapParameters(RuleParameter):
 
 
 @dataclass(frozen=True, slots=True)
+class StandardLeadTimeParameters(RuleParameter):
+    """Reviewed rule defining the standard supplier-delivery calculation."""
+
+    calculation: str
+
+    def __post_init__(self) -> None:
+        super(StandardLeadTimeParameters, self).__post_init__()
+        if self.calculation != "order_date_plus_quoted_lead_time":
+            raise ValueError("unsupported standard lead-time calculation")
+
+
+@dataclass(frozen=True, slots=True)
+class AirFreightLeadTimeParameters(RuleParameter):
+    """Reviewed, effective-window-scoped air-freight lead-time modifier."""
+
+    shipping_mode: str
+    standard_lead_time_condition: str
+    lead_time_reduction_days: int
+    minimum_lead_time_days: int
+
+    def __post_init__(self) -> None:
+        super(AirFreightLeadTimeParameters, self).__post_init__()
+        if self.shipping_mode != "air freight":
+            raise ValueError("unsupported air-freight shipping mode")
+        if (
+            self.standard_lead_time_condition
+            != "standard_lead_time_causes_production_delay"
+        ):
+            raise ValueError("unsupported air-freight lead-time condition")
+        for name, value, minimum in (
+            ("lead_time_reduction_days", self.lead_time_reduction_days, 1),
+            ("minimum_lead_time_days", self.minimum_lead_time_days, 0),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < minimum
+            ):
+                raise ValueError(f"{name} must be an int of at least {minimum}")
+
+
+@dataclass(frozen=True, slots=True)
 class EconomicAutonomyParameters:
     """Reviewed pack-owned bounds; forced surplus review remains advisory."""
 
@@ -279,6 +321,8 @@ class ApplicablePolicyParameters:
     scenario_date: date
     pack_id: str
     content_hash: str
+    standard_lead_time: StandardLeadTimeParameters
+    air_freight_lead_time: AirFreightLeadTimeParameters | None
     domestic_premiums: DomesticPremiumParameters
     strategic_continuity: StrategicContinuityParameters
     sustainability: SustainabilityParameters
@@ -293,6 +337,14 @@ class ApplicablePolicyParameters:
         _date(self.scenario_date, "scenario_date")
         _text(self.pack_id, "pack_id")
         _text(self.content_hash, "content_hash")
+        if not isinstance(self.standard_lead_time, StandardLeadTimeParameters):
+            raise TypeError("standard_lead_time must be StandardLeadTimeParameters")
+        if self.air_freight_lead_time is not None and not isinstance(
+            self.air_freight_lead_time, AirFreightLeadTimeParameters
+        ):
+            raise TypeError(
+                "air_freight_lead_time must be AirFreightLeadTimeParameters or None"
+            )
         if not self.approval_thresholds:
             raise ValueError("approval_thresholds must not be empty")
         if len({item.rule_id for item in self.approval_thresholds}) != len(
@@ -327,6 +379,7 @@ class ApplicablePolicyParameters:
 
 
 __all__ = [
+    "AirFreightLeadTimeParameters",
     "AirFreightPeriodCapParameters",
     "ApplicablePolicyParameters",
     "ApprovalThresholdParameters",
@@ -337,6 +390,7 @@ __all__ = [
     "RuleParameter",
     "SecondaryAllocationParameters",
     "SemanticScope",
+    "StandardLeadTimeParameters",
     "StrategicContinuityParameters",
     "SupplierVolumeCapParameters",
     "SustainabilityParameters",

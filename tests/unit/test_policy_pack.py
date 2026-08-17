@@ -129,6 +129,49 @@ class PolicyPackTests(unittest.TestCase):
         )
         self.assertEqual(next_day, set())
 
+    def test_typed_shipping_parameters_follow_every_effective_boundary(self) -> None:
+        registry = load_policy_registry()
+
+        with self.assertRaisesRegex(
+            PolicyValidationError,
+            "No reviewed procurement policy is effective on scenario date 2025-01-14",
+        ):
+            registry.parameters_for(date(2025, 1, 14))
+
+        for current in (date(2025, 1, 15), date(2025, 1, 16)):
+            with self.subTest(base_policy_date=current):
+                parameters = registry.parameters_for(current)
+                self.assertEqual(
+                    parameters.standard_lead_time.rule_id,
+                    "POL-PROC-001.section_10.delivery_date",
+                )
+                self.assertEqual(
+                    parameters.standard_lead_time.calculation,
+                    "order_date_plus_quoted_lead_time",
+                )
+                self.assertIsNone(parameters.air_freight_lead_time)
+
+        expected_air = {
+            date(2025, 6, 30): False,
+            date(2025, 7, 1): True,
+            date(2025, 7, 2): True,
+            date(2025, 9, 29): True,
+            date(2025, 9, 30): True,
+            date(2025, 10, 1): False,
+        }
+        for current, is_active in expected_air.items():
+            with self.subTest(air_policy_date=current):
+                parameter = registry.parameters_for(current).air_freight_lead_time
+                self.assertEqual(parameter is not None, is_active)
+                if parameter is not None:
+                    self.assertEqual(
+                        parameter.rule_id,
+                        "MEMO-2025-072.air_freight_authorization",
+                    )
+                    self.assertEqual(parameter.shipping_mode, "air freight")
+                    self.assertEqual(parameter.lead_time_reduction_days, 14)
+                    self.assertEqual(parameter.minimum_lead_time_days, 7)
+
     def test_magnet_memo_has_three_distinct_evidence_models(self) -> None:
         registry = load_policy_registry()
         rolling = registry.rule("MEMO-2025-041.magnet_rolling_cap")

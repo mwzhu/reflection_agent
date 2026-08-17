@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .parameters import (
+    AirFreightLeadTimeParameters,
     AirFreightPeriodCapParameters,
     ApplicablePolicyParameters,
     ApprovalThresholdParameters,
@@ -26,6 +27,7 @@ from .parameters import (
     RuleParameter,
     SecondaryAllocationParameters,
     SemanticScope,
+    StandardLeadTimeParameters,
     StrategicContinuityParameters,
     SupplierVolumeCapParameters,
     SustainabilityParameters,
@@ -126,6 +128,11 @@ class PolicyRegistry:
         if not isinstance(scenario_date, date) or isinstance(scenario_date, datetime):
             raise TypeError("scenario_date must be datetime.date")
         active = self.active_rules(scenario_date)
+        if not active:
+            raise PolicyValidationError(
+                "No reviewed procurement policy is effective on scenario date "
+                f"{scenario_date.isoformat()}; procurement is withheld."
+            )
 
         def kind(rule: PolicyRule) -> str | None:
             for key in ("constraint", "directive"):
@@ -172,6 +179,46 @@ class PolicyRegistry:
                     f"expected one active {rule_kind!r} rule, found {len(matches)}"
                 )
             return matches[0]
+
+        standard_lead_rule = one("quoted_lead_time_delivery_date")
+        standard_lead = StandardLeadTimeParameters(
+            standard_lead_rule.rule_id,
+            "quoted_lead_time_delivery_date",
+            scope(standard_lead_rule),
+            str(body(standard_lead_rule).get("calculation", "")),
+        )
+
+        air_lead_rules = tuple(
+            rule for rule in active if kind(rule) == "air_freight_authorization"
+        )
+        if len(air_lead_rules) > 1:
+            raise PolicyValidationError(
+                "expected at most one active 'air_freight_authorization' rule, "
+                f"found {len(air_lead_rules)}"
+            )
+        air_lead: AirFreightLeadTimeParameters | None = None
+        if air_lead_rules:
+            air_rule = air_lead_rules[0]
+            air_body = body(air_rule)
+            reduction = air_body.get("lead_time_reduction_days")
+            minimum = air_body.get("minimum_lead_time_days")
+            for field_name, value in (
+                ("lead_time_reduction_days", reduction),
+                ("minimum_lead_time_days", minimum),
+            ):
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise PolicyValidationError(
+                        f"{air_rule.rule_id}.constraint.{field_name} must be int"
+                    )
+            air_lead = AirFreightLeadTimeParameters(
+                air_rule.rule_id,
+                "air_freight_authorization",
+                scope(air_rule),
+                str(air_body.get("shipping_mode", "")),
+                str(air_body.get("standard_lead_time_condition", "")),
+                reduction,
+                minimum,
+            )
 
         domestic_rules = tuple(
             rule for rule in active if kind(rule) == "domestic_supplier_preference"
@@ -330,6 +377,8 @@ class PolicyRegistry:
             scenario_date=scenario_date,
             pack_id=self.pack_id,
             content_hash=self.content_hash,
+            standard_lead_time=standard_lead,
+            air_freight_lead_time=air_lead,
             domestic_premiums=DomesticPremiumParameters(
                 ordinary=domestic["none"], critical=domestic["any"]
             ),
