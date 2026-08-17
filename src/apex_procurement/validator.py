@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from enum import Enum
@@ -52,6 +52,11 @@ from .domain import (
     ZERO,
 )
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
+from .policy.parameters import (
+    ApplicablePolicyParameters,
+    EconomicAutonomyParameters,
+    SecondaryAllocationParameters,
+)
 
 
 _TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
@@ -104,27 +109,6 @@ def _is_evidence_contract_diagnostic(plan: CandidatePlan) -> bool:
         and bool(_evidence_contract_blockers(plan))
         and not plan.relaxed_rule_ids
     )
-
-
-@dataclass(frozen=True, slots=True)
-class EconomicAutonomy:
-    """The provisional §8.3 bounds, injectable when Apex supplies its own."""
-
-    max_surplus_fraction: Decimal = Decimal("0.10")
-    max_surplus_units: Decimal | None = None
-    max_excess_cost_usd: Decimal = Decimal("2500")
-
-    def __post_init__(self) -> None:
-        for name in ("max_surplus_fraction", "max_excess_cost_usd"):
-            value = getattr(self, name)
-            if not isinstance(value, Decimal) or not value.is_finite() or value < ZERO:
-                raise ValueError(f"{name} must be a finite nonnegative Decimal")
-        if self.max_surplus_units is not None and (
-            not isinstance(self.max_surplus_units, Decimal)
-            or not self.max_surplus_units.is_finite()
-            or self.max_surplus_units < ZERO
-        ):
-            raise ValueError("max_surplus_units must be a finite nonnegative Decimal or None")
 
 
 class NamedEntityOutcome(str, Enum):
@@ -507,7 +491,8 @@ class IndependentPlanValidator:
         self,
         registry: PolicyRegistry | None = None,
         *,
-        autonomy: EconomicAutonomy = EconomicAutonomy(),
+        policy_parameters: ApplicablePolicyParameters | None = None,
+        autonomy: EconomicAutonomyParameters | None = None,
         receiving_buffer_days: int = 0,
         accepted_shipment_pairs: Iterable[tuple[str, str]] = (),
         approved_rule_ids: Iterable[str] = (),
@@ -520,8 +505,14 @@ class IndependentPlanValidator:
         self.registry = registry or load_policy_registry()
         if not isinstance(self.registry, PolicyRegistry):
             raise TypeError("registry must be PolicyRegistry")
-        if not isinstance(autonomy, EconomicAutonomy):
-            raise TypeError("autonomy must be EconomicAutonomy")
+        if policy_parameters is not None and not isinstance(
+            policy_parameters, ApplicablePolicyParameters
+        ):
+            raise TypeError("policy_parameters must be ApplicablePolicyParameters or None")
+        if autonomy is not None and not isinstance(
+            autonomy, EconomicAutonomyParameters
+        ):
+            raise TypeError("autonomy must be EconomicAutonomyParameters or None")
         if not isinstance(receiving_buffer_days, int) or isinstance(receiving_buffer_days, bool) or receiving_buffer_days < 0:
             raise ValueError("receiving_buffer_days must be a nonnegative int")
         if not isinstance(enumeration_node_limit, int) or enumeration_node_limit <= 0:
@@ -536,7 +527,12 @@ class IndependentPlanValidator:
             solver_limits, IndependentSolverLimits
         ):
             raise TypeError("solver_limits must be IndependentSolverLimits or None")
-        self.autonomy = autonomy
+        self.policy_parameters = policy_parameters
+        self.autonomy = autonomy or (
+            policy_parameters.economic_autonomy
+            if policy_parameters is not None
+            else self.registry.economic_autonomy
+        )
         self.receiving_buffer_days = receiving_buffer_days
         self.accepted_shipment_pairs = frozenset(tuple(item) for item in accepted_shipment_pairs)
         self.approved_rule_ids = frozenset(approved_rule_ids)
@@ -562,6 +558,14 @@ class IndependentPlanValidator:
             if fixture_tokens[:1] == ("country",) and len(fixture_tokens) > 1:
                 known_international.add(fixture_tokens[1:])
         self._known_international = frozenset(known_international)
+
+    def _parameters(self, current: date) -> ApplicablePolicyParameters:
+        parameters = self.policy_parameters or self.registry.parameters_for(current)
+        if parameters.scenario_date != current:
+            raise ValueError("policy_parameters scenario date does not match the snapshot")
+        if parameters.content_hash != self.registry.content_hash:
+            raise ValueError("policy_parameters do not belong to the active registry")
+        return parameters
 
     # ---- independent policy and source reconstruction -----------------
 
@@ -1002,22 +1006,35 @@ class IndependentPlanValidator:
             return None
         return self.resolve_source_named_entity(release["subject"], snapshot.suppliers)
 
+    def _minimum_secondary_parameter(
+        self, snapshot: ScenarioSnapshot, component: Component
+    ) -> SecondaryAllocationParameters | None:
+        status = self._concept("neodymium_magnet", component)
+        semantic_status = {
+            "neodymium_magnet": (
+                True
+                if status is EvidenceStatus.PASS
+                else False
+                if status is EvidenceStatus.FAIL
+                else None
+            )
+        }
+        matches = self._parameters(
+            snapshot.configuration.current_date
+        ).matching_secondary_allocations(semantic_status)
+        if len(matches) > 1:
+            raise ValueError("multiple minimum-secondary parameters match one component")
+        return matches[0] if matches else None
+
     def _minimum_secondary(self, snapshot: ScenarioSnapshot, component: Component) -> Decimal | None:
-        for rule in self._rules(snapshot.configuration.current_date, "minimum_secondary_fraction"):
-            if self._concept("neodymium_magnet", component) is EvidenceStatus.PASS:
-                return Decimal(str(rule.data["constraint"]["value"]))
-        return None
+        parameter = self._minimum_secondary_parameter(snapshot, component)
+        return parameter.minimum_fraction if parameter is not None else None
 
     def _minimum_secondary_rule_id(
         self, snapshot: ScenarioSnapshot, component: Component
     ) -> str | None:
-        for rule in self._rules(
-            snapshot.configuration.current_date,
-            "minimum_secondary_fraction",
-        ):
-            if self._concept("neodymium_magnet", component) is EvidenceStatus.PASS:
-                return rule.rule_id
-        return None
+        parameter = self._minimum_secondary_parameter(snapshot, component)
+        return parameter.rule_id if parameter is not None else None
 
     def _increment(self, component: Component) -> Decimal:
         unit = " ".join(_tokens(component.unit_of_measure))
@@ -1170,7 +1187,18 @@ class IndependentPlanValidator:
         best_domestic = min(item[1].unit_price for item in domestic)
         best_international = min(item[1].unit_price for item in international)
         critical = self._concept("critical_component", requirement.component)
-        threshold = Decimal("0.50") if critical is not EvidenceStatus.FAIL else Decimal("0.35")
+        critical_status = (
+            True
+            if critical is EvidenceStatus.PASS
+            else False
+            if critical is EvidenceStatus.FAIL
+            else None
+        )
+        threshold = self._parameters(
+            snapshot.configuration.current_date
+        ).domestic_premiums.for_critical_status(
+            critical_status
+        ).maximum_premium_fraction
         premium = Decimal("Infinity") if best_international == ZERO and best_domestic > ZERO else (
             ZERO if best_international == ZERO else (best_domestic - best_international) / best_international
         )
@@ -1477,6 +1505,11 @@ class IndependentPlanValidator:
         plan: CandidatePlan,
         offers: Sequence[_Offer],
     ) -> tuple[Decimal, ...]:
+        parameters = self._parameters(snapshot.configuration.current_date)
+        strategic_savings = (
+            parameters.strategic_continuity.maximum_alternative_savings_fraction
+        )
+        sustainability = parameters.sustainability
         matched = {line.route_id: self._match_offer(offers, line) for line in plan.lines}
         total_quantity = sum((line.quantity for line in plan.lines), ZERO)
         physical_gaps: list[Decimal] = []
@@ -1540,7 +1573,7 @@ class IndependentPlanValidator:
                         savings = ZERO if best.catalog.unit_price == ZERO else (
                             best.catalog.unit_price - offer.catalog.unit_price
                         ) / best.catalog.unit_price
-                        if savings <= Decimal("0.15"):
+                        if savings <= strategic_savings:
                             strategic_penalty += allocation.quantity
                 if current_rating is not None:
                     comparable = tuple(
@@ -1554,9 +1587,10 @@ class IndependentPlanValidator:
                             if min(item.catalog.unit_price, offer.catalog.unit_price) == ZERO
                             else abs(item.catalog.unit_price - offer.catalog.unit_price)
                             / min(item.catalog.unit_price, offer.catalog.unit_price)
-                            <= Decimal("0.10")
+                            <= sustainability.comparable_price_fraction
                         )
-                        and _business_days(item.material_available, offer.material_available) <= 5
+                        and _business_days(item.material_available, offer.material_available)
+                        <= sustainability.comparable_delivery_days
                     )
                     if comparable:
                         best_rating = max(_rating(item.supplier.sustainability_rating) for item in comparable)
@@ -1593,6 +1627,11 @@ class IndependentPlanValidator:
         phased_allocation: Mapping[tuple[int, int], Decimal],
         q_min: Decimal,
     ) -> tuple[Decimal, ...]:
+        parameters = self._parameters(snapshot.configuration.current_date)
+        strategic_savings = (
+            parameters.strategic_continuity.maximum_alternative_savings_fraction
+        )
+        sustainability = parameters.sustainability
         physical_gaps = tuple(
             max(
                 ZERO,
@@ -1671,7 +1710,7 @@ class IndependentPlanValidator:
                         )
                         / best.catalog.unit_price
                     )
-                    if savings <= Decimal("0.15"):
+                    if savings <= strategic_savings:
                         strategic += quantity
             current_rating = _rating(offer.supplier.sustainability_rating)
             if current_rating is not None:
@@ -1695,12 +1734,12 @@ class IndependentPlanValidator:
                         / min(
                             item.catalog.unit_price, offer.catalog.unit_price
                         )
-                        <= Decimal("0.10")
+                        <= sustainability.comparable_price_fraction
                     )
                     and _business_days(
                         item.material_available, offer.material_available
                     )
-                    <= 5
+                    <= sustainability.comparable_delivery_days
                 )
                 if better:
                     best_rating = max(
@@ -1748,6 +1787,11 @@ class IndependentPlanValidator:
         case without walking equivalent compositions.
         """
 
+        parameters = self._parameters(snapshot.configuration.current_date)
+        strategic_savings = (
+            parameters.strategic_continuity.maximum_alternative_savings_fraction
+        )
+        sustainability = parameters.sustainability
         selected = tuple(
             index for index, quantity in allocation.items() if quantity > ZERO
         )
@@ -1812,7 +1856,7 @@ class IndependentPlanValidator:
                         )
                         / best.catalog.unit_price
                     )
-                    if savings <= Decimal("0.15"):
+                    if savings <= strategic_savings:
                         strategic_penalty = Decimal("1")
             sustainability_penalty = ZERO
             rating = _rating(offer.supplier.sustainability_rating)
@@ -1836,12 +1880,12 @@ class IndependentPlanValidator:
                         / min(
                             item.catalog.unit_price, offer.catalog.unit_price
                         )
-                        <= Decimal("0.10")
+                        <= sustainability.comparable_price_fraction
                     )
                     and _business_days(
                         item.material_available, offer.material_available
                     )
-                    <= 5
+                    <= sustainability.comparable_delivery_days
                 )
                 if comparable:
                     best_rating = max(
@@ -2271,6 +2315,11 @@ class IndependentPlanValidator:
         q_min: Decimal | None = None,
         cheapest_covering_cost: Decimal | None = None,
     ) -> IndependentSolve:
+        parameters = self._parameters(snapshot.configuration.current_date)
+        strategic_savings = (
+            parameters.strategic_continuity.maximum_alternative_savings_fraction
+        )
+        sustainability = parameters.sustainability
         atom = self._milp_quantity_atom(requirement, offers)
         increment_atoms = _ceil_units(
             self._increment(requirement.component), atom
@@ -2833,7 +2882,7 @@ class IndependentPlanValidator:
                                 )
                                 / best.catalog.unit_price
                             )
-                            if savings <= Decimal("0.15"):
+                            if savings <= strategic_savings:
                                 strategic_coefficients[
                                     z[offer_index][bucket_index]
                                 ] = 1
@@ -2863,13 +2912,13 @@ class IndependentPlanValidator:
                                 item.catalog.unit_price,
                                 offer.catalog.unit_price,
                             )
-                            <= Decimal("0.10")
+                            <= sustainability.comparable_price_fraction
                         )
                         and _business_days(
                             item.material_available,
                             offer.material_available,
                         )
-                        <= 5
+                        <= sustainability.comparable_delivery_days
                     )
                     if comparable:
                         best_rating = max(
@@ -3507,7 +3556,12 @@ class IndependentPlanValidator:
             snapshot.configuration.current_date,
             "order_value_approval",
         )
-        order_value_rule_ids = {item.rule_id for item in order_value_rules}
+        approval_parameters = self._parameters(
+            snapshot.configuration.current_date
+        ).approval_thresholds
+        order_value_rule_ids = {item.rule_id for item in approval_parameters}
+        if order_value_rule_ids != {item.rule_id for item in order_value_rules}:
+            raise ValueError("typed approval parameters disagree with active approval rules")
         group_ids = {line.allocation_group_id for line in plan.lines}
         if len(group_ids) != 1:
             sink.error("ALLOCATION_GROUP_MISMATCH", "All lines for one component/run must share one allocation group.", component_id=component_id, plan_id=plan_id)
@@ -3603,11 +3657,11 @@ class IndependentPlanValidator:
                     if "condition_" in exception_id and not exception_id.endswith(f"condition_{condition}"):
                         sink.error("EXCEPTION_PREDICATE_MISMATCH", "Allocation exception label disagrees with the recomputed bucket predicate.", component_id=component_id, plan_id=plan_id)
             expected_order_approvals = {
-                rule.rule_id
-                for rule in order_value_rules
+                parameter.rule_id
+                for parameter in approval_parameters
                 if line.line_total
-                > Decimal(str(rule.data["constraint"]["amount_exceeds"]))
-                and rule.rule_id not in self.approved_rule_ids
+                > parameter.amount_exceeds
+                and parameter.rule_id not in self.approved_rule_ids
             }
             represented_order_approvals = (
                 set(line.approval_rule_ids) & order_value_rule_ids
@@ -4014,7 +4068,13 @@ class IndependentPlanValidator:
                     "Evidence-blocked requirements require an EVIDENCE_CONTRACT remediation alert.",
                     component_id=decision.component_id,
                 )
-            if AlertCategory.ASSUMPTION in decision.alert_categories:
+            if (
+                AlertCategory.ASSUMPTION in decision.alert_categories
+                and not (
+                    decision.economic_autonomy is not None
+                    and decision.economic_autonomy.provisional
+                )
+            ):
                 sink.error(
                     "PRODUCTION_EVIDENCE_AS_ASSUMPTION",
                     "Unavailable production facts cannot be rendered as assumptions relied upon.",
@@ -4269,6 +4329,25 @@ class IndependentPlanValidator:
             if requirement is None:
                 sink.error("UNKNOWN_REQUIREMENT_COMPONENT", "Decision has no independently reconstructed source requirement.", component_id=decision.component_id)
                 continue
+            if self.policy_parameters is not None:
+                expected_autonomy = self._parameters(
+                    snapshot.configuration.current_date
+                ).economic_autonomy
+                if decision.economic_autonomy != expected_autonomy:
+                    sink.error(
+                        "ECONOMIC_AUTONOMY_DISCLOSURE_MISMATCH",
+                        "Decision output does not disclose the active typed economic-autonomy parameters.",
+                        component_id=decision.component_id,
+                    )
+                if (
+                    expected_autonomy.provisional
+                    and AlertCategory.ASSUMPTION not in decision.alert_categories
+                ):
+                    sink.error(
+                        "PROVISIONAL_AUTONOMY_ALERT_MISSING",
+                        "Provisional economic-autonomy parameters require an ASSUMPTION alert.",
+                        component_id=decision.component_id,
+                    )
             self._check_decision_facts(snapshot, decision, requirement, sink)
             self._check_requirement_evidence_disposition(
                 snapshot,
@@ -4421,6 +4500,33 @@ class IndependentPlanValidator:
 
 
 PlanValidator = IndependentPlanValidator
+
+
+def EconomicAutonomy(
+    *,
+    max_surplus_fraction: Decimal | None = None,
+    max_surplus_units: Decimal | None = None,
+    max_excess_cost_usd: Decimal | None = None,
+) -> EconomicAutonomyParameters:
+    """Compatibility constructor whose omitted values still come from the pack."""
+
+    base = load_policy_registry().economic_autonomy
+    return replace(
+        base,
+        max_surplus_fraction=(
+            base.max_surplus_fraction
+            if max_surplus_fraction is None
+            else max_surplus_fraction
+        ),
+        max_surplus_units=(
+            base.max_surplus_units if max_surplus_units is None else max_surplus_units
+        ),
+        max_excess_cost_usd=(
+            base.max_excess_cost_usd
+            if max_excess_cost_usd is None
+            else max_excess_cost_usd
+        ),
+    )
 
 
 def validate_plans(

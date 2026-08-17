@@ -57,6 +57,7 @@ from .policy.entity_resolution import (
     normalize_legal_name,
     normalized_tokens,
 )
+from .policy.parameters import ApplicablePolicyParameters, DomesticPremiumParameters
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
 
 
@@ -221,13 +222,12 @@ def evaluate_domestic_gate(
     best_domestic_price: Decimal | None,
     best_international_price: Decimal | None,
     critical_status: EvidenceStatus | bool,
-    noncritical_rule_id: str = "POLICY.section_3.domestic_preference",
-    critical_rule_id: str = "POLICY.section_3.critical_premium_threshold",
+    premium_parameters: DomesticPremiumParameters | None = None,
 ) -> DomesticGateDecision:
     """Evaluate §3 with strict thresholds and a guarded international denominator.
 
-    Unknown criticality uses the stricter 50% reading, the intersection that
-    remains safe under both possible classifications.
+    Unknown criticality uses the critical semantic scope, the intersection
+    that remains safe under both possible classifications.
     """
 
     for name, value in (
@@ -242,8 +242,13 @@ def evaluate_domestic_gate(
         critical = critical_status is not EvidenceStatus.FAIL
     else:
         raise TypeError("critical_status must be bool or EvidenceStatus")
-    threshold = Decimal("0.50") if critical else Decimal("0.35")
-    rule_ids = (critical_rule_id,) if critical else (noncritical_rule_id,)
+    if premium_parameters is None:
+        premium_parameters = load_policy_registry().parameters_for(
+            date.max
+        ).domestic_premiums
+    parameter = premium_parameters.for_critical_status(critical)
+    threshold = parameter.maximum_premium_fraction
+    rule_ids = (parameter.rule_id,)
 
     # Without an international offer there is no valid ratio denominator and
     # no international route for any lettered permission to admit.
@@ -575,6 +580,7 @@ class CandidateBuilder:
         approved_air_route_fingerprints: Iterable[str] = (),
         approved_below_b_route_fingerprints: Iterable[str] = (),
         air_period_spend: Decimal | None = None,
+        policy_parameters: ApplicablePolicyParameters | None = None,
     ) -> None:
         self.registry = registry or load_policy_registry()
         if not isinstance(self.registry, PolicyRegistry):
@@ -609,7 +615,20 @@ class CandidateBuilder:
             approved_below_b_route_fingerprints
         )
         self.air_period_spend = air_period_spend
+        if policy_parameters is not None and not isinstance(
+            policy_parameters, ApplicablePolicyParameters
+        ):
+            raise TypeError("policy_parameters must be ApplicablePolicyParameters or None")
+        self.policy_parameters = policy_parameters
         self.resolver = EntityResolver(self.registry)
+
+    def _parameters(self, scenario_date: date) -> ApplicablePolicyParameters:
+        parameters = self.policy_parameters or self.registry.parameters_for(scenario_date)
+        if parameters.scenario_date != scenario_date:
+            raise ValueError("policy_parameters scenario date does not match the snapshot")
+        if parameters.content_hash != self.registry.content_hash:
+            raise ValueError("policy_parameters do not belong to the active registry")
+        return parameters
 
     def _rules(self, kind: str, scenario_date: date) -> tuple[PolicyRule, ...]:
         return tuple(
@@ -853,24 +872,6 @@ class CandidateBuilder:
     def _critical_status(self, component: Component) -> EvidenceStatus:
         return self.resolver.resolve_concept("critical_component", component).status
 
-    def _domestic_rule_ids(
-        self, component: Component, scenario_date: date
-    ) -> tuple[str, str]:
-        rules = self._rules("domestic_supplier_preference", scenario_date)
-        noncritical = next(
-            rule
-            for rule in rules
-            if Decimal(str(rule.data["constraint"]["maximum_premium_fraction"]))
-            == Decimal("0.35")
-        )
-        critical = next(
-            rule
-            for rule in rules
-            if Decimal(str(rule.data["constraint"]["maximum_premium_fraction"]))
-            == Decimal("0.50")
-        )
-        return noncritical.rule_id, critical.rule_id
-
     def _gate_by_component(
         self,
         snapshot: ScenarioSnapshot,
@@ -902,9 +903,6 @@ class CandidateBuilder:
             best_international = min(
                 (item.catalog.unit_price for item in international), default=None
             )
-            noncritical_id, critical_id = self._domestic_rule_ids(
-                component, scenario_date
-            )
             critical_status = self._critical_status(component)
             for bucket in ledgers.buckets_for(component_id):
                 domestic_can_meet = any(
@@ -917,8 +915,9 @@ class CandidateBuilder:
                     best_domestic_price=best_domestic,
                     best_international_price=best_international,
                     critical_status=critical_status,
-                    noncritical_rule_id=noncritical_id,
-                    critical_rule_id=critical_id,
+                    premium_parameters=self._parameters(
+                        scenario_date
+                    ).domestic_premiums,
                 )
         return result
 
@@ -1121,7 +1120,15 @@ class CandidateBuilder:
                 )
             )
         for rule in self._rules("air_freight_period_spend_cap", scenario_date):
-            cap = Decimal(str(rule.data["constraint"]["maximum_amount"]))
+            caps = {
+                item.rule_id: item.maximum_amount
+                for item in self._parameters(scenario_date).air_freight_period_caps
+            }
+            if rule.rule_id not in caps:
+                raise ValueError(
+                    f"active air-freight cap {rule.rule_id!r} is absent from typed parameters"
+                )
+            cap = caps[rule.rule_id]
             if self.air_period_spend is not None and self.air_period_spend <= cap:
                 results.append(
                     _evidence(
@@ -1273,7 +1280,19 @@ class CandidateBuilder:
         if not grouped:
             # Preserve one classified route for the catalog offer even though
             # the international eligibility gate is shut.
-            decision = gate[(facts.component.component_id, buckets[0].due_date)] if buckets else DomesticGateDecision(DomesticGateCondition.SHUT, Decimal("0.50"), None)
+            if buckets:
+                decision = gate[(facts.component.component_id, buckets[0].due_date)]
+            else:
+                critical = self._critical_status(facts.component)
+                parameter = self._parameters(order_date).domestic_premiums.for_critical_status(
+                    critical is not EvidenceStatus.FAIL
+                )
+                decision = DomesticGateDecision(
+                    DomesticGateCondition.SHUT,
+                    parameter.maximum_premium_fraction,
+                    None,
+                    (parameter.rule_id,),
+                )
             return (
                 self._make_route(
                     snapshot,
@@ -1384,6 +1403,12 @@ class CandidateBuilder:
         scenario_date = snapshot.configuration.current_date
         strategic_rule = self._one_rule("strategic_supplier_continuity", scenario_date)
         sustainability_rule = self._one_rule("sustainability_preference", scenario_date)
+        parameters = self._parameters(scenario_date)
+        strategic_savings = (
+            parameters.strategic_continuity.maximum_alternative_savings_fraction
+        )
+        comparable_price_fraction = parameters.sustainability.comparable_price_fraction
+        comparable_delivery_days = parameters.sustainability.comparable_delivery_days
         cost_rule = self._one_rule("total_cost_of_ownership", scenario_date)
         delivery_rule = self._one_rule("on_time_arrival", scenario_date)
         domestic_rule_ids = tuple(
@@ -1461,7 +1486,7 @@ class CandidateBuilder:
                         within = route.unit_price >= ZERO
                     else:
                         savings = (best.unit_price - route.unit_price) / best.unit_price
-                        within = savings <= Decimal("0.15")
+                        within = savings <= strategic_savings
                     if within:
                         strategic_penalty_deadlines.append(due.isoformat())
 
@@ -1482,14 +1507,14 @@ class CandidateBuilder:
                             route.unit_price == alternative.unit_price
                             if low_price == ZERO
                             else abs(route.unit_price - alternative.unit_price) / low_price
-                            <= Decimal("0.10")
+                            <= comparable_price_fraction
                         )
                         delivery_comparable = (
                             _business_day_distance(
                                 route.material_available_date,
                                 alternative.material_available_date,
                             )
-                            <= 5
+                            <= comparable_delivery_days
                         )
                         if price_comparable and delivery_comparable:
                             sustainability_penalty_deadlines.append(due.isoformat())
@@ -1519,7 +1544,8 @@ class CandidateBuilder:
                     "penalty:" + ",".join(strategic_penalty_deadlines)
                     if strategic_penalty_deadlines
                     else "no_penalty",
-                    "A non-Strategic route is penalized only where its savings do not strictly exceed 15%.",
+                    "A non-Strategic route is penalized only where its savings do not "
+                    f"strictly exceed {strategic_savings}.",
                     compared,
                     (strategic_rule.rule_id,),
                 ),
@@ -1529,7 +1555,8 @@ class CandidateBuilder:
                     "penalty:" + ",".join(sustainability_penalty_deadlines)
                     if sustainability_penalty_deadlines
                     else "no_penalty",
-                    "The rating preference applies only inside the inclusive 10%-price and five-business-day window.",
+                    "The rating preference applies only inside the inclusive "
+                    f"{comparable_price_fraction}-price and {comparable_delivery_days}-business-day window.",
                     compared,
                     (sustainability_rule.rule_id,),
                 ),
@@ -1692,6 +1719,7 @@ def build_candidate_routes(
     approved_air_route_fingerprints: Iterable[str] = (),
     approved_below_b_route_fingerprints: Iterable[str] = (),
     air_period_spend: Decimal | None = None,
+    policy_parameters: ApplicablePolicyParameters | None = None,
 ) -> CandidateBuildResult:
     """Convenience wrapper around :class:`CandidateBuilder`."""
 
@@ -1704,6 +1732,7 @@ def build_candidate_routes(
         approved_air_route_fingerprints=approved_air_route_fingerprints,
         approved_below_b_route_fingerprints=approved_below_b_route_fingerprints,
         air_period_spend=air_period_spend,
+        policy_parameters=policy_parameters,
     ).build(snapshot, ledgers)
 
 
@@ -1719,6 +1748,7 @@ def _compare_routes(
     right: CandidateRoute,
     suppliers: Mapping[str, Supplier],
     due_date: date | None,
+    policy_parameters: ApplicablePolicyParameters,
 ) -> int:
     left_feasible = bool(left.feasible_deadlines) if due_date is None else due_date in left.feasible_deadlines
     right_feasible = bool(right.feasible_deadlines) if due_date is None else due_date in right.feasible_deadlines
@@ -1745,7 +1775,10 @@ def _compare_routes(
             savings = (
                 strategic_route.unit_price - alternative.unit_price
             ) / strategic_route.unit_price
-            retain = savings <= Decimal("0.15")
+            retain = (
+                savings
+                <= policy_parameters.strategic_continuity.maximum_alternative_savings_fraction
+            )
         if retain:
             return -1 if left_strategic else 1
 
@@ -1761,13 +1794,13 @@ def _compare_routes(
             left.unit_price == right.unit_price
             if minimum_price == ZERO
             else abs(left.unit_price - right.unit_price) / minimum_price
-            <= Decimal("0.10")
+            <= policy_parameters.sustainability.comparable_price_fraction
         )
         comparable_delivery = (
             _business_day_distance(
                 left.material_available_date, right.material_available_date
             )
-            <= 5
+            <= policy_parameters.sustainability.comparable_delivery_days
         )
         if comparable_price and comparable_delivery:
             return -1 if left_rating > right_rating else 1
@@ -1790,12 +1823,22 @@ def rank_candidate_routes(
     suppliers: Iterable[Supplier],
     *,
     due_date: date | None = None,
+    policy_parameters: ApplicablePolicyParameters | None = None,
 ) -> tuple[CandidateRoute, ...]:
     """Order routes with the §7 lexicographic comparator chain."""
 
     if due_date is not None:
         _require_date(due_date, "due_date")
     route_tuple = tuple(routes)
+    if policy_parameters is None:
+        parameter_date = due_date or (
+            min(item.order_date for item in route_tuple) if route_tuple else None
+        )
+        if parameter_date is None:
+            return ()
+        policy_parameters = load_policy_registry().parameters_for(parameter_date)
+    elif not isinstance(policy_parameters, ApplicablePolicyParameters):
+        raise TypeError("policy_parameters must be ApplicablePolicyParameters or None")
     supplier_map = {item.supplier_id: item for item in suppliers}
     if any(item.supplier_id not in supplier_map for item in route_tuple):
         raise ValueError("every route requires its supplier row")
@@ -1810,7 +1853,7 @@ def rank_candidate_routes(
             eligible,
             key=cmp_to_key(
                 lambda left, right: _compare_routes(
-                    left, right, supplier_map, due_date
+                    left, right, supplier_map, due_date, policy_parameters
                 )
             ),
         )

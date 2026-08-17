@@ -7,7 +7,7 @@
     "llm_used": false
   },
   "review_status": "approved",
-  "content_hash": "sha256:f85076dcde4b4a4745e2d74ff856daacd508f56a08dae9881bff22416400bc1e",
+  "content_hash": "sha256:1e97f744ca6cdd03b11336e87cf8d955988ba6a81f95cd6954dd68f781b16a6d",
   "concepts": {
     "path": "concepts.json",
     "content_hash": "sha256:f6671dbe7124f6a512f529f6c321282e51260b54e36712e40951d14a8eca3994"
@@ -136,6 +136,16 @@
     ],
     "conflict_result": "UNKNOWN_BLOCK_AND_ALERT",
     "derived_from": "MERGED_PLAN#5.1/precedence"
+  },
+  "economic_autonomy": {
+    "max_surplus_fraction": "0.10",
+    "max_surplus_units": null,
+    "max_excess_cost_usd": "2500",
+    "forced_surplus_review_usd": "2500",
+    "boundary": "inclusive",
+    "provisional": true,
+    "review_status": "approved",
+    "source_pointer": "MERGED_PLAN#8.3"
   },
   "derivations": [
     {"derivation_id": "evidence_prospective_order", "value": "always_satisfiable", "source_pointer": "MERGED_PLAN#5.1/evidence_bases/prospective_order", "review_status": "approved", "reasoning": "A prospective allocation is provable from the order under construction."},

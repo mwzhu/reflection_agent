@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+from decimal import Decimal
 import json
 from pathlib import Path
 import re
@@ -42,12 +43,66 @@ def _rule(pack: dict[str, object], rule_id: str) -> dict[str, object]:
 class PolicyPackTests(unittest.TestCase):
     def test_checked_in_pack_validates_with_pdf_provenance(self) -> None:
         registry = load_policy_registry()
+        parameters = registry.parameters_for(date(2025, 9, 1))
 
         self.assertEqual(registry.pack_id, "apex-procurement-policy-2025-08-20")
         self.assertEqual(len(registry.rules), 35)
         self.assertTrue(registry.content_hash.startswith("sha256:"))
         self.assertTrue(registry.concepts_hash.startswith("sha256:"))
         self.assertFalse(registry.pack["compiler"]["llm_used"])
+        self.assertEqual(
+            parameters.domestic_premiums.ordinary.maximum_premium_fraction,
+            Decimal("0.35"),
+        )
+        self.assertEqual(
+            parameters.domestic_premiums.critical.maximum_premium_fraction,
+            Decimal("0.50"),
+        )
+        self.assertEqual(
+            parameters.strategic_continuity.maximum_alternative_savings_fraction,
+            Decimal("0.15"),
+        )
+        self.assertEqual(
+            parameters.sustainability.comparable_price_fraction,
+            Decimal("0.10"),
+        )
+        self.assertEqual(parameters.sustainability.comparable_delivery_days, 5)
+        self.assertEqual(
+            tuple((item.amount_exceeds, item.authority) for item in parameters.approval_thresholds),
+            (
+                (Decimal("50000"), "Procurement Manager"),
+                (Decimal("150000"), "VP of Operations"),
+            ),
+        )
+        self.assertEqual(parameters.emergency_approval.amount_up_to, Decimal("75000"))
+        self.assertEqual(parameters.emergency_approval.retroactive_approval_business_days, 5)
+        self.assertEqual(
+            tuple(
+                (item.rule_id, item.maximum_fraction, item.window_months)
+                for item in parameters.supplier_volume_caps
+            ),
+            (
+                ("MEMO-2025-041.magnet_rolling_cap", Decimal("0.50"), 12),
+                ("POL-PROC-001.section_4.critical_cap", Decimal("0.70"), 12),
+                ("POL-PROC-001.section_4.noncritical_cap", Decimal("0.85"), 12),
+            ),
+        )
+        self.assertEqual(
+            tuple(
+                (item.rule_id, item.minimum_fraction)
+                for item in parameters.secondary_allocations
+            ),
+            (("MEMO-2025-041.magnet_secondary_allocation", Decimal("0.20")),),
+        )
+        self.assertEqual(
+            tuple(item.maximum_amount for item in parameters.air_freight_period_caps),
+            (Decimal("25000"),),
+        )
+        self.assertEqual(parameters.economic_autonomy.max_surplus_fraction, Decimal("0.10"))
+        self.assertIsNone(parameters.economic_autonomy.max_surplus_units)
+        self.assertEqual(parameters.economic_autonomy.max_excess_cost_usd, Decimal("2500"))
+        self.assertEqual(parameters.economic_autonomy.forced_surplus_review_usd, Decimal("2500"))
+        self.assertTrue(parameters.economic_autonomy.provisional)
 
     def test_air_freight_memo_is_active_on_last_day_and_inactive_next_day(self) -> None:
         registry = load_policy_registry()
@@ -167,6 +222,24 @@ class PolicyPackTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PolicyValidationError, "must be 'approved'"):
             validate_policy_documents(mutated, concepts, project_root=PROJECT_ROOT)
+
+    def test_economic_autonomy_is_strictly_typed_and_reviewed(self) -> None:
+        pack, concepts = _documents()
+        mutations = (
+            ("max_surplus_fraction", 0.25, "decimal string"),
+            ("max_surplus_units", "NaN", "finite"),
+            ("review_status", "draft", "approved"),
+            ("boundary", "exclusive", "inclusive"),
+        )
+        for key, value, message in mutations:
+            with self.subTest(key=key):
+                mutated = deepcopy(pack)
+                mutated["economic_autonomy"][key] = value
+                _rehash(mutated)
+                with self.assertRaisesRegex(PolicyValidationError, message):
+                    validate_policy_documents(
+                        mutated, concepts, project_root=PROJECT_ROOT
+                    )
 
 
 if __name__ == "__main__":

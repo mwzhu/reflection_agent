@@ -157,6 +157,13 @@ def _number(value: Decimal) -> str:
     return format(value, "f")
 
 
+def _economic_autonomy_disclosure(decision: DecisionRecord) -> str:
+    parameters = decision.economic_autonomy
+    if parameters is None:
+        return ""
+    return f" Active policy parameter disclosure: {parameters.disclosure()}."
+
+
 def _encode_scope(scope: str) -> str:
     return urlsafe_b64encode(scope.encode("utf-8")).decode("ascii").rstrip("=")
 
@@ -260,6 +267,7 @@ def render_decision_rationale(decision: DecisionRecord) -> str:
         f"{decision.requirement_state.resolution.value}; evidence contract "
         f"{decision.evidence_contract.value}; rule IDs [{_list(rules)}]."
         f"{contract_dispositions} Post-plan deadline misses [{lateness}]."
+        f"{_economic_autonomy_disclosure(decision)}"
     )
 
 
@@ -314,6 +322,7 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
         f"objective [{objective}]; evidence [{evidence}]; alternatives and material rejections "
         f"[{alternatives}]; disclosures [{_list(item.value for item in decision.alert_categories)}]; "
         f"assumptions [{_list(assumptions)}]."
+        f"{_economic_autonomy_disclosure(decision)}"
     )
 
 
@@ -650,6 +659,15 @@ def _evidence_contract_alert(decision: DecisionRecord) -> str:
 
 
 def _assumption_alert(decision: DecisionRecord, code: str) -> str:
+    if code == "PROVISIONAL_ECONOMIC_AUTONOMY":
+        return (
+            f"Component {decision.component_id}, requirement {decision.requirement_id} uses "
+            "reviewed but provisional economic-autonomy parameters from the policy pack. "
+            f"The managed record retains assumption code {code}; this classification concerns "
+            "governance of pack-owned thresholds, not the evidence contract. Human action: "
+            "approve or replace the provisional values in a reviewed policy pack and rerun if "
+            "they change."
+        )
     return (
         f"Component {decision.component_id}, requirement {decision.requirement_id} relied on "
         f"assumption {code} under the {decision.evidence_contract.value} evidence contract. "
@@ -713,7 +731,15 @@ def render_alerts(
     registry = policy_registry
     rendered: list[RenderedAlert] = []
 
-    def add(category: AlertCategory, scope: str, body: str) -> None:
+    def add(
+        category: AlertCategory,
+        scope: str,
+        body: str,
+        *,
+        decision: DecisionRecord | None = None,
+    ) -> None:
+        if decision is not None:
+            body += _economic_autonomy_disclosure(decision)
         rendered.append(
             make_owned_alert(category, scope, body, visible_prefix=visible_prefixes)
         )
@@ -721,7 +747,12 @@ def render_alerts(
     for decision in records:
         scope = f"requirement:{decision.requirement_id}"
         if decision.residual_gap > ZERO:
-            add(AlertCategory.UNMET_DEMAND, f"{scope}:residual", _residual_alert(decision))
+            add(
+                AlertCategory.UNMET_DEMAND,
+                f"{scope}:residual",
+                _residual_alert(decision),
+                decision=decision,
+            )
 
         assumptions: set[str] = set()
         plans = tuple(
@@ -736,8 +767,18 @@ def render_alerts(
                     assumptions.update(evidence.assumption_codes)
             for evidence in decision.evidence:
                 assumptions.update(evidence.assumption_codes)
+        if (
+            decision.economic_autonomy is not None
+            and decision.economic_autonomy.provisional
+        ):
+            assumptions.add("PROVISIONAL_ECONOMIC_AUTONOMY")
         for code in sorted(assumptions):
-            add(AlertCategory.ASSUMPTION, f"{scope}:assumption:{code}", _assumption_alert(decision, code))
+            add(
+                AlertCategory.ASSUMPTION,
+                f"{scope}:assumption:{code}",
+                _assumption_alert(decision, code),
+                decision=decision,
+            )
 
         approval_count = 0
         decision_count = 0
@@ -768,6 +809,7 @@ def render_alerts(
                     AlertCategory.APPROVAL_REQUIRED,
                     f"{scope}:approval:{plan.plan_id}:{'-'.join(sorted(represented))}",
                     _approval_alert(decision, plan, approvals_by_route),
+                    decision=decision,
                 )
                 approval_count += 1
             elif plan.disposition is PlanDisposition.DECISION_REQUIRED:
@@ -775,6 +817,7 @@ def render_alerts(
                     AlertCategory.DECISION_REQUIRED,
                     f"{scope}:decision:{plan.plan_id}",
                     _decision_alert(decision, plan),
+                    decision=decision,
                 )
                 decision_count += 1
 
@@ -797,6 +840,7 @@ def render_alerts(
                     AlertCategory.LATE_ARRIVAL,
                     f"{scope}:late:{lateness.due_date.isoformat()}",
                     _late_alert(decision, lateness.due_date),
+                    decision=decision,
                 )
         elif AlertCategory.LATE_ARRIVAL in decision.alert_categories:
             raise ExplanationError(
@@ -824,6 +868,7 @@ def render_alerts(
                     f"residual quantity is {_number(decision.residual_gap)}. The agent placed no "
                     f"unsupported order. Human action: {remediation} and rerun from a fresh snapshot."
                 ),
+                decision=decision,
             )
         if (
             decision.evidence_contract is EvidenceContract.PRODUCTION
@@ -834,13 +879,24 @@ def render_alerts(
                 AlertCategory.EVIDENCE_CONTRACT,
                 f"{scope}:evidence-contract",
                 _evidence_contract_alert(decision),
+                decision=decision,
             )
         if AlertCategory.SOLVER_UNPROVEN in decision.alert_categories:
-            add(AlertCategory.SOLVER_UNPROVEN, f"{scope}:solver", _solver_alert(decision))
+            add(
+                AlertCategory.SOLVER_UNPROVEN,
+                f"{scope}:solver",
+                _solver_alert(decision),
+                decision=decision,
+            )
         for category in sorted(set(decision.alert_categories) - special, key=lambda item: item.value):
             if category not in _GENERIC_ACTIONS:
                 raise ExplanationError(f"no deterministic alert template for {category.value}")
-            add(category, f"{scope}:category:{category.value}", _generic_alert(decision, category))
+            add(
+                category,
+                f"{scope}:category:{category.value}",
+                _generic_alert(decision, category),
+                decision=decision,
+            )
 
     po_count = sum(
         len(item.selected_plan.lines) if item.selected_plan is not None else 0

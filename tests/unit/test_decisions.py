@@ -48,6 +48,7 @@ from apex_procurement.explanations import (
     render_line_rationale,
 )
 from apex_procurement.ledgers import build_ledgers
+from apex_procurement.policy import load_policy_registry
 from apex_procurement.repository import SQLiteRepository
 
 
@@ -240,7 +241,12 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertNotEqual(demand_fingerprint(original), demand_fingerprint(changed_demand))
 
     def test_owned_po_round_trips_full_record_and_selected_line_state(self) -> None:
-        output = build_decision_outputs((make_decision(),), "policy-version-one")
+        registry = load_policy_registry()
+        decision = replace(
+            make_decision(),
+            economic_autonomy=registry.economic_autonomy,
+        )
+        output = build_decision_outputs((decision,), "policy-version-one")
         target = output.purchase_orders[0]
 
         stored = ExistingPurchaseOrder(
@@ -259,6 +265,10 @@ class IdentityAndRenderingTests(unittest.TestCase):
         assert parsed is not None
         self.assertEqual(parsed.action_key, target.action_key)
         self.assertEqual(parsed.decision, output.decisions[0])
+        self.assertEqual(
+            parsed.decision.economic_autonomy,
+            registry.economic_autonomy,
+        )
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
         self.assertIn("[APEX_AGENT:v3 ", target.rationale)
         self.assertIn("Fulfillment FULFILLED; resolution RESOLVED", target.rationale)

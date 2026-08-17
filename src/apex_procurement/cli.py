@@ -75,6 +75,7 @@ from .optimizer import (
 )
 from .policy.entity_resolution import EntityResolver
 from .policy.evaluator import EvaluationBatch, EvaluationContext, PolicyEvaluator
+from .policy.parameters import ApplicablePolicyParameters
 from .policy.registry import PolicyRegistry, PolicyRule, load_policy_registry
 from .policy.schema import PolicyValidationError
 from .repository import (
@@ -347,6 +348,7 @@ def _optimizer_problem(
     candidates: CandidateBuildResult,
     evaluations: Mapping[str, EvaluationBatch],
     component_id: str,
+    policy_parameters: ApplicablePolicyParameters,
 ) -> OptimizerProblem:
     component = next(item for item in snapshot.components if item.component_id == component_id)
     ledger = ledgers.ledger_for(component_id)
@@ -358,26 +360,35 @@ def _optimizer_problem(
     named_primary_rule_id: str | None = None
     moq_rule_id: str | None = None
     sub_moq_approval_rule_id: str | None = None
-    order_approvals: list[OrderApprovalConstraint] = []
+    order_approvals = [
+        OrderApprovalConstraint(
+            rule_id=item.rule_id,
+            maximum_without_approval=item.amount_exceeds,
+            approving_authority=item.authority,
+        )
+        for item in policy_parameters.approval_thresholds
+    ]
+
+    secondary_parameters = tuple(
+        item
+        for item in policy_parameters.secondary_allocations
+        if item.rule_id in applicable
+    )
+    if len(secondary_parameters) > 1:
+        raise PlanningFailure(
+            f"multiple minimum-secondary parameters apply to {component_id}"
+        )
+    if secondary_parameters:
+        minimum_secondary_fraction = secondary_parameters[0].minimum_fraction
+        minimum_secondary_rule_id = secondary_parameters[0].rule_id
 
     for rule in registry.active_rules(snapshot.configuration.current_date):
         kind = _rule_kind(rule)
         body = _rule_body(rule)
-        if kind == "order_value_approval":
-            order_approvals.append(
-                OrderApprovalConstraint(
-                    rule_id=rule.rule_id,
-                    maximum_without_approval=Decimal(str(body["amount_exceeds"])),
-                    approving_authority=str(body["authority"]),
-                )
-            )
-        elif kind == "catalog_minimum_order_quantity":
+        if kind == "catalog_minimum_order_quantity":
             moq_rule_id = rule.rule_id
         elif kind == "sub_moq_written_approval":
             sub_moq_approval_rule_id = rule.rule_id
-        elif kind == "minimum_secondary_fraction" and rule.rule_id in applicable:
-            minimum_secondary_fraction = Decimal(str(body["value"]))
-            minimum_secondary_rule_id = rule.rule_id
         elif kind == "named_primary_supplier" and rule.rule_id in applicable:
             reference = body.get("supplier")
             if isinstance(reference, Mapping):
@@ -402,6 +413,7 @@ def _optimizer_problem(
         named_primary_supplier_id=named_primary_supplier_id,
         named_primary_rule_id=named_primary_rule_id,
         order_approval_constraints=tuple(order_approvals),
+        policy_parameters=policy_parameters,
         moq_rule_id=moq_rule_id,
         sub_moq_approval_rule_id=sub_moq_approval_rule_id,
     )
@@ -424,6 +436,7 @@ def _below_b_no_alternative_proofs(
     ledgers: LedgerBuildResult,
     candidates: CandidateBuildResult,
     evaluations: Mapping[str, EvaluationBatch],
+    policy_parameters: ApplicablePolicyParameters,
 ) -> tuple[NoAlternativeProof, ...]:
     """Run the planner/validator predicate pair required by the below-B gate."""
 
@@ -445,7 +458,9 @@ def _below_b_no_alternative_proofs(
         return ()
     components = {item.component_id: item for item in snapshot.components}
     solver = IntegerScaledSolver()
-    validator = IndependentPlanValidator(registry)
+    validator = IndependentPlanValidator(
+        registry, policy_parameters=policy_parameters
+    )
     proofs: list[NoAlternativeProof] = []
     for component_id in sorted(pending):
         problem = _optimizer_problem(
@@ -455,6 +470,7 @@ def _below_b_no_alternative_proofs(
             candidates,
             evaluations,
             component_id,
+            policy_parameters,
         )
         # Named-primary is shaping, not evidence that a B-or-better
         # alternative is absent.  All hard gates and per-order allocation
@@ -559,6 +575,8 @@ def _decision_categories(
         for item in ledgers.alerts
         if item.component_id in {None, component_id}
     }
+    if registry.economic_autonomy.provisional:
+        categories.add(AlertCategory.ASSUMPTION)
     categories.update(
         item.category
         for item in candidates.alerts
@@ -578,7 +596,8 @@ def _decision_categories(
         categories.update(
             {AlertCategory.DECISION_REQUIRED, AlertCategory.EVIDENCE_CONTRACT}
         )
-        categories.discard(AlertCategory.ASSUMPTION)
+        if not registry.economic_autonomy.provisional:
+            categories.discard(AlertCategory.ASSUMPTION)
         categories.discard(AlertCategory.NO_ELIGIBLE_SUPPLIER)
     selected = getattr(outcome, "selected_plan", None) if outcome is not None else None
     lateness = post_plan_deadline_lateness(
@@ -677,6 +696,7 @@ def _closed_decision(
             ledger,
             ledgers.buckets_for(component_id),
         ),
+        economic_autonomy=registry.economic_autonomy,
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -729,6 +749,7 @@ def _planned_decision(
             ledgers.buckets_for(component_id),
             selected.lines if selected is not None else (),
         ),
+        economic_autonomy=registry.economic_autonomy,
     )
     return replace(decision, rationale=render_decision_rationale(decision))
 
@@ -945,6 +966,7 @@ def _run_once(
 
     phase_started = perf_counter_ns()
     registry = load_policy_registry()
+    policy_parameters = registry.parameters_for(snapshot.configuration.current_date)
     timings_us["policy_load"] = (perf_counter_ns() - phase_started) // 1_000
 
     phase_started = perf_counter_ns()
@@ -960,6 +982,7 @@ def _run_once(
             ledgers,
             registry=registry,
             contract=config.contract,
+            policy_parameters=policy_parameters,
         ),
         evaluations,
     )
@@ -975,6 +998,7 @@ def _run_once(
         ledgers,
         candidates,
         evaluations,
+        policy_parameters,
     )
     if no_alternative_proofs:
         candidates = _merge_component_rule_evidence(
@@ -984,6 +1008,7 @@ def _run_once(
                 registry=registry,
                 contract=config.contract,
                 no_alternative_proofs=no_alternative_proofs,
+                policy_parameters=policy_parameters,
             ),
             evaluations,
         )
@@ -1034,6 +1059,7 @@ def _run_once(
             candidates,
             evaluations,
             component_id,
+            policy_parameters,
         )
         outcome = optimizer.optimize(problem)
         results = _solver_results(outcome)
@@ -1055,7 +1081,9 @@ def _run_once(
     planned = tuple(sorted(decisions, key=lambda item: item.component_id))
     result_tuple = tuple(solver_results)
     phase_started = perf_counter_ns()
-    validator = IndependentPlanValidator(registry)
+    validator = IndependentPlanValidator(
+        registry, policy_parameters=policy_parameters
+    )
     validation = validator.validate(snapshot, planned, result_tuple)
     timings_us["validation"] = (perf_counter_ns() - phase_started) // 1_000
     if not validation.is_valid:

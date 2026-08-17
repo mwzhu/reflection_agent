@@ -50,6 +50,8 @@ from .domain import (
     ZERO,
 )
 from .ledgers import DEFAULT_UNIT_OF_MEASURE_CONTRACT, demand_supply_segments
+from .policy.parameters import ApplicablePolicyParameters, EconomicAutonomyParameters
+from .policy.registry import load_policy_registry
 
 
 def _require_decimal(value: Decimal, name: str, *, nonnegative: bool = True) -> None:
@@ -162,27 +164,6 @@ class ExceptionAllowance:
 
 
 @dataclass(frozen=True, slots=True)
-class EconomicAutonomy:
-    max_surplus_fraction: Decimal = Decimal("0.10")
-    max_surplus_units: Decimal | None = None
-    max_excess_cost_usd: Decimal = Decimal("2500")
-    forced_surplus_review_usd: Decimal = Decimal("2500")
-    provisional: bool = True
-
-    def __post_init__(self) -> None:
-        _require_decimal(self.max_surplus_fraction, "max_surplus_fraction")
-        if self.max_surplus_units is not None:
-            _require_decimal(self.max_surplus_units, "max_surplus_units")
-        _require_decimal(self.max_excess_cost_usd, "max_excess_cost_usd")
-        _require_decimal(
-            self.forced_surplus_review_usd,
-            "forced_surplus_review_usd",
-        )
-        if not isinstance(self.provisional, bool):
-            raise TypeError("provisional must be bool")
-
-
-@dataclass(frozen=True, slots=True)
 class OrderApprovalConstraint:
     """A per-line order-value classification rule applied after solving."""
 
@@ -222,7 +203,8 @@ class OptimizerProblem:
     order_approval_constraints: tuple[OrderApprovalConstraint, ...] = ()
     approved_order_rule_ids: tuple[str, ...] = ()
     exception_allowances: tuple[ExceptionAllowance, ...] = ()
-    autonomy: EconomicAutonomy = field(default_factory=EconomicAutonomy)
+    policy_parameters: ApplicablePolicyParameters | None = None
+    autonomy: EconomicAutonomyParameters | None = None
     recovery_demand: Decimal = ZERO
     authorized_recovery_surplus: Decimal = ZERO
     max_allocation_driven_surplus: Decimal | None = None
@@ -321,8 +303,19 @@ class OptimizerProblem:
             raise TypeError("exception_allowances contains an invalid item")
         if len({item.exception_id for item in allowances}) != len(allowances):
             raise ValueError("exception_allowances contains duplicate exception IDs")
-        if not isinstance(self.autonomy, EconomicAutonomy):
-            raise TypeError("autonomy must be EconomicAutonomy")
+        parameter_date = routes[0].order_date if routes else buckets[0].due_date
+        parameters = self.policy_parameters or load_policy_registry().parameters_for(
+            parameter_date
+        )
+        if not isinstance(parameters, ApplicablePolicyParameters):
+            raise TypeError("policy_parameters must be ApplicablePolicyParameters")
+        if routes and any(
+            item.order_date != parameters.scenario_date for item in routes
+        ):
+            raise ValueError("policy_parameters scenario date must match every order date")
+        autonomy = self.autonomy or parameters.economic_autonomy
+        if not isinstance(autonomy, EconomicAutonomyParameters):
+            raise TypeError("autonomy must be EconomicAutonomyParameters")
         if self.secondary_shortage_kind is not None and not isinstance(
             self.secondary_shortage_kind, SecondaryShortageKind
         ):
@@ -343,6 +336,8 @@ class OptimizerProblem:
         )
         object.__setattr__(self, "demand_buckets", buckets)
         object.__setattr__(self, "suppliers", tuple(sorted(suppliers, key=lambda item: item.supplier_id)))
+        object.__setattr__(self, "policy_parameters", parameters)
+        object.__setattr__(self, "autonomy", autonomy)
         object.__setattr__(
             self,
             "concentration_constraints",
@@ -1330,6 +1325,8 @@ def _coefficients(context: _ModelContext, values: Mapping[int, Fraction | int]) 
 
 def _sustainability_coefficients(context: _ModelContext) -> dict[int, Fraction]:
     suppliers = {item.supplier_id: item for item in context.problem.suppliers}
+    assert context.problem.policy_parameters is not None
+    sustainability = context.problem.policy_parameters.sustainability
     result: dict[int, Fraction] = {}
     for route_index, route in enumerate(context.routes):
         rating = _rating(suppliers[route.supplier_id].sustainability_rating)
@@ -1347,12 +1344,13 @@ def _sustainability_coefficients(context: _ModelContext) -> dict[int, Fraction]:
                 comparable_price = (
                     route.unit_price == alternative.unit_price
                     if low == ZERO
-                    else abs(route.unit_price - alternative.unit_price) / low <= Decimal("0.10")
+                    else abs(route.unit_price - alternative.unit_price) / low
+                    <= sustainability.comparable_price_fraction
                 )
                 comparable_date = _business_days(
                     route.material_available_date,
                     alternative.material_available_date,
-                ) <= 5
+                ) <= sustainability.comparable_delivery_days
                 alternative_can_serve = (
                     not alternative.exception_codes
                     or bucket.due_date in alternative.exception_scope_deadlines
@@ -1383,7 +1381,7 @@ def _international_coefficients(context: _ModelContext) -> dict[int, Fraction]:
 
 
 def _strategic_coefficients(context: _ModelContext) -> dict[int, Fraction]:
-    """Recompute the inclusive 15% Strategic-retention window exactly."""
+    """Recompute the pack-owned Strategic-retention window exactly."""
 
     suppliers = {item.supplier_id: item for item in context.problem.suppliers}
 
@@ -1424,7 +1422,11 @@ def _strategic_coefficients(context: _ModelContext) -> dict[int, Fraction]:
                 if best.unit_price == ZERO
                 else (best.unit_price - route.unit_price) / best.unit_price
             )
-            if savings <= Decimal("0.15"):
+            assert context.problem.policy_parameters is not None
+            if (
+                savings
+                <= context.problem.policy_parameters.strategic_continuity.maximum_alternative_savings_fraction
+            ):
                 result[context.z[route_index][bucket_index]] = Fraction(1)
     return result
 
@@ -3151,6 +3153,41 @@ def solve_component(
 # Clear public aliases for callers/tests that prefer the implementation name.
 HighsSolver = IntegerScaledSolver
 MilpSolver = IntegerScaledSolver
+
+
+def EconomicAutonomy(
+    *,
+    max_surplus_fraction: Decimal | None = None,
+    max_surplus_units: Decimal | None = None,
+    max_excess_cost_usd: Decimal | None = None,
+    forced_surplus_review_usd: Decimal | None = None,
+    provisional: bool | None = None,
+) -> EconomicAutonomyParameters:
+    """Compatibility constructor whose omitted values still come from the pack."""
+
+    base = load_policy_registry().economic_autonomy
+    return replace(
+        base,
+        max_surplus_fraction=(
+            base.max_surplus_fraction
+            if max_surplus_fraction is None
+            else max_surplus_fraction
+        ),
+        max_surplus_units=(
+            base.max_surplus_units if max_surplus_units is None else max_surplus_units
+        ),
+        max_excess_cost_usd=(
+            base.max_excess_cost_usd
+            if max_excess_cost_usd is None
+            else max_excess_cost_usd
+        ),
+        forced_surplus_review_usd=(
+            base.forced_surplus_review_usd
+            if forced_surplus_review_usd is None
+            else forced_surplus_review_usd
+        ),
+        provisional=base.provisional if provisional is None else provisional,
+    )
 
 
 class StdlibSolver(IntegerScaledSolver):
