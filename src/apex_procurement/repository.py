@@ -34,6 +34,14 @@ from .domain import (
     SupplierCatalogLine,
 )
 from .snapshot import build_snapshot
+from .persistence import (
+    ALERT_METADATA_COLUMNS,
+    ALERT_METADATA_TABLE,
+    DECISION_AUDIT_COLUMNS,
+    DECISION_AUDIT_TABLE,
+    PO_METADATA_COLUMNS,
+    PO_METADATA_TABLE,
+)
 
 
 class RepositoryLoadError(ValueError):
@@ -728,6 +736,104 @@ class SQLiteRepository:
         return tuple(sorted(rows, key=_raw_sort_key))
 
     @staticmethod
+    def _read_agent_ownership(
+        connection: sqlite3.Connection,
+    ) -> tuple[dict[str, str], dict[int, str]]:
+        """Load optional agent metadata used to reconstruct internal ownership records."""
+
+        table_rows = connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = ? ORDER BY name",
+            ("table",),
+        ).fetchall()
+        available_tables = {
+            row["name"].casefold()
+            for row in table_rows
+            if isinstance(row["name"], str)
+        }
+        expected = {
+            PO_METADATA_TABLE: PO_METADATA_COLUMNS,
+            ALERT_METADATA_TABLE: ALERT_METADATA_COLUMNS,
+            DECISION_AUDIT_TABLE: DECISION_AUDIT_COLUMNS,
+        }
+        present = set(expected) & available_tables
+        if not present:
+            return {}, {}
+        if present != set(expected):
+            missing = ", ".join(sorted(set(expected) - present))
+            raise ScenarioSchemaError(
+                f"scenario schema error: incomplete agent metadata schema; missing: {missing}"
+            )
+        for table, required_columns in expected.items():
+            column_rows = connection.execute(
+                "SELECT name FROM pragma_table_info(?) ORDER BY cid",
+                (table,),
+            ).fetchall()
+            columns = {
+                row["name"].casefold()
+                for row in column_rows
+                if isinstance(row["name"], str)
+            }
+            missing_columns = sorted(required_columns - columns)
+            if missing_columns:
+                raise ScenarioSchemaError(
+                    f"scenario schema error: table '{table}' missing required columns: "
+                    + ", ".join(missing_columns)
+                )
+            count = connection.execute(
+                f"SELECT COUNT(*) AS row_count FROM {_quoted(table)}"
+            ).fetchone()["row_count"]
+            if not isinstance(count, int) or count < 0 or count > MAX_TABLE_ROWS:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{table}' exceeds the row limit"
+                )
+
+        po_markers: dict[str, str] = {}
+        for row in connection.execute(
+            f"SELECT po_number, marker FROM {_quoted(PO_METADATA_TABLE)} "
+            "ORDER BY po_number"
+        ).fetchall():
+            po_number = _required_text(
+                row["po_number"], PO_METADATA_TABLE, (), "po_number"
+            )
+            marker = _required_text(row["marker"], PO_METADATA_TABLE, (), "marker")
+            if len(marker.encode("utf-8")) > MAX_TEXT_BYTES:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{PO_METADATA_TABLE}' marker is too large"
+                )
+            if po_number in po_markers:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{PO_METADATA_TABLE}' has duplicate PO metadata"
+                )
+            po_markers[po_number] = marker
+
+        alert_markers: dict[int, str] = {}
+        for row in connection.execute(
+            f"SELECT alert_id, marker FROM {_quoted(ALERT_METADATA_TABLE)} "
+            "ORDER BY alert_id"
+        ).fetchall():
+            raw_alert_id = row["alert_id"]
+            if (
+                not isinstance(raw_alert_id, int)
+                or isinstance(raw_alert_id, bool)
+                or raw_alert_id <= 0
+            ):
+                raise ScenarioDataError(
+                    f"scenario data error: table '{ALERT_METADATA_TABLE}' has an invalid alert_id"
+                )
+            alert_id = raw_alert_id
+            marker = _required_text(row["marker"], ALERT_METADATA_TABLE, (), "marker")
+            if len(marker.encode("utf-8")) > MAX_TEXT_BYTES:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{ALERT_METADATA_TABLE}' marker is too large"
+                )
+            if alert_id in alert_markers:
+                raise ScenarioDataError(
+                    f"scenario data error: table '{ALERT_METADATA_TABLE}' has duplicate alert metadata"
+                )
+            alert_markers[alert_id] = marker
+        return po_markers, alert_markers
+
+    @staticmethod
     def _validate_input_limits(
         connection: sqlite3.Connection,
         available: dict[str, frozenset[str]],
@@ -785,6 +891,57 @@ class SQLiteRepository:
             table: self._read_rows(connection, table, available[table])
             for table in sorted(_TABLE_COLUMNS)
         }
+        po_markers, alert_markers = self._read_agent_ownership(connection)
+
+        purchase_order_rows: list[dict[str, object]] = []
+        purchase_order_ids = {row["po_number"] for row in rows_by_table["purchase_orders"]}
+        po_markers = {
+            po_number: marker
+            for po_number, marker in po_markers.items()
+            if po_number in purchase_order_ids
+        }
+        for row in rows_by_table["purchase_orders"]:
+            enriched = dict(row)
+            marker = po_markers.get(row["po_number"])
+            if marker is not None:
+                rationale = row["rationale"]
+                if not isinstance(rationale, str) or not rationale:
+                    raise ScenarioDataError(
+                        "scenario data error: managed purchase order has no human rationale"
+                    )
+                if "[APEX_AGENT:" in rationale:
+                    raise ScenarioDataError(
+                        "scenario data error: managed purchase order duplicates embedded metadata"
+                    )
+                enriched["rationale"] = f"{marker} {rationale}"
+            purchase_order_rows.append(enriched)
+
+        alert_rows: list[dict[str, object]] = []
+        alert_ids = {
+            _integer(row["alert_id"], "alerts", (), "alert_id", positive=True)
+            for row in rows_by_table["alerts"]
+        }
+        alert_markers = {
+            alert_id: marker
+            for alert_id, marker in alert_markers.items()
+            if alert_id in alert_ids
+        }
+        for row in rows_by_table["alerts"]:
+            enriched = dict(row)
+            alert_id = _integer(row["alert_id"], "alerts", (), "alert_id", positive=True)
+            marker = alert_markers.get(alert_id)
+            if marker is not None:
+                description = row["description"]
+                if not isinstance(description, str) or not description:
+                    raise ScenarioDataError(
+                        "scenario data error: managed alert has no human description"
+                    )
+                if "[APEX_ALERT:" in description:
+                    raise ScenarioDataError(
+                        "scenario data error: managed alert duplicates embedded metadata"
+                    )
+                enriched["description"] = f"{description} {marker}"
+            alert_rows.append(enriched)
 
         configuration = self._configuration(rows_by_table["scenario_config"])
         products = tuple(self._product(row) for row in rows_by_table["products"])
@@ -797,9 +954,9 @@ class SQLiteRepository:
             self._inventory_position(row) for row in rows_by_table["inventory"]
         )
         purchase_orders = tuple(
-            self._purchase_order(row) for row in rows_by_table["purchase_orders"]
+            self._purchase_order(row) for row in purchase_order_rows
         )
-        alerts = tuple(self._alert(row) for row in rows_by_table["alerts"])
+        alerts = tuple(self._alert(row) for row in alert_rows)
 
         supplier_rows = rows_by_table["suppliers"]
         supplier_source_ids = tuple(

@@ -224,10 +224,10 @@ def test_runtime_terminal_explanations_are_complete(
     terminal = next(item for item in rendered if item.category is category)
     parsed = parse_owned_alert(terminal.description)
     assert parsed is not None
-    assert "The agent" in parsed.body
-    assert "Applicable rule IDs [" in parsed.body
-    assert owner_phrase in parsed.body
-    assert f"Component {decision.component_id}" in parsed.body
+    assert "The agent" in terminal.audit_description
+    assert "Applicable rule IDs [" in terminal.audit_description
+    assert owner_phrase in terminal.audit_description
+    assert f"Component {decision.component_id}" in terminal.audit_description
 
 
 def test_decision_required_terminal_explanation_names_withheld_action_and_rules() -> None:
@@ -248,7 +248,7 @@ def test_decision_required_terminal_explanation_names_withheld_action_and_rules(
     )
     parsed = parse_owned_alert(terminal.description)
     assert parsed is not None
-    assert "alternative policy-decision-alternative" in parsed.body
-    assert "The agent did not place the alternative" in parsed.body
-    assert "Applicable rule IDs [" in parsed.body
-    assert "Human action:" in parsed.body
+    assert "alternative policy-decision-alternative" in terminal.audit_description
+    assert "The agent did not place the alternative" in terminal.audit_description
+    assert "Applicable rule IDs [" in terminal.audit_description
+    assert "Human action:" in terminal.audit_description

@@ -270,9 +270,10 @@ class IdentityAndRenderingTests(unittest.TestCase):
         self.assertEqual(parsed.source_fingerprint, decision.source_fingerprint)
         self.assertEqual(parsed.evidence_contract, EvidenceContract.BENCHMARK)
         self.assertRegex(target.po_number, r"\AAPX-[0-9a-f]{8}\Z")
-        self.assertIn("[APEX_AGENT:v4 ", target.rationale)
+        self.assertIn("[APEX_AGENT:v5 ", target.rationale)
         self.assertNotIn(" record=", target.rationale)
-        self.assertIn("Fulfillment FULFILLED; resolution RESOLVED", target.rationale)
+        self.assertIn("Order 20 units of CMP-014 from SUP-112", target.rationale)
+        self.assertNotIn("deciding comparators", target.rationale)
 
     def test_pre_r03_v2_record_without_line_approvals_remains_parseable(self) -> None:
         policy_version = "policy-version-one"
@@ -513,10 +514,10 @@ class IdentityAndRenderingTests(unittest.TestCase):
         )
         parsed_accounting = parse_owned_alert(accounting.description)
         assert parsed_accounting is not None
-        self.assertIn("AGENT_ORDERED_WITH_RESIDUAL=1", parsed_accounting.body)
-        self.assertIn("DECISION_DEFERRED=0", parsed_accounting.body)
-        self.assertIn("bucket sum 1", parsed_accounting.body)
-        self.assertTrue(all("[APEX_ALERT:v1" in item.description for item in alerts))
+        self.assertIn("AGENT_ORDERED_WITH_RESIDUAL=1", accounting.audit_description)
+        self.assertIn("DECISION_DEFERRED=0", accounting.audit_description)
+        self.assertIn("bucket sum 1", accounting.audit_description)
+        self.assertTrue(all("[APEX_ALERT:v2" in item.description for item in alerts))
 
     def test_approval_alert_is_a_complete_proposal_from_policy_facts(self) -> None:
         proposal = make_plan(

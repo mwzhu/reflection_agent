@@ -586,7 +586,10 @@ class PolicyAuthorityTests(unittest.TestCase):
             and "PROVISIONAL_ECONOMIC_AUTONOMY" in item.description
         )
         self.assertEqual(len(provisional), 1)
-        self.assertIn("economic_autonomy(provisional=true", provisional[0].description)
+        self.assertIn(
+            "economic_autonomy(provisional=true",
+            provisional[0].audit_description,
+        )
         validator_source = inspect.getsource(validator_module)
         self.assertNotIn("from .optimizer import", validator_source)
         self.assertNotIn("import apex_procurement.optimizer", validator_source)

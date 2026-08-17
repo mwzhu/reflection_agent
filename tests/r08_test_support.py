@@ -9,7 +9,8 @@ from pathlib import Path
 import sqlite3
 
 from apex_procurement.cli import main
-from apex_procurement.explanations import ParsedAlertMarker, parse_owned_alert
+from apex_procurement.domain import AlertCategory
+from apex_procurement.explanations import ParsedAlertMarker
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,16 +57,27 @@ def purchase_order_rows(
 
 def owned_alerts(scenario_path: str | Path) -> tuple[ParsedAlertMarker, ...]:
     with closing(sqlite3.connect(Path(scenario_path))) as connection:
-        descriptions = tuple(
-            row[0]
+        if connection.execute(
+            "SELECT COUNT(*) FROM sqlite_schema "
+            "WHERE type = 'table' AND name = 'apex_alert_metadata'"
+        ).fetchone()[0] == 0:
+            return ()
+        rows = tuple(
+            row
             for row in connection.execute(
-                "SELECT description FROM alerts ORDER BY alert_id"
+                "SELECT alert_key, category, scope, audit_description "
+                "FROM apex_alert_metadata ORDER BY alert_id"
             )
         )
-    parsed = tuple(parse_owned_alert(description) for description in descriptions)
-    if any(item is None for item in parsed):
-        raise AssertionError("an R08 fixture contains an unowned or malformed alert")
-    return tuple(item for item in parsed if item is not None)
+    return tuple(
+        ParsedAlertMarker(
+            key=key,
+            category=AlertCategory(category),
+            scope=scope,
+            body=audit_description,
+        )
+        for key, category, scope, audit_description in rows
+    )
 
 
 __all__ = [

@@ -19,7 +19,7 @@ from apex_procurement.domain import (
     ValidationIssue,
     ValidationSeverity,
 )
-from apex_procurement.explanations import parse_owned_alert
+from apex_procurement.explanations import ParsedAlertMarker
 from apex_procurement.isolation import (
     build_internal_failure_exclusions,
     reviewed_validation_failure_scope,
@@ -39,6 +39,20 @@ def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
             tuple(connection.execute("SELECT * FROM purchase_orders ORDER BY 1")),
             tuple(connection.execute("SELECT * FROM alerts ORDER BY 1")),
         )
+
+
+def owned_alerts(path: Path) -> tuple[ParsedAlertMarker, ...]:
+    with closing(sqlite3.connect(path)) as connection:
+        rows = tuple(
+            connection.execute(
+                "SELECT alert_key, category, scope, audit_description "
+                "FROM apex_alert_metadata ORDER BY alert_id"
+            )
+        )
+    return tuple(
+        ParsedAlertMarker(key, AlertCategory(category), scope, audit_description)
+        for key, category, scope, audit_description in rows
+    )
 
 
 def injected_issue(
@@ -164,11 +178,7 @@ class R15ComponentIsolationTests(unittest.TestCase):
             any(row[1] == self.affected_component for row in rows_after_first[0])
         )
         self.assertEqual(len(rows_after_first[0]), len({row[0] for row in rows_after_first[0]}))
-        parsed_alerts = tuple(
-            parsed
-            for _alert_id, description in rows_after_first[1]
-            if (parsed := parse_owned_alert(description)) is not None
-        )
+        parsed_alerts = owned_alerts(self.path)
         internal = tuple(
             item
             for item in parsed_alerts

@@ -63,9 +63,15 @@ Every run writes one structured success or failure audit line to stderr. Human o
 
 ## Idempotency and ownership
 
-New managed POs use a compact v4 marker. It stores full action, demand, component-source, group, and business-field digests plus route/policy/line identity; it does not embed a serialized `DecisionRecord`. Before a managed PO is temporarily removed for fresh reconstruction, the planner must reproduce the complete component source fingerprint, including relevant supplier, catalog, external-PO evidence, contract, and policy facts. If any competing route or source fact changed, the old PO remains physical inbound and cannot be silently replaced by a duplicate full-demand order.
+Human-facing business columns now contain only readable summaries. `purchase_orders.rationale` explains the order, shortage, timing, and material assumptions; `alerts.description` states the issue and the required action. Agent ownership, hashes, and exhaustive audit facts are stored separately in three agent-owned tables:
 
-Markers v1, v2, and v3 remain strictly parseable and fail closed on malformed markers, APX prefix collisions, forged payloads, incomplete line groups, or changed stored business fields. Because legacy markers lack the all-candidate source digest, they are conservatively retained as physical commitments rather than temporarily removed. Exact unchanged v4 reruns preserve PO rows, alert IDs, and SQLite sequences.
+- `apex_po_metadata` holds purchase-order ownership and idempotency fields.
+- `apex_alert_metadata` holds alert ownership plus the full diagnostic description.
+- `apex_decision_audit` holds one structured decision record per evaluated requirement and component.
+
+New managed POs use metadata version 5. Before a managed PO is temporarily removed for fresh reconstruction, the planner must reproduce the complete component source fingerprint, including relevant supplier, catalog, external-PO evidence, contract, and policy facts. If any competing route or source fact changed, the old PO remains physical inbound and cannot be silently replaced by a duplicate full-demand order.
+
+Embedded markers from versions 1 through 4 remain strictly parseable and fail closed on malformed markers, APX prefix collisions, forged payloads, incomplete line groups, or changed stored business fields. Eligible version 4 rows are migrated in place to version 5 metadata and concise prose; older rows without the all-candidate source digest remain physical commitments. Exact unchanged version 5 reruns preserve PO rows, alert IDs, metadata, audit records, and SQLite sequences. Dry runs do not create or modify these tables.
 
 ## Reviewed policy-pack workflow
 

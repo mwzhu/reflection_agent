@@ -43,7 +43,8 @@ from .policy.rendering import (
 from .serialization import canonical_dumps, sanitize_control_characters
 
 
-ALERT_MARKER_VERSION = 1
+ALERT_MARKER_VERSION = 2
+_SUPPORTED_ALERT_MARKER_VERSIONS = frozenset({1, ALERT_MARKER_VERSION})
 _HEX_64 = r"[0-9a-f]{64}"
 _ALERT_MARKER = re.compile(
     rf" \[APEX_ALERT:v(?P<version>[0-9]+) key=(?P<key>{_HEX_64}) "
@@ -57,12 +58,13 @@ class ExplanationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class RenderedAlert:
-    """One target alert with a validated, terminal ownership marker."""
+    """One concise target alert plus its separate detailed audit prose."""
 
     key: str
     category: AlertCategory
     scope: str
     description: str
+    audit_description: str
 
     def __post_init__(self) -> None:
         if not re.fullmatch(_HEX_64, self.key):
@@ -71,6 +73,7 @@ class RenderedAlert:
             raise TypeError("category must be AlertCategory")
         _require_safe_text(self.scope, "scope")
         _require_safe_text(self.description, "description")
+        _require_safe_text(self.audit_description, "audit_description")
         parsed = parse_owned_alert(self.description)
         if (
             parsed is None
@@ -423,6 +426,35 @@ def render_line_rationale(decision: DecisionRecord, line: PlanLine) -> str:
     )
 
 
+def render_purchase_order_rationale(decision: DecisionRecord, line: PlanLine) -> str:
+    """Render the concise, human-facing explanation stored on a purchase order.
+
+    The complete decision, evidence, comparator trace, and rejected alternatives
+    are persisted separately in the decision-audit table.  This field is kept
+    deliberately short because it is an operational purchase-order attribute,
+    not an audit transport.
+    """
+
+    if decision.selected_plan is None or line not in decision.selected_plan.lines:
+        raise ExplanationError("line must belong to the decision's selected plan")
+    plan = decision.selected_plan
+    assumptions = set(plan.assumption_codes)
+    for evidence in (*decision.evidence, *plan.evidence):
+        assumptions.update(evidence.assumption_codes)
+    assumption_text = (
+        f" Assumptions: {_list(assumptions)}."
+        if assumptions
+        else ""
+    )
+    return sanitize_control_characters(
+        f"Order {_number(line.quantity)} units of {line.component_id} from "
+        f"{line.supplier_id} at {_number(line.unit_price)} per unit "
+        f"({_number(line.line_total)} total), expected {line.expected_delivery_date.isoformat()}. "
+        f"Initial shortage: {_number(decision.initial_eventual_gap)}; plan residual: "
+        f"{_number(decision.residual_gap)}.{assumption_text}"
+    )
+
+
 def render_legacy_v1_decision_rationale(decision: DecisionRecord) -> str:
     """Reproduce the canonical rationale embedded in pre-R02 v1 PO markers."""
 
@@ -589,11 +621,70 @@ def approval_rule(registry: PolicyRegistry, rule_id: str, supplier_id: str) -> A
     )
 
 
-def _alert_key(category: AlertCategory, scope: str, body: str) -> str:
+def _alert_key(
+    category: AlertCategory,
+    scope: str,
+    body: str,
+    *,
+    version: int = ALERT_MARKER_VERSION,
+) -> str:
     payload = canonical_dumps(
-        {"version": ALERT_MARKER_VERSION, "category": category.value, "scope": scope, "body": body}
+        {"version": version, "category": category.value, "scope": scope, "body": body}
     )
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _concise_alert_body(category: AlertCategory, scope: str, body: str) -> str:
+    """Reduce verbose audit prose to one operational issue and one action."""
+
+    if category is AlertCategory.RUN_ACCOUNTING:
+        match = re.search(
+            r"Managed (?P<requirements>[0-9]+) component requirements.*?"
+            r"Agent purchase orders: (?P<orders>[0-9]+); ordered cost: "
+            r"(?P<cost>[^;]+);",
+            body,
+        )
+        if match is not None:
+            return (
+                f"Run completed for {match.group('requirements')} component requirements: "
+                f"{match.group('orders')} purchase orders totaling {match.group('cost')}."
+            )
+
+    if scope.startswith("run:assumption:"):
+        code = scope.rsplit(":", 1)[-1]
+        return (
+            f"Run used policy assumption {code}. "
+            "Approve or replace it in the reviewed policy pack, then rerun if it changes."
+        )
+
+    if category is AlertCategory.EVIDENCE_CONTRACT and scope == "run:evidence-contract":
+        components = sorted(set(re.findall(r"CMP-[0-9]+", body)))
+        affected = ", ".join(components) if components else "one or more components"
+        return (
+            f"Missing benchmark evidence affected {affected}. "
+            "Provide the cited authoritative evidence and rerun."
+        )
+
+    assumption = re.match(
+        r"Component (?P<component>[^,]+), requirement [^ ]+ relied on assumption "
+        r"(?P<code>[A-Z0-9_]+) under the (?P<contract>[a-z]+) evidence contract\.",
+        body,
+    )
+    if assumption is not None:
+        return (
+            f"Component {assumption.group('component')} used assumption "
+            f"{assumption.group('code')} under the {assumption.group('contract')} contract. "
+            "Verify the missing evidence and rerun if it changes."
+        )
+
+    first, separator, _remaining = body.partition(". ")
+    issue = first + ("." if separator else "")
+    action = ""
+    if "Human action:" in body:
+        action_tail = body.rsplit("Human action:", 1)[1].strip()
+        action_text, action_separator, _after_action = action_tail.partition(". ")
+        action = f" Action: {action_text}{'.' if action_separator else ''}"
+    return sanitize_control_characters(issue + action)
 
 
 def make_owned_alert(
@@ -603,7 +694,7 @@ def make_owned_alert(
     *,
     visible_prefix: bool = False,
 ) -> RenderedAlert:
-    """Attach a self-validating terminal ownership marker to deterministic prose."""
+    """Create concise alert prose while retaining the detailed text for audit."""
 
     if not isinstance(category, AlertCategory):
         raise TypeError("category must be AlertCategory")
@@ -611,13 +702,20 @@ def make_owned_alert(
     body = sanitize_control_characters(body)
     _require_safe_text(scope, "scope")
     _require_safe_text(body, "body")
-    visible = f"[{category.value}] {body}" if visible_prefix else body
+    concise = _concise_alert_body(category, scope, body)
+    visible = f"[{category.value}] {concise}" if visible_prefix else concise
     key = _alert_key(category, scope, visible)
     description = (
         f"{visible} [APEX_ALERT:v{ALERT_MARKER_VERSION} key={key} "
         f"category={category.value} scope={_encode_scope(scope)}]"
     )
-    return RenderedAlert(key=key, category=category, scope=scope, description=description)
+    return RenderedAlert(
+        key=key,
+        category=category,
+        scope=scope,
+        description=description,
+        audit_description=body,
+    )
 
 
 def parse_owned_alert(description: str) -> ParsedAlertMarker | None:
@@ -628,7 +726,8 @@ def parse_owned_alert(description: str) -> ParsedAlertMarker | None:
     match = _ALERT_MARKER.search(description)
     if match is None:
         return None
-    if int(match.group("version")) != ALERT_MARKER_VERSION:
+    marker_version = int(match.group("version"))
+    if marker_version not in _SUPPORTED_ALERT_MARKER_VERSIONS:
         return None
     try:
         category = AlertCategory(match.group("category"))
@@ -638,7 +737,7 @@ def parse_owned_alert(description: str) -> ParsedAlertMarker | None:
     if scope is None:
         return None
     body = description[: match.start()]
-    if match.group("key") != _alert_key(category, scope, body):
+    if match.group("key") != _alert_key(category, scope, body, version=marker_version):
         return None
     return ParsedAlertMarker(
         key=match.group("key"), category=category, scope=scope, body=body
@@ -1393,6 +1492,7 @@ __all__ = [
     "render_alerts",
     "render_decision_rationale",
     "render_line_rationale",
+    "render_purchase_order_rationale",
     "validate_owned_alert",
     "validate_stored_alert",
 ]

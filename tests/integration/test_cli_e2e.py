@@ -28,6 +28,7 @@ from apex_procurement.domain import (
     ValidationSeverity,
 )
 from apex_procurement.explanations import (
+    ParsedAlertMarker,
     parse_owned_alert,
     render_decision_rationale,
     render_line_rationale,
@@ -61,6 +62,20 @@ def output_rows(path: Path) -> tuple[tuple[object, ...], tuple[object, ...]]:
         orders = tuple(connection.execute("SELECT * FROM purchase_orders ORDER BY 1"))
         alerts = tuple(connection.execute("SELECT * FROM alerts ORDER BY 1"))
     return orders, alerts
+
+
+def owned_alert_audits(path: Path) -> tuple[ParsedAlertMarker, ...]:
+    with closing(sqlite3.connect(path)) as connection:
+        rows = tuple(
+            connection.execute(
+                "SELECT alert_key, category, scope, audit_description "
+                "FROM apex_alert_metadata ORDER BY alert_id"
+            )
+        )
+    return tuple(
+        ParsedAlertMarker(key, AlertCategory(category), scope, audit_description)
+        for key, category, scope, audit_description in rows
+    )
 
 
 class AssembledCliTests(unittest.TestCase):
@@ -172,15 +187,12 @@ class AssembledCliTests(unittest.TestCase):
             connection.execute("DROP TABLE old_supplier_catalog")
 
     def source_data_quality_alerts(self, scenario: Path) -> tuple[str, ...]:
-        with closing(sqlite3.connect(scenario)) as connection:
-            return tuple(
-                row[0]
-                for row in connection.execute(
-                    "SELECT description FROM alerts "
-                    "WHERE description LIKE '%category=DATA_QUALITY%' "
-                    "AND description LIKE '%Source table %' ORDER BY description"
-                )
-            )
+        return tuple(
+            item.body
+            for item in owned_alert_audits(scenario)
+            if item.category is AlertCategory.DATA_QUALITY
+            and "Source table " in item.body
+        )
 
     def test_dry_run_is_offline_deterministic_and_writes_nothing(self) -> None:
         before = output_rows(self.path)
@@ -243,8 +255,8 @@ class AssembledCliTests(unittest.TestCase):
 
                 with closing(sqlite3.connect(scenario)) as connection:
                     accounting_count = connection.execute(
-                        "SELECT COUNT(*) FROM alerts "
-                        "WHERE description LIKE '%category=RUN_ACCOUNTING%'"
+                        "SELECT COUNT(*) FROM apex_alert_metadata "
+                        "WHERE category = 'RUN_ACCOUNTING'"
                     ).fetchone()[0]
                     order_counts = connection.execute(
                         "SELECT COUNT(*), COUNT(DISTINCT po_number) FROM purchase_orders"
@@ -315,10 +327,12 @@ class AssembledCliTests(unittest.TestCase):
                 for item in artifacts.outputs.alerts
                 if item.category is AlertCategory.RUN_ACCOUNTING
             )
-            parsed_accounting = parse_owned_alert(accounting.description)
-            assert parsed_accounting is not None
-            managed = int(parsed_accounting.body.split("Managed ", 1)[1].split(" ", 1)[0])
-            bucket_sum = int(parsed_accounting.body.split("bucket sum ", 1)[1].split(".", 1)[0])
+            managed = int(
+                accounting.audit_description.split("Managed ", 1)[1].split(" ", 1)[0]
+            )
+            bucket_sum = int(
+                accounting.audit_description.split("bucket sum ", 1)[1].split(".", 1)[0]
+            )
             self.assertEqual(bucket_sum, managed)
 
             for target in artifacts.outputs.purchase_orders:
@@ -351,14 +365,16 @@ class AssembledCliTests(unittest.TestCase):
                     version=3,
                 )
                 old_rationale = f"{old_marker} {render_line_rationale(decision, line)}"
+                human_rationale = target.rationale.split("] ", 1)[1]
                 observed.append(
-                    (source.name, len(target.rationale), len(old_rationale))
+                    (source.name, len(human_rationale), len(old_rationale))
                 )
                 self.assertLessEqual(
-                    len(target.rationale) * 100,
+                    len(human_rationale) * 100,
                     len(old_rationale) * 45,
                 )
                 self.assertNotIn(" record=", target.rationale)
+                self.assertNotIn("deciding comparators", human_rationale)
         self.assertTrue(observed)
         self.assertIn("skipped_condition_b", stage_two_outcomes)
         self.assertIn("moot_same_domesticity", stage_two_outcomes)
@@ -658,27 +674,23 @@ class AssembledCliTests(unittest.TestCase):
 
                 rows_after_first = output_rows(scenario)
                 self.assertEqual(rows_after_first[0], initial_orders)
+                alert_audits = owned_alert_audits(scenario)
                 with closing(sqlite3.connect(scenario)) as connection:
-                    descriptions = tuple(
-                        row[0]
-                        for row in connection.execute(
-                            "SELECT description FROM alerts"
-                        )
-                    )
                     sequence_after_first = connection.execute(
                         "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
                     ).fetchone()
                 self.assertEqual(
-                    sum("category=RUN_ACCOUNTING" in item for item in descriptions),
+                    sum(
+                        item.category is AlertCategory.RUN_ACCOUNTING
+                        for item in alert_audits
+                    ),
                     1,
                 )
-                accounting_description = next(
+                accounting = next(
                     item
-                    for item in descriptions
-                    if "category=RUN_ACCOUNTING" in item
+                    for item in alert_audits
+                    if item.category is AlertCategory.RUN_ACCOUNTING
                 )
-                accounting = parse_owned_alert(accounting_description)
-                assert accounting is not None
                 managed = int(
                     accounting.body.split("Managed ", 1)[1].split(" ", 1)[0]
                 )
@@ -686,57 +698,57 @@ class AssembledCliTests(unittest.TestCase):
                     accounting.body.split("bucket sum ", 1)[1].split(".", 1)[0]
                 )
                 self.assertEqual(bucket_sum, managed)
-                assumption_descriptions = tuple(
+                assumption_alerts = tuple(
                     item
-                    for item in descriptions
-                    if "category=ASSUMPTION" in item
+                    for item in alert_audits
+                    if item.category is AlertCategory.ASSUMPTION
                 )
-                self.assertEqual(len(assumption_descriptions), 1)
+                self.assertEqual(len(assumption_alerts), 1)
                 self.assertTrue(
                     all(
-                        "PROVISIONAL_ECONOMIC_AUTONOMY" in item
-                        for item in assumption_descriptions
+                        "PROVISIONAL_ECONOMIC_AUTONOMY" in item.body
+                        for item in assumption_alerts
                     )
                 )
                 self.assertFalse(
                     any(
-                        "ROLLING_HISTORY_UNKNOWN" in item
-                        for item in assumption_descriptions
+                        "ROLLING_HISTORY_UNKNOWN" in item.body
+                        for item in assumption_alerts
                     )
                 )
                 self.assertEqual(
                     sum(
-                        "category=EVIDENCE_CONTRACT" in item
-                        for item in descriptions
+                        item.category is AlertCategory.EVIDENCE_CONTRACT
+                        for item in alert_audits
                     ),
                     1,
                 )
                 self.assertFalse(
                     any(
-                        "category=NO_ELIGIBLE_SUPPLIER" in item
-                        for item in descriptions
+                        item.category is AlertCategory.NO_ELIGIBLE_SUPPLIER
+                        for item in alert_audits
                     )
                 )
                 for component_id in scoped_components:
                     self.assertTrue(
                         any(
-                            "category=DECISION_REQUIRED" in item
-                            and f"component {component_id}" in item
-                            for item in descriptions
+                            item.category is AlertCategory.DECISION_REQUIRED
+                            and f"component {component_id}" in item.body
+                            for item in alert_audits
                         )
                     )
                     global_evidence = next(
                         item
-                        for item in descriptions
-                        if "category=EVIDENCE_CONTRACT" in item
+                        for item in alert_audits
+                        if item.category is AlertCategory.EVIDENCE_CONTRACT
                     )
-                    self.assertIn(component_id, global_evidence)
+                    self.assertIn(component_id, global_evidence.body)
                 self.assertFalse(
                     any(
-                        "relied on assumption" in item
-                        or "missing evidence" in item
-                        or "unavailable evidence" in item
-                        for item in assumption_descriptions
+                        "relied on assumption" in item.body
+                        or "missing evidence" in item.body
+                        or "unavailable evidence" in item.body
+                        for item in assumption_alerts
                     )
                 )
 
@@ -788,7 +800,8 @@ class AssembledCliTests(unittest.TestCase):
             ).fetchone()
             managed_recovery = connection.execute(
                 "SELECT COUNT(*) FROM purchase_orders "
-                "WHERE component_id = 'CMP-014' AND rationale LIKE '[APEX_AGENT:%'"
+                "WHERE component_id = 'CMP-014' AND po_number IN "
+                "(SELECT po_number FROM apex_po_metadata)"
             ).fetchone()[0]
         self.assertEqual(managed_recovery, 1)
 
@@ -837,7 +850,8 @@ class AssembledCliTests(unittest.TestCase):
                 connection.execute(
                     "SELECT supplier_id, unit_price FROM purchase_orders "
                     "WHERE component_id = 'CMP-016' "
-                    "AND rationale LIKE '[APEX_AGENT:%' ORDER BY supplier_id"
+                    "AND po_number IN (SELECT po_number FROM apex_po_metadata) "
+                    "ORDER BY supplier_id"
                 )
             )
         self.assertEqual(managed_routes, (("SUP-109", 22.0),))
@@ -905,7 +919,8 @@ class AssembledCliTests(unittest.TestCase):
                         for row in connection.execute(
                             "SELECT supplier_id FROM purchase_orders "
                             "WHERE component_id = 'CMP-016' "
-                            "AND rationale LIKE '[APEX_AGENT:%' ORDER BY supplier_id"
+                            "AND po_number IN (SELECT po_number FROM apex_po_metadata) "
+                            "ORDER BY supplier_id"
                         )
                     )
                 self.assertEqual(managed_suppliers, ("SUP-109",))
@@ -1007,16 +1022,22 @@ class AssembledCliTests(unittest.TestCase):
         with closing(sqlite3.connect(scenario)) as connection:
             component_orders = connection.execute(
                 "SELECT COUNT(*) FROM purchase_orders "
-                "WHERE component_id = 'CMP-016' AND rationale LIKE '[APEX_AGENT:%'"
+                "WHERE component_id = 'CMP-016' AND po_number IN "
+                "(SELECT po_number FROM apex_po_metadata)"
             ).fetchone()[0]
-            descriptions = tuple(
-                row[0] for row in connection.execute("SELECT description FROM alerts")
-            )
+        alert_audits = owned_alert_audits(scenario)
         self.assertEqual(component_orders, 0)
-        self.assertTrue(any("category=DATA_QUALITY" in item for item in descriptions))
-        self.assertTrue(any("category=UNMET_DEMAND" in item for item in descriptions))
+        self.assertTrue(
+            any(item.category is AlertCategory.DATA_QUALITY for item in alert_audits)
+        )
+        self.assertTrue(
+            any(item.category is AlertCategory.UNMET_DEMAND for item in alert_audits)
+        )
         self.assertFalse(
-            any("category=NO_ELIGIBLE_SUPPLIER" in item for item in descriptions)
+            any(
+                item.category is AlertCategory.NO_ELIGIBLE_SUPPLIER
+                for item in alert_audits
+            )
         )
 
     def test_structural_input_corruption_exits_three_without_any_write(self) -> None:
@@ -1103,7 +1124,7 @@ class AssembledCliTests(unittest.TestCase):
                     managed_recovery = connection.execute(
                         "SELECT COUNT(*) FROM purchase_orders "
                         "WHERE component_id = 'CMP-014' "
-                        "AND rationale LIKE '[APEX_AGENT:%'"
+                        "AND po_number IN (SELECT po_number FROM apex_po_metadata)"
                     ).fetchone()[0]
                 self.assertEqual(managed_recovery, 0)
 
@@ -1160,8 +1181,8 @@ class AssembledCliTests(unittest.TestCase):
                 )
                 with closing(sqlite3.connect(scenario)) as connection:
                     late_alerts = connection.execute(
-                        "SELECT COUNT(*) FROM alerts "
-                        "WHERE description LIKE '%category=LATE_ARRIVAL%'"
+                        "SELECT COUNT(*) FROM apex_alert_metadata "
+                        "WHERE category = 'LATE_ARRIVAL'"
                     ).fetchone()[0]
                 self.assertEqual(
                     late_alerts,
@@ -1216,7 +1237,14 @@ class AssembledCliTests(unittest.TestCase):
             row for row in orders_after_first if row[1] == "CMP-016"
         )
         self.assertEqual(len(cmp016_before), 1)
-        self.assertIn(" source=", cmp016_before[0][7])
+        self.assertTrue(cmp016_before[0][7].startswith("Order 15.0 units of CMP-016"))
+        self.assertNotIn("[APEX_AGENT:", cmp016_before[0][7])
+        with closing(sqlite3.connect(scenario)) as connection:
+            marker = connection.execute(
+                "SELECT marker FROM apex_po_metadata WHERE po_number = ?",
+                (cmp016_before[0][0],),
+            ).fetchone()[0]
+        self.assertIn(" source=", marker)
         self.assertNotIn(" record=", cmp016_before[0][7])
 
         with closing(sqlite3.connect(scenario)) as connection, connection:
@@ -1317,18 +1345,14 @@ class AssembledCliTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                row[7].startswith("[APEX_AGENT:v4 ")
-                and "component " in row[7]
-                and "disposition " in row[7]
+                row[7].startswith("Order ")
+                and "Initial shortage:" in row[7]
+                and "[APEX_AGENT:" not in row[7]
                 for row in after_orders
                 if row[0] in payload["commit"]["committed_po_numbers"]
             )
         )
-        parsed_alerts = tuple(
-            parsed
-            for _alert_id, description in after_alerts
-            if (parsed := parse_owned_alert(description)) is not None
-        )
+        parsed_alerts = owned_alert_audits(scenario)
         self.assertTrue(parsed_alerts)
         self.assertEqual(
             sum(item.category is AlertCategory.RUN_ACCOUNTING for item in parsed_alerts),
@@ -1461,8 +1485,8 @@ class AssembledCliTests(unittest.TestCase):
         self.assertEqual(rows_after_first[0], ())
         with closing(sqlite3.connect(scenario)) as connection:
             approval = connection.execute(
-                "SELECT description FROM alerts "
-                "WHERE description LIKE '%category=APPROVAL_REQUIRED%'"
+                "SELECT audit_description FROM apex_alert_metadata "
+                "WHERE category = 'APPROVAL_REQUIRED'"
             ).fetchone()[0]
             sequence_after_first = connection.execute(
                 "SELECT seq FROM sqlite_sequence WHERE name = 'alerts'"
@@ -1631,8 +1655,8 @@ class AssembledCliTests(unittest.TestCase):
                 0,
             )
             approval = connection.execute(
-                "SELECT description FROM alerts "
-                "WHERE description LIKE '%category=APPROVAL_REQUIRED%'"
+                "SELECT audit_description FROM apex_alert_metadata "
+                "WHERE category = 'APPROVAL_REQUIRED'"
             ).fetchone()[0]
         for expected in (
             "line total exceeds 50000",
@@ -1674,7 +1698,7 @@ class AssembledCliTests(unittest.TestCase):
                 connection.execute(
                     "SELECT supplier_id, quantity FROM purchase_orders "
                     "WHERE component_id = 'CMP-003' "
-                    "AND rationale LIKE '[APEX_AGENT:%' "
+                    "AND po_number IN (SELECT po_number FROM apex_po_metadata) "
                     "ORDER BY supplier_id"
                 )
             )

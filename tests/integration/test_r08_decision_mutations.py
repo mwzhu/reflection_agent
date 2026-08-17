@@ -162,13 +162,7 @@ def test_r12_changed_inbound_expires_live_request_and_preserves_human_rows(
             "SELECT alert_id, description FROM alerts WHERE alert_id = ?",
             (human_alert_id,),
         ).fetchone() == (human_alert_id, human_alert)
-        current_owned = tuple(
-            parsed
-            for (description,) in connection.execute(
-                "SELECT description FROM alerts ORDER BY alert_id"
-            )
-            if (parsed := parse_owned_alert(description)) is not None
-        )
+        current_owned = owned_alerts(fixture.scenario_path)
     assert not any(
         alert.category is AlertCategory.APPROVAL_REQUIRED
         and SUB_MOQ_RULE in alert.body

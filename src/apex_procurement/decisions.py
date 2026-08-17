@@ -39,9 +39,16 @@ from .explanations import (
     render_legacy_v1_decision_rationale,
     render_legacy_v1_line_rationale,
     render_line_rationale,
+    render_purchase_order_rationale,
     validate_stored_alert,
 )
 from .policy.registry import PolicyRegistry
+from .persistence import (
+    ALERT_METADATA_TABLE,
+    DECISION_AUDIT_TABLE,
+    PO_METADATA_TABLE,
+    ensure_agent_tables,
+)
 from .repository import (
     SQLiteRepository,
     ScenarioLoadError,
@@ -51,8 +58,9 @@ from .repository import (
 from .serialization import canonical_dumps, canonical_loads
 
 
-PO_MARKER_VERSION = 4
-_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, 2, 3, PO_MARKER_VERSION})
+PO_MARKER_VERSION = 5
+_COMPACT_PO_MARKER_VERSIONS = frozenset({4, PO_MARKER_VERSION})
+_SUPPORTED_PO_MARKER_VERSIONS = frozenset({1, 2, 3, *_COMPACT_PO_MARKER_VERSIONS})
 _HEX_64 = r"[0-9a-f]{64}"
 _TOKEN = r"[A-Za-z0-9_-]+"
 _LEGACY_PO_MARKER = re.compile(
@@ -737,7 +745,7 @@ def _purchase_order_outputs(
             policy_pack_version,
         )
         number = po_number_for_action(key)
-        rationale_body = render_line_rationale(decision, line)
+        rationale_body = render_purchase_order_rationale(decision, line)
         field_digest = _compact_field_digest(
             action_digest=key,
             demand_digest=demand_digest,
@@ -888,7 +896,7 @@ def parse_owned_purchase_order(order: ExistingPurchaseOrder) -> ParsedOwnedPurch
             f"purchase order {order.po_number} has an invalid ownership marker version or number"
         )
     if compact is not None:
-        if marker_version != PO_MARKER_VERSION:
+        if marker_version not in _COMPACT_PO_MARKER_VERSIONS:
             raise OwnershipMarkerError(
                 f"purchase order {order.po_number} has an invalid compact marker version"
             )
@@ -1161,7 +1169,7 @@ def _managed_purchase_order_groups(
             for _order, parsed in rows
             if parsed.decision is not None
         }
-        if first.marker_version == PO_MARKER_VERSION:
+        if first.marker_version in _COMPACT_PO_MARKER_VERSIONS:
             if first.source_fingerprint is None or first.evidence_contract is None:
                 raise OwnershipMarkerError(
                     f"managed record {first.requirement_id} lacks compact source metadata"
@@ -1337,8 +1345,14 @@ def reconstruct_managed_decisions(
             stored = stored_by_action[target.action_key]
             same_business = _stored_fields(stored)[:-1] == target.business_fields[:-1]
             exact = _stored_fields(stored) == target.business_fields
+            older_compact_equivalent = all(
+                parsed.marker_version < PO_MARKER_VERSION
+                for _order, parsed in group.rows
+            )
             if not same_business or (
-                group.legacy_decision is None and not exact
+                group.legacy_decision is None
+                and not exact
+                and not older_compact_equivalent
             ):
                 raise ActionCollisionError(
                     f"current action {target.action_key} disagrees with stored business fields"
@@ -1385,6 +1399,262 @@ def _stored_fields(order: ExistingPurchaseOrder) -> tuple[object, ...]:
         order.expected_delivery_date,
         order.rationale,
     )
+
+
+def _split_compact_po_rationale(rationale: str) -> tuple[str, str]:
+    match = _COMPACT_PO_MARKER.match(rationale)
+    if match is None:
+        raise OwnershipMarkerError("purchase-order rationale has no compact ownership marker")
+    marker_end = match.end()
+    if rationale[marker_end : marker_end + 1] != " " or not rationale[marker_end + 1 :]:
+        raise OwnershipMarkerError("purchase-order rationale has no human-readable body")
+    return rationale[:marker_end], rationale[marker_end + 1 :]
+
+
+def _split_alert_description(description: str) -> tuple[str, str]:
+    parsed = parse_owned_alert(description)
+    if parsed is None:
+        raise OwnershipMarkerError("alert description has no valid ownership marker")
+    marker_start = description.rfind(" [APEX_ALERT:")
+    if marker_start < 0:
+        raise OwnershipMarkerError("alert description has no separable ownership marker")
+    return description[:marker_start], description[marker_start + 1 :]
+
+
+def _store_po_metadata(
+    connection: sqlite3.Connection,
+    order: ExistingPurchaseOrder,
+    parsed: ParsedOwnedPurchaseOrder,
+    marker: str,
+) -> None:
+    if parsed.source_fingerprint is None or parsed.evidence_contract is None:
+        raise OwnershipMarkerError(
+            f"purchase order {order.po_number} lacks compact metadata required for separation"
+        )
+    connection.execute(
+        f"INSERT INTO {PO_METADATA_TABLE} "
+        "(po_number, marker, marker_version, action_key, demand_fingerprint, "
+        "source_fingerprint, evidence_contract, requirement_id, route_id, "
+        "policy_pack_version, line_index, line_count, group_digest, field_digest) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(po_number) DO UPDATE SET marker=excluded.marker, "
+        "marker_version=excluded.marker_version, action_key=excluded.action_key, "
+        "demand_fingerprint=excluded.demand_fingerprint, "
+        "source_fingerprint=excluded.source_fingerprint, "
+        "evidence_contract=excluded.evidence_contract, "
+        "requirement_id=excluded.requirement_id, route_id=excluded.route_id, "
+        "policy_pack_version=excluded.policy_pack_version, line_index=excluded.line_index, "
+        "line_count=excluded.line_count, group_digest=excluded.group_digest, "
+        "field_digest=excluded.field_digest",
+        (
+            order.po_number,
+            marker,
+            parsed.marker_version,
+            parsed.action_key,
+            parsed.demand_fingerprint,
+            parsed.source_fingerprint,
+            parsed.evidence_contract.value,
+            parsed.requirement_id,
+            parsed.route_id,
+            parsed.policy_pack_version,
+            parsed.line_index,
+            parsed.line_count,
+            parsed.group_digest,
+            parsed.field_digest,
+        ),
+    )
+
+
+def _target_existing_order(target: PurchaseOrderOutput) -> ExistingPurchaseOrder:
+    return ExistingPurchaseOrder(
+        po_number=target.po_number,
+        component_id=target.component_id,
+        supplier_id=target.supplier_id,
+        quantity=target.quantity,
+        unit_price=target.unit_price,
+        order_date=target.order_date,
+        expected_delivery_date=target.expected_delivery_date,
+        rationale=target.rationale,
+    )
+
+
+def _store_target_po_metadata(
+    connection: sqlite3.Connection,
+    target: PurchaseOrderOutput,
+) -> str:
+    order = _target_existing_order(target)
+    parsed = parse_owned_purchase_order(order)
+    if parsed is None or parsed.marker_version != PO_MARKER_VERSION:
+        raise OwnershipMarkerError(
+            f"purchase order {target.po_number} does not contain current compact metadata"
+        )
+    marker, body = _split_compact_po_rationale(target.rationale)
+    _store_po_metadata(connection, order, parsed, marker)
+    return body
+
+
+def _store_alert_metadata(
+    connection: sqlite3.Connection,
+    alert_id: int,
+    alert: RenderedAlert,
+) -> str:
+    body, marker = _split_alert_description(alert.description)
+    marker_version_match = re.match(r"\[APEX_ALERT:v(?P<version>[0-9]+) ", marker)
+    if marker_version_match is None:
+        raise OwnershipMarkerError("alert ownership marker version is malformed")
+    connection.execute(
+        f"INSERT INTO {ALERT_METADATA_TABLE} "
+        "(alert_id, marker, marker_version, alert_key, category, scope, audit_description) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(alert_id) DO UPDATE SET marker=excluded.marker, "
+        "marker_version=excluded.marker_version, alert_key=excluded.alert_key, "
+        "category=excluded.category, scope=excluded.scope, "
+        "audit_description=excluded.audit_description",
+        (
+            alert_id,
+            marker,
+            int(marker_version_match.group("version")),
+            alert.key,
+            alert.category.value,
+            alert.scope,
+            alert.audit_description,
+        ),
+    )
+    return body
+
+
+def _migrate_embedded_metadata(
+    connection: sqlite3.Connection,
+    snapshot: ScenarioSnapshot,
+) -> int:
+    """Move valid embedded v4/alert markers out of human-facing text columns."""
+
+    changes = 0
+    cursor = connection.execute(
+        f"DELETE FROM {PO_METADATA_TABLE} WHERE po_number NOT IN "
+        "(SELECT po_number FROM purchase_orders)"
+    )
+    changes += max(cursor.rowcount, 0)
+    cursor = connection.execute(
+        f"DELETE FROM {ALERT_METADATA_TABLE} WHERE alert_id NOT IN "
+        "(SELECT alert_id FROM alerts)"
+    )
+    changes += max(cursor.rowcount, 0)
+    stored_po_numbers = {
+        row[0]
+        for row in connection.execute(
+            f"SELECT po_number FROM {PO_METADATA_TABLE}"
+        ).fetchall()
+    }
+    for order in snapshot.purchase_orders:
+        if order.po_number in stored_po_numbers or order.rationale is None:
+            continue
+        match = _COMPACT_PO_MARKER.match(order.rationale)
+        if match is None or int(match.group("version")) not in _COMPACT_PO_MARKER_VERSIONS:
+            continue
+        parsed = parse_owned_purchase_order(order)
+        if parsed is None:
+            continue
+        marker, body = _split_compact_po_rationale(order.rationale)
+        cursor = connection.execute(
+            "UPDATE purchase_orders SET rationale = ? "
+            "WHERE po_number = ? AND rationale = ?",
+            (body, order.po_number, order.rationale),
+        )
+        if cursor.rowcount != 1:
+            raise ConcurrentModificationError(
+                f"purchase order {order.po_number} changed during metadata migration"
+            )
+        _store_po_metadata(connection, order, parsed, marker)
+        changes += 1
+
+    stored_alert_ids = {
+        row[0]
+        for row in connection.execute(
+            f"SELECT alert_id FROM {ALERT_METADATA_TABLE}"
+        ).fetchall()
+    }
+    for alert in snapshot.alerts:
+        if alert.alert_id in stored_alert_ids:
+            continue
+        parsed = parse_owned_alert(alert.description)
+        if parsed is None:
+            continue
+        body, marker = _split_alert_description(alert.description)
+        cursor = connection.execute(
+            "UPDATE alerts SET description = ? WHERE alert_id = ? AND description = ?",
+            (body, alert.alert_id, alert.description),
+        )
+        if cursor.rowcount != 1:
+            raise ConcurrentModificationError(
+                f"alert {alert.alert_id} changed during metadata migration"
+            )
+        marker_version_match = re.match(r"\[APEX_ALERT:v(?P<version>[0-9]+) ", marker)
+        if marker_version_match is None:
+            raise OwnershipMarkerError("alert ownership marker version is malformed")
+        connection.execute(
+            f"INSERT INTO {ALERT_METADATA_TABLE} "
+            "(alert_id, marker, marker_version, alert_key, category, scope, audit_description) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                alert.alert_id,
+                marker,
+                int(marker_version_match.group("version")),
+                parsed.key,
+                parsed.category.value,
+                parsed.scope,
+                parsed.body,
+            ),
+        )
+        changes += 1
+    return changes
+
+
+def _reconcile_decision_audit(
+    connection: sqlite3.Connection,
+    outputs: DecisionOutputs,
+    policy_pack_version: str,
+) -> int:
+    targets: dict[str, tuple[str, str, str]] = {}
+    for decision in outputs.decisions:
+        # Source fingerprints are machine ownership state, not decision-audit
+        # content.  They can vary as managed output rows are reconciled and are
+        # persisted authoritatively with executable PO metadata instead.
+        decision_json = canonical_dumps(replace(decision, source_fingerprint=None))
+        targets[decision.requirement_id] = (
+            decision.component_id,
+            sha256(decision_json.encode("utf-8")).hexdigest(),
+            decision_json,
+        )
+    stored = {
+        row[0]: (row[1], row[2], row[3], row[4])
+        for row in connection.execute(
+            f"SELECT requirement_id, component_id, policy_pack_version, "
+            f"decision_digest, decision_json FROM {DECISION_AUDIT_TABLE}"
+        ).fetchall()
+    }
+    changes = 0
+    for requirement_id in sorted(set(stored) - set(targets)):
+        connection.execute(
+            f"DELETE FROM {DECISION_AUDIT_TABLE} WHERE requirement_id = ?",
+            (requirement_id,),
+        )
+        changes += 1
+    for requirement_id, (component_id, digest, decision_json) in sorted(targets.items()):
+        target = (component_id, policy_pack_version, digest, decision_json)
+        if stored.get(requirement_id) == target:
+            continue
+        connection.execute(
+            f"INSERT INTO {DECISION_AUDIT_TABLE} "
+            "(requirement_id, component_id, policy_pack_version, decision_digest, decision_json) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(requirement_id) DO UPDATE SET "
+            "component_id=excluded.component_id, "
+            "policy_pack_version=excluded.policy_pack_version, "
+            "decision_digest=excluded.decision_digest, decision_json=excluded.decision_json",
+            (requirement_id, component_id, policy_pack_version, digest, decision_json),
+        )
+        changes += 1
+    return changes
 
 
 def _source_state(snapshot: ScenarioSnapshot) -> tuple[object, ...]:
@@ -1535,6 +1805,7 @@ class AtomicDecisionWriter:
         inserted_numbers: list[str] = []
         inserted_alerts = 0
         deleted_alerts = 0
+        auxiliary_changes = 0
         began = False
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -1543,6 +1814,8 @@ class AtomicDecisionWriter:
                 raise ConcurrentModificationError(
                     "scenario file identity changed after planning; no decision rows were written"
                 )
+            ensure_agent_tables(connection)
+            auxiliary_changes += _migrate_embedded_metadata(connection, snapshot)
             columns = SQLiteRepository._validate_schema(connection)
             current = SQLiteRepository()._load(connection, columns)
             if current.state_digest != snapshot.state_digest or current != snapshot:
@@ -1589,7 +1862,19 @@ class AtomicDecisionWriter:
                         raise ActionCollisionError(
                             f"action key {target.action_key} matches different business fields"
                         )
+                    if older_marker_equivalent:
+                        rationale_body = _store_target_po_metadata(connection, target)
+                        cursor = connection.execute(
+                            "UPDATE purchase_orders SET rationale = ? WHERE po_number = ?",
+                            (rationale_body, target.po_number),
+                        )
+                        if cursor.rowcount != 1:
+                            raise CommitPostconditionError(
+                                f"purchase order {target.po_number} disappeared during metadata upgrade"
+                            )
+                        auxiliary_changes += 1
                     continue
+                _marker, rationale_body = _split_compact_po_rationale(target.rationale)
                 connection.execute(
                     "INSERT INTO purchase_orders "
                     "(po_number, component_id, supplier_id, quantity, unit_price, order_date, "
@@ -1602,9 +1887,10 @@ class AtomicDecisionWriter:
                         str(target.unit_price),
                         target.order_date.isoformat(),
                         target.expected_delivery_date.isoformat(),
-                        target.rationale,
+                        rationale_body,
                     ),
                 )
+                _store_target_po_metadata(connection, target)
                 inserted_numbers.append(target.po_number)
             self._step(CommitStep.PURCHASE_ORDERS_INSERTED)
 
@@ -1635,19 +1921,46 @@ class AtomicDecisionWriter:
             obsolete = sorted(set(stored_owned) - target_descriptions)
             missing = sorted(target_descriptions - set(stored_owned))
             for description in obsolete:
+                parsed_obsolete = parse_owned_alert(description)
+                if parsed_obsolete is None:
+                    raise OwnershipMarkerError("obsolete owned alert lost its ownership metadata")
                 cursor = connection.execute(
                     "DELETE FROM alerts WHERE alert_id = ? AND description = ?",
-                    (stored_owned[description], description),
+                    (stored_owned[description], parsed_obsolete.body),
                 )
                 if cursor.rowcount != 1:
                     raise CommitPostconditionError("owned alert disappeared during reconciliation")
                 deleted_alerts += 1
             for description in missing:
-                connection.execute(
-                    "INSERT INTO alerts (description) VALUES (?)",
-                    (description,),
+                target_alert = next(
+                    item for item in outputs.alerts if item.description == description
                 )
+                body, _marker = _split_alert_description(description)
+                cursor = connection.execute(
+                    "INSERT INTO alerts (description) VALUES (?)",
+                    (body,),
+                )
+                if cursor.lastrowid is None:
+                    raise CommitPostconditionError("inserted alert has no SQLite row ID")
+                _store_alert_metadata(connection, int(cursor.lastrowid), target_alert)
                 inserted_alerts += 1
+            for description in sorted(set(stored_owned) & target_descriptions):
+                target_alert = next(
+                    item for item in outputs.alerts if item.description == description
+                )
+                alert_id = stored_owned[description]
+                prior_audit = connection.execute(
+                    f"SELECT audit_description FROM {ALERT_METADATA_TABLE} WHERE alert_id = ?",
+                    (alert_id,),
+                ).fetchone()
+                if prior_audit is None or prior_audit[0] != target_alert.audit_description:
+                    _store_alert_metadata(connection, alert_id, target_alert)
+                    auxiliary_changes += 1
+            auxiliary_changes += _reconcile_decision_audit(
+                connection,
+                outputs,
+                self._policy_pack_version,
+            )
             self._step(CommitStep.ALERTS_RECONCILED)
 
             after_columns = SQLiteRepository._validate_schema(connection)
@@ -1674,7 +1987,12 @@ class AtomicDecisionWriter:
                 committed_po_numbers=tuple(inserted_numbers),
                 inserted_alert_count=inserted_alerts,
                 deleted_alert_count=deleted_alerts,
-                no_op=not inserted_numbers and inserted_alerts == 0 and deleted_alerts == 0,
+                no_op=(
+                    not inserted_numbers
+                    and inserted_alerts == 0
+                    and deleted_alerts == 0
+                    and auxiliary_changes == 0
+                ),
             )
         except BaseException:
             if began and connection.in_transaction:
@@ -1694,12 +2012,25 @@ class AtomicDecisionWriter:
             raise CommitPostconditionError("a source or master table changed during commit")
         before_orders = {item.po_number: item for item in before.purchase_orders}
         after_orders = {item.po_number: item for item in after.purchase_orders}
+        targets = {item.po_number: item for item in outputs.purchase_orders}
         for number, order in before_orders.items():
-            if after_orders.get(number) != order:
+            after_order = after_orders.get(number)
+            if after_order == order:
+                continue
+            target = targets.get(number)
+            parsed_before = parse_owned_purchase_order(order)
+            managed_upgrade = (
+                target is not None
+                and after_order is not None
+                and parsed_before is not None
+                and parsed_before.marker_version < PO_MARKER_VERSION
+                and _stored_fields(order)[:-1] == target.business_fields[:-1]
+                and _stored_fields(after_order) == target.business_fields
+            )
+            if not managed_upgrade:
                 raise CommitPostconditionError(
                     f"pre-existing purchase order {number} was modified or removed"
                 )
-        targets = {item.po_number: item for item in outputs.purchase_orders}
         if set(after_orders) != set(before_orders) | set(targets):
             raise CommitPostconditionError("purchase-order target set does not match committed rows")
         for number, target in targets.items():
