@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Iterable
 
 from .config import EvidenceContract
+from .policy.parameters import EconomicAutonomyParameters
 
 
 ZERO = Decimal("0")
@@ -1062,6 +1063,7 @@ class DecisionRecord:
     alert_categories: tuple[AlertCategory, ...]
     rationale: str
     deadline_lateness: tuple[DeadlineLateness, ...] = ()
+    economic_autonomy: EconomicAutonomyParameters | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.requirement_id, "requirement_id")
@@ -1153,6 +1155,12 @@ class DecisionRecord:
         if any(item.due_date not in {bucket.due_date for bucket in buckets} for item in lateness):
             raise ValueError("deadline lateness must reference a demand bucket")
         object.__setattr__(self, "deadline_lateness", lateness)
+        if self.economic_autonomy is not None and not isinstance(
+            self.economic_autonomy, EconomicAutonomyParameters
+        ):
+            raise TypeError(
+                "economic_autonomy must be EconomicAutonomyParameters or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,6 +15,21 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .parameters import (
+    AirFreightPeriodCapParameters,
+    ApplicablePolicyParameters,
+    ApprovalThresholdParameters,
+    DomesticPremiumParameter,
+    DomesticPremiumParameters,
+    EconomicAutonomyParameters,
+    EmergencyApprovalParameters,
+    RuleParameter,
+    SecondaryAllocationParameters,
+    SemanticScope,
+    StrategicContinuityParameters,
+    SupplierVolumeCapParameters,
+    SustainabilityParameters,
+)
 from .schema import PolicyValidationError, validate_policy_documents
 
 
@@ -90,6 +105,7 @@ class PolicyRegistry:
     rules: tuple[PolicyRule, ...]
     pack: Mapping[str, Any]
     concepts: Mapping[str, Any]
+    economic_autonomy: EconomicAutonomyParameters
 
     def active_rules(self, scenario_date: date) -> tuple[PolicyRule, ...]:
         """Return active rules in stable rule-id order using inclusive windows."""
@@ -103,6 +119,268 @@ class PolicyRegistry:
             if rule.rule_id == rule_id:
                 return rule
         raise KeyError(rule_id)
+
+    def parameters_for(self, scenario_date: date) -> ApplicablePolicyParameters:
+        """Return the strictly typed behavioral values active on ``scenario_date``."""
+
+        if not isinstance(scenario_date, date) or isinstance(scenario_date, datetime):
+            raise TypeError("scenario_date must be datetime.date")
+        active = self.active_rules(scenario_date)
+
+        def kind(rule: PolicyRule) -> str | None:
+            for key in ("constraint", "directive"):
+                payload = rule.data.get(key)
+                if isinstance(payload, Mapping) and isinstance(payload.get("kind"), str):
+                    return str(payload["kind"])
+            return None
+
+        def body(rule: PolicyRule) -> Mapping[str, Any]:
+            payload = rule.data.get("constraint", rule.data.get("directive"))
+            if not isinstance(payload, Mapping):
+                raise PolicyValidationError(f"rule {rule.rule_id!r} has no typed payload")
+            return payload
+
+        def scope(rule: PolicyRule) -> SemanticScope:
+            selector = rule.data.get("selector")
+            if not isinstance(selector, Mapping):
+                raise PolicyValidationError(f"rule {rule.rule_id!r} has no selector")
+            return SemanticScope(
+                entity=str(selector["entity"]),
+                semantic_tags=tuple(str(item) for item in selector.get("semantic_tags", ())),
+                operator=(str(selector["operator"]) if "operator" in selector else None),
+                match=(str(selector["match"]) if "match" in selector else None),
+                route_conditions=tuple(
+                    str(item) for item in selector.get("route_conditions", ())
+                ),
+            )
+
+        def decimal_value(value: Any, location: str) -> Decimal:
+            if not isinstance(value, str):
+                raise PolicyValidationError(f"{location} must be a decimal string")
+            try:
+                parsed = Decimal(value)
+            except Exception as error:
+                raise PolicyValidationError(f"{location} is not a decimal") from error
+            if not parsed.is_finite():
+                raise PolicyValidationError(f"{location} must be finite")
+            return parsed
+
+        def one(rule_kind: str) -> PolicyRule:
+            matches = tuple(rule for rule in active if kind(rule) == rule_kind)
+            if len(matches) != 1:
+                raise PolicyValidationError(
+                    f"expected one active {rule_kind!r} rule, found {len(matches)}"
+                )
+            return matches[0]
+
+        domestic_rules = tuple(
+            rule for rule in active if kind(rule) == "domestic_supplier_preference"
+        )
+        domestic: dict[str, DomesticPremiumParameter] = {}
+        for rule in domestic_rules:
+            parameter = DomesticPremiumParameter(
+                rule.rule_id,
+                "domestic_supplier_preference",
+                scope(rule),
+                decimal_value(
+                    body(rule).get("maximum_premium_fraction"),
+                    f"{rule.rule_id}.constraint.maximum_premium_fraction",
+                ),
+            )
+            operator = parameter.scope.operator
+            if operator not in {"any", "none"} or operator in domestic:
+                raise PolicyValidationError(
+                    "domestic premium rules require unique critical(any) and ordinary(none) scopes"
+                )
+            domestic[operator] = parameter
+        if set(domestic) != {"any", "none"}:
+            raise PolicyValidationError(
+                "domestic premium rules require critical(any) and ordinary(none) scopes"
+            )
+
+        strategic_rule = one("strategic_supplier_continuity")
+        strategic = StrategicContinuityParameters(
+            strategic_rule.rule_id,
+            "strategic_supplier_continuity",
+            scope(strategic_rule),
+            decimal_value(
+                body(strategic_rule).get("maximum_alternative_savings_fraction"),
+                f"{strategic_rule.rule_id}.constraint.maximum_alternative_savings_fraction",
+            ),
+        )
+        sustainability_rule = one("sustainability_preference")
+        sustainability_body = body(sustainability_rule)
+        delivery_days = sustainability_body.get("comparable_delivery_days")
+        if not isinstance(delivery_days, int) or isinstance(delivery_days, bool):
+            raise PolicyValidationError(
+                f"{sustainability_rule.rule_id}.constraint.comparable_delivery_days must be int"
+            )
+        sustainability = SustainabilityParameters(
+            sustainability_rule.rule_id,
+            "sustainability_preference",
+            scope(sustainability_rule),
+            decimal_value(
+                sustainability_body.get("comparable_price_fraction"),
+                f"{sustainability_rule.rule_id}.constraint.comparable_price_fraction",
+            ),
+            delivery_days,
+        )
+
+        approvals = tuple(
+            ApprovalThresholdParameters(
+                rule.rule_id,
+                "order_value_approval",
+                scope(rule),
+                decimal_value(
+                    body(rule).get("amount_exceeds"),
+                    f"{rule.rule_id}.constraint.amount_exceeds",
+                ),
+                str(body(rule).get("authority", "")),
+            )
+            for rule in active
+            if kind(rule) == "order_value_approval"
+        )
+        authorities = {item.authority for item in approvals}
+        if not {"Procurement Manager", "VP of Operations"} <= authorities:
+            raise PolicyValidationError(
+                "active order approval parameters must include manager and VP authorities"
+            )
+
+        emergency_rule = one("emergency_approval_bypass")
+        emergency_body = body(emergency_rule)
+        retroactive_days = emergency_body.get("retroactive_approval_business_days")
+        if not isinstance(retroactive_days, int) or isinstance(retroactive_days, bool):
+            raise PolicyValidationError(
+                f"{emergency_rule.rule_id}.constraint.retroactive_approval_business_days must be int"
+            )
+        emergency = EmergencyApprovalParameters(
+            emergency_rule.rule_id,
+            "emergency_approval_bypass",
+            scope(emergency_rule),
+            decimal_value(
+                emergency_body.get("amount_up_to"),
+                f"{emergency_rule.rule_id}.constraint.amount_up_to",
+            ),
+            (
+                str(emergency_body["authority"])
+                if emergency_body.get("authority") is not None
+                else None
+            ),
+            retroactive_days,
+            str(emergency_body.get("implementation_status", "")),
+        )
+
+        volume_caps: list[SupplierVolumeCapParameters] = []
+        for rule in active:
+            if kind(rule) != "supplier_volume_cap":
+                continue
+            rule_body = body(rule)
+            window = rule_body.get("window_months")
+            if not isinstance(window, int) or isinstance(window, bool):
+                raise PolicyValidationError(
+                    f"{rule.rule_id}.constraint.window_months must be int"
+                )
+            precedence = rule.data.get("precedence")
+            supersedes = (
+                tuple(str(item) for item in precedence.get("supersedes", ()))
+                if isinstance(precedence, Mapping)
+                else ()
+            )
+            volume_caps.append(
+                SupplierVolumeCapParameters(
+                    rule.rule_id,
+                    "supplier_volume_cap",
+                    scope(rule),
+                    decimal_value(
+                        rule_body.get("maximum_fraction"),
+                        f"{rule.rule_id}.constraint.maximum_fraction",
+                    ),
+                    window,
+                    supersedes,
+                )
+            )
+
+        secondary = tuple(
+            SecondaryAllocationParameters(
+                rule.rule_id,
+                "minimum_secondary_fraction",
+                scope(rule),
+                decimal_value(
+                    body(rule).get("value"),
+                    f"{rule.rule_id}.constraint.value",
+                ),
+            )
+            for rule in active
+            if kind(rule) == "minimum_secondary_fraction"
+        )
+        air_caps = tuple(
+            AirFreightPeriodCapParameters(
+                rule.rule_id,
+                "air_freight_period_spend_cap",
+                scope(rule),
+                decimal_value(
+                    body(rule).get("maximum_amount"),
+                    f"{rule.rule_id}.constraint.maximum_amount",
+                ),
+            )
+            for rule in active
+            if kind(rule) == "air_freight_period_spend_cap"
+        )
+        return ApplicablePolicyParameters(
+            scenario_date=scenario_date,
+            pack_id=self.pack_id,
+            content_hash=self.content_hash,
+            domestic_premiums=DomesticPremiumParameters(
+                ordinary=domestic["none"], critical=domestic["any"]
+            ),
+            strategic_continuity=strategic,
+            sustainability=sustainability,
+            approval_thresholds=tuple(
+                sorted(approvals, key=lambda item: (item.amount_exceeds, item.rule_id))
+            ),
+            emergency_approval=emergency,
+            supplier_volume_caps=tuple(sorted(volume_caps, key=lambda item: item.rule_id)),
+            secondary_allocations=tuple(sorted(secondary, key=lambda item: item.rule_id)),
+            air_freight_period_caps=tuple(sorted(air_caps, key=lambda item: item.rule_id)),
+            economic_autonomy=self.economic_autonomy,
+        )
+
+
+def _economic_autonomy(pack: Mapping[str, Any]) -> EconomicAutonomyParameters:
+    raw = pack.get("economic_autonomy")
+    if not isinstance(raw, Mapping):
+        raise PolicyValidationError("policy.economic_autonomy must be an object")
+
+    def decimal_value(key: str, *, optional: bool = False) -> Decimal | None:
+        value = raw.get(key)
+        if optional and value is None:
+            return None
+        if not isinstance(value, str):
+            raise PolicyValidationError(
+                f"policy.economic_autonomy.{key} must be a decimal string"
+            )
+        try:
+            result = Decimal(value)
+        except Exception as error:
+            raise PolicyValidationError(
+                f"policy.economic_autonomy.{key} is not a decimal"
+            ) from error
+        if not result.is_finite():
+            raise PolicyValidationError(
+                f"policy.economic_autonomy.{key} must be finite"
+            )
+        return result
+
+    return EconomicAutonomyParameters(
+        max_surplus_fraction=decimal_value("max_surplus_fraction"),  # type: ignore[arg-type]
+        max_surplus_units=decimal_value("max_surplus_units", optional=True),
+        max_excess_cost_usd=decimal_value("max_excess_cost_usd"),  # type: ignore[arg-type]
+        forced_surplus_review_usd=decimal_value("forced_surplus_review_usd"),  # type: ignore[arg-type]
+        boundary=str(raw.get("boundary", "")),
+        provisional=raw.get("provisional"),  # type: ignore[arg-type]
+        review_status=str(raw.get("review_status", "")),
+        source_pointer=str(raw.get("source_pointer", "")),
+    )
 
 
 def load_policy_registry(
@@ -142,7 +420,14 @@ def load_policy_registry(
         rules=rules,
         pack=_deep_freeze(pack),
         concepts=_deep_freeze(concepts),
+        economic_autonomy=_economic_autonomy(pack),
     )
 
 
-__all__ = ["PolicyRegistry", "PolicyRule", "load_policy_registry"]
+__all__ = [
+    "ApplicablePolicyParameters",
+    "EconomicAutonomyParameters",
+    "PolicyRegistry",
+    "PolicyRule",
+    "load_policy_registry",
+]

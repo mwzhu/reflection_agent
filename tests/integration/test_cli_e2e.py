@@ -249,7 +249,13 @@ class AssembledCliTests(unittest.TestCase):
                     self.assertIn(
                         "EVIDENCE_CONTRACT", decision["alert_categories"]
                     )
-                    self.assertNotIn("ASSUMPTION", decision["alert_categories"])
+                    # The only production-safe ASSUMPTION here is the pack's
+                    # explicitly provisional economic-autonomy configuration;
+                    # unavailable rolling evidence remains DECISION_REQUIRED.
+                    self.assertIn("ASSUMPTION", decision["alert_categories"])
+                    self.assertTrue(
+                        decision["economic_autonomy"]["provisional"]
+                    )
                     self.assertNotIn(
                         "NO_ELIGIBLE_SUPPLIER", decision["alert_categories"]
                     )
@@ -288,8 +294,23 @@ class AssembledCliTests(unittest.TestCase):
                     sum("category=RUN_ACCOUNTING" in item for item in descriptions),
                     1,
                 )
+                assumption_descriptions = tuple(
+                    item
+                    for item in descriptions
+                    if "category=ASSUMPTION" in item
+                )
+                self.assertTrue(assumption_descriptions)
+                self.assertTrue(
+                    all(
+                        "PROVISIONAL_ECONOMIC_AUTONOMY" in item
+                        for item in assumption_descriptions
+                    )
+                )
                 self.assertFalse(
-                    any("category=ASSUMPTION" in item for item in descriptions)
+                    any(
+                        "ROLLING_HISTORY_UNKNOWN" in item
+                        for item in assumption_descriptions
+                    )
                 )
                 self.assertFalse(
                     any(
@@ -313,7 +334,12 @@ class AssembledCliTests(unittest.TestCase):
                         )
                     )
                 self.assertFalse(
-                    any("relied on assumption" in item for item in descriptions)
+                    any(
+                        "relied on assumption" in item
+                        or "missing evidence" in item
+                        or "unavailable evidence" in item
+                        for item in assumption_descriptions
+                    )
                 )
 
                 second = self.command(*arguments)

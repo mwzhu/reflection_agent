@@ -73,6 +73,36 @@ class StaticContractTests(unittest.TestCase):
                     violations.append(f"{path.relative_to(PROJECT_ROOT)}:{line_number}: {line.strip()}")
         self.assertEqual(violations, [], "\n".join(violations))
 
+    def test_planner_and_validator_do_not_duplicate_load_bearing_policy_literals(self) -> None:
+        targets = (
+            SOURCE_ROOT / "apex_procurement" / "candidates.py",
+            SOURCE_ROOT / "apex_procurement" / "optimizer.py",
+            SOURCE_ROOT / "apex_procurement" / "validator.py",
+        )
+        policy_value_literal = re.compile(
+            r"(?<![\w.])(?:0\.35|0\.50|0\.15|0\.10|2500)(?![\w.])"
+        )
+        numeric_rule_selection = re.compile(
+            r"maximum_(?:premium|alternative_savings)_fraction[^\n]{0,120}=="
+        )
+        delivery_window_literal = re.compile(
+            r"(?:_business_day(?:_distance|s)?\([^)]*\)|"
+            r"(?:comparable_delivery_days|delivery_day_window)[^\n]{0,40})\s*"
+            r"(?:=|<=)\s*5",
+            re.DOTALL,
+        )
+        violations: list[str] = []
+        for path in targets:
+            source = path.read_text(encoding="utf-8")
+            for label, pattern in (
+                ("policy value", policy_value_literal),
+                ("numeric rule selection", numeric_rule_selection),
+                ("delivery window", delivery_window_literal),
+            ):
+                if pattern.search(source):
+                    violations.append(f"{path.name}: {label}")
+        self.assertEqual(violations, [], "\n".join(violations))
+
 
 if __name__ == "__main__":
     unittest.main()

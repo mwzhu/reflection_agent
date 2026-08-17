@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 import json
@@ -15,6 +16,7 @@ from apex_procurement.domain import (
     ScenarioConfiguration,
     SupplyLedger,
 )
+from apex_procurement.policy import load_policy_registry
 from apex_procurement.serialization import (
     MAX_CANONICAL_JSON_BYTES,
     canonical_dumps,
@@ -78,7 +80,11 @@ def make_record() -> DecisionRecord:
 
 class SerializationTests(unittest.TestCase):
     def test_nested_record_is_deterministic_and_round_trips(self) -> None:
-        record = make_record()
+        registry = load_policy_registry()
+        record = replace(
+            make_record(),
+            economic_autonomy=registry.economic_autonomy,
+        )
 
         first = canonical_dumps(record)
         second = canonical_dumps(record)
@@ -86,6 +92,7 @@ class SerializationTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(restored, record)
+        self.assertEqual(restored.economic_autonomy, registry.economic_autonomy)
         self.assertIsInstance(restored.total_requirement, Decimal)
         self.assertEqual(str(restored.total_requirement), "2.00")
         self.assertIsInstance(restored.demand_buckets[0].due_date, date)

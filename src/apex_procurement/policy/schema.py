@@ -109,6 +109,7 @@ POLICY_PACK_SCHEMA: Mapping[str, Any] = {
         "evidence_bases",
         "contracts",
         "precedence_model",
+        "economic_autonomy",
         "derivations",
         "rules",
     ],
@@ -169,6 +170,18 @@ _RULE_KEYS = frozenset(
 )
 _DERIVATION_KEYS = frozenset(
     {"derivation_id", "value", "source_pointer", "review_status", "reasoning"}
+)
+_ECONOMIC_AUTONOMY_KEYS = frozenset(
+    {
+        "max_surplus_fraction",
+        "max_surplus_units",
+        "max_excess_cost_usd",
+        "forced_surplus_review_usd",
+        "boundary",
+        "provisional",
+        "review_status",
+        "source_pointer",
+    }
 )
 _DIRECT_PROOF_KEYS = frozenset({"source_quote", "value_literal", "value_format"})
 _DERIVED_PROOF_KEYS = frozenset({"derived_from"})
@@ -715,6 +728,55 @@ def _validate_evidence_contracts(pack: Mapping[str, Any]) -> None:
             )
 
 
+def _validate_economic_autonomy(pack: Mapping[str, Any]) -> None:
+    location = "policy.economic_autonomy"
+    autonomy = _expect_mapping(pack["economic_autonomy"], location)
+    _expect_keys(autonomy, _ECONOMIC_AUTONOMY_KEYS, location)
+    _expect_reviewed(autonomy["review_status"], f"{location}.review_status")
+    if not isinstance(autonomy["provisional"], bool):
+        _fail(f"{location}.provisional", "must be boolean")
+    if autonomy["boundary"] != "inclusive":
+        _fail(f"{location}.boundary", "must be 'inclusive'")
+    source_pointer = _expect_text(
+        autonomy["source_pointer"], f"{location}.source_pointer"
+    )
+    if not source_pointer.startswith("MERGED_PLAN#"):
+        _fail(f"{location}.source_pointer", "must point into MERGED_PLAN")
+    for key in (
+        "max_surplus_fraction",
+        "max_excess_cost_usd",
+        "forced_surplus_review_usd",
+    ):
+        value = autonomy[key]
+        if not isinstance(value, str):
+            _fail(f"{location}.{key}", "must be a decimal string")
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation as error:
+            raise PolicyValidationError(
+                f"{location}.{key}: invalid decimal string"
+            ) from error
+        if not parsed.is_finite() or parsed < 0:
+            _fail(f"{location}.{key}", "must be finite and nonnegative")
+        if key == "max_surplus_fraction" and parsed > 1:
+            _fail(f"{location}.{key}", "must not exceed one")
+    units = autonomy["max_surplus_units"]
+    if units is not None:
+        if not isinstance(units, str):
+            _fail(f"{location}.max_surplus_units", "must be null or a decimal string")
+        try:
+            parsed_units = Decimal(units)
+        except InvalidOperation as error:
+            raise PolicyValidationError(
+                f"{location}.max_surplus_units: invalid decimal string"
+            ) from error
+        if not parsed_units.is_finite() or parsed_units < 0:
+            _fail(
+                f"{location}.max_surplus_units",
+                "must be finite and nonnegative",
+            )
+
+
 def _validate_rules(
     pack: Mapping[str, Any],
     *,
@@ -1026,6 +1088,7 @@ def validate_policy_documents(
     sources_by_id = _validate_source_documents(policy, project_root)
     concepts_by_id = _validate_concepts(concept_document, sources_by_id)
     _validate_evidence_contracts(policy)
+    _validate_economic_autonomy(policy)
 
     precedence = _expect_mapping(policy["precedence_model"], "policy.precedence_model")
     _expect_keys(precedence, frozenset({"steps", "conflict_result", "derived_from"}), "policy.precedence_model")
